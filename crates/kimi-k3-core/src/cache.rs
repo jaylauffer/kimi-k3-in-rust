@@ -7,7 +7,8 @@
 use std::fmt;
 
 use crate::{
-    expert::{ExpertError, ExpertRef},
+    expert::{ExpertError, ExpertRef, QuantizedMatrix},
+    layer::{ExpertFetchError, ExpertSource, Mxfp4Matrix, PackedExpert},
     safetensors::SafeTensorIndex,
 };
 
@@ -553,12 +554,69 @@ fn round_up_to_direct_alignment(bytes: usize) -> Option<usize> {
         .map(|value| value & !(DIRECT_ALIGNMENT - 1))
 }
 
+/// The engine's [`ExpertSource`]: routed experts streamed from the checkpoint shards
+/// through this cache, and multiplied straight out of the cached packed bytes.
+pub struct CachedExperts<'a> {
+    cache: &'a mut ExpertCache,
+    index: &'a SafeTensorIndex,
+}
+
+impl<'a> CachedExperts<'a> {
+    #[must_use]
+    pub const fn new(cache: &'a mut ExpertCache, index: &'a SafeTensorIndex) -> Self {
+        Self { cache, index }
+    }
+}
+
+impl ExpertSource for CachedExperts<'_> {
+    fn prefetch(&mut self, layer: usize, experts: &[usize]) -> Result<(), ExpertFetchError> {
+        // A failed batch is not fatal, exactly as the C `getmany`: every expert is still
+        // requested through `expert`, which reads it on demand or reports the failure.
+        let _ = self.cache.prefetch_many(self.index, layer, experts);
+        Ok(())
+    }
+
+    fn expert(
+        &mut self,
+        layer: usize,
+        expert: usize,
+    ) -> Result<PackedExpert<'_>, ExpertFetchError> {
+        let fetch_error = |error: CacheError| ExpertFetchError {
+            layer,
+            expert,
+            detail: error.to_string(),
+        };
+        let resident = self
+            .cache
+            .get(self.index, layer, expert)
+            .map_err(fetch_error)?;
+        let bytes = self.cache.bytes(&resident).map_err(fetch_error)?;
+        Ok(packed_expert(bytes, resident.layout()))
+    }
+}
+
+/// Views one expert's canonical bytes as its three MXFP4 matrices.
+fn packed_expert<'b>(bytes: &'b [u8], layout: &ExpertRef) -> PackedExpert<'b> {
+    let view = |matrix: &QuantizedMatrix| Mxfp4Matrix {
+        packed: &bytes[matrix.packed_offset..matrix.packed_offset + matrix.packed_bytes],
+        scales: &bytes[matrix.scale_offset..matrix.scale_offset + matrix.scale_bytes],
+        rows: matrix.rows,
+        columns: matrix.packed_columns * 2,
+    };
+    let [w1, w2, w3] = &layout.matrices;
+    PackedExpert {
+        w1: view(w1),
+        w2: view(w2),
+        w3: view(w3),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CacheError, ExpertCache};
-    use crate::{expert::ExpertRef, safetensors::SafeTensorIndex};
+    use super::{CacheError, CachedExperts, ExpertCache, packed_expert};
+    use crate::{expert::ExpertRef, layer::ExpertSource, safetensors::SafeTensorIndex};
 
     fn fixture_index() -> SafeTensorIndex {
         let directory =
@@ -579,6 +637,50 @@ mod tests {
             .load_into(index, &mut bytes)
             .expect("direct expert read");
         bytes
+    }
+
+    #[test]
+    fn cached_expert_source_serves_the_same_bytes_and_products_as_a_direct_load() {
+        let index = fixture_index();
+        let mut cache = cache(&index, 5);
+        let x: Vec<f32> = (0..128_u16).map(|i| (f32::from(i) * 0.37).sin()).collect();
+
+        // Two passes over 24 experts with 5 slots, some through a batch prefetch, so the
+        // views are taken under real eviction pressure.
+        for pass in 0..2 {
+            for expert in 0..24 {
+                let direct = direct_bytes(&index, expert);
+                let layout = ExpertRef::resolve(&index, 0, expert).expect("expert resolves");
+                let want = packed_expert(&direct, &layout);
+
+                let mut source = CachedExperts::new(&mut cache, &index);
+                if (expert + pass) % 3 == 0 {
+                    source
+                        .prefetch(0, &[expert, (expert + 1) % 24])
+                        .expect("prefetch never fails the token");
+                }
+                let got = source.expert(0, expert).expect("expert fetches");
+                for (got, want) in [(got.w1, want.w1), (got.w2, want.w2), (got.w3, want.w3)] {
+                    assert_eq!((got.rows, got.columns), (want.rows, want.columns));
+                    assert_eq!(got.packed, want.packed, "expert {expert} packed bytes");
+                    assert_eq!(got.scales, want.scales, "expert {expert} scales");
+                    let mut a = vec![0.0; got.rows];
+                    let mut b = vec![0.0; want.rows];
+                    got.mul(&mut a, &x[..got.columns]);
+                    want.mul(&mut b, &x[..want.columns]);
+                    assert!(a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_expert_source_reports_a_bad_key_instead_of_serving_nothing() {
+        let index = fixture_index();
+        let mut cache = cache(&index, 5);
+        let mut source = CachedExperts::new(&mut cache, &index);
+        let error = source.expert(3, 0).expect_err("layer 3 does not exist");
+        assert_eq!((error.layer, error.expert), (3, 0));
     }
 
     #[test]

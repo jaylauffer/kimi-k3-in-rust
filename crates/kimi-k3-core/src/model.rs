@@ -9,19 +9,26 @@
 //!   reused across layers, the C CLI's low-memory layout, and must be bit-identical;
 //! - [`Session`] prefills once and then feeds tokens one at a time, carrying KDA state
 //!   and an MLA KV cache.
+//!
+//! Every entry point takes the [`ExpertSource`] streamed `MoE` layers fetch from; a model
+//! with only resident experts passes [`crate::layer::NoStreamedExperts`].
 
 use crate::{
     config::K3Config,
-    layer::{KdaState, LayerState, LayerWeights, MlaCache, decoder_layer},
-    ops::{attn_res, matmul, rmsnorm},
+    layer::{
+        ExpertFetchError, ExpertSource, KdaState, LayerState, LayerWeights, Matrix, MlaCache,
+        decoder_layer,
+    },
+    ops::{attn_res, rmsnorm},
 };
 
 /// Every weight the model reads, borrowed from wherever the checkpoint lives.
 #[derive(Clone, Debug)]
 pub struct Model<'a> {
     pub config: K3Config,
-    pub embed: &'a [f32],
-    pub lm_head: &'a [f32],
+    /// `[vocab][hidden]`, gathered one row per token.
+    pub embed: Matrix<'a>,
+    pub lm_head: Matrix<'a>,
     pub final_norm: &'a [f32],
     /// `output_attn_res_{norm,proj}`, the one aggregator outside the layers.
     pub out_res: Option<(&'a [f32], &'a [f32])>,
@@ -33,6 +40,7 @@ pub struct Model<'a> {
 pub struct Session {
     states: Vec<LayerState>,
     position: usize,
+    broken: bool,
 }
 
 impl Session {
@@ -45,20 +53,41 @@ impl Session {
 
 impl Model<'_> {
     /// Logits for every position of `ids`, recomputed from an empty state.
-    #[must_use]
-    pub fn forward(&self, ids: &[u32]) -> Vec<f32> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertFetchError`] when a streamed expert cannot be fetched.
+    pub fn forward(
+        &self,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+    ) -> Result<Vec<f32>, ExpertFetchError> {
         let mut states = self.fresh_states(ids.len());
-        self.run(ids, &mut states, 0, Positions::All, None)
+        self.run(ids, &mut states, 0, Positions::All, None, experts)
     }
 
     /// [`Model::forward`] with ONE KDA state slot, cleared before each KDA layer. Full
     /// recompute never returns to a layer after its sequence is done, so this must give
     /// bit-identical logits.
-    #[must_use]
-    pub fn forward_shared_kda_slot(&self, ids: &[u32]) -> Vec<f32> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertFetchError`] when a streamed expert cannot be fetched.
+    pub fn forward_shared_kda_slot(
+        &self,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+    ) -> Result<Vec<f32>, ExpertFetchError> {
         let mut states = self.fresh_states(ids.len());
         let mut slot = KdaState::new(&self.config);
-        self.run(ids, &mut states, 0, Positions::All, Some(&mut slot))
+        self.run(
+            ids,
+            &mut states,
+            0,
+            Positions::All,
+            Some(&mut slot),
+            experts,
+        )
     }
 
     /// A session able to hold `capacity` positions.
@@ -67,27 +96,50 @@ impl Model<'_> {
         Session {
             states: self.fresh_states(capacity),
             position: 0,
+            broken: false,
         }
     }
 
     /// Feeds `ids` after everything the session has already seen and returns the logits
     /// for the last of them.
     ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertFetchError`] when a streamed expert cannot be fetched. The session
+    /// is then left partially updated and refuses further tokens.
+    ///
     /// # Panics
     ///
-    /// Panics when `ids` is empty or the session's capacity would be exceeded.
-    #[must_use]
-    pub fn feed(&self, session: &mut Session, ids: &[u32]) -> Vec<f32> {
+    /// Panics when `ids` is empty, the session's capacity would be exceeded, or the
+    /// session was broken by an earlier error.
+    pub fn feed(
+        &self,
+        session: &mut Session,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+    ) -> Result<Vec<f32>, ExpertFetchError> {
         assert!(!ids.is_empty(), "feed needs at least one token");
-        let logits = self.run(
+        assert!(
+            !session.broken,
+            "this session was left partially updated by an earlier error"
+        );
+        match self.run(
             ids,
             &mut session.states,
             session.position,
             Positions::Last,
             None,
-        );
-        session.position += ids.len();
-        logits
+            experts,
+        ) {
+            Ok(logits) => {
+                session.position += ids.len();
+                Ok(logits)
+            }
+            Err(error) => {
+                session.broken = true;
+                Err(error)
+            }
+        }
     }
 
     fn fresh_states(&self, capacity: usize) -> Vec<LayerState> {
@@ -109,7 +161,8 @@ impl Model<'_> {
         cached: usize,
         positions: Positions,
         mut shared_slot: Option<&mut KdaState>,
-    ) -> Vec<f32> {
+        experts: &mut dyn ExpertSource,
+    ) -> Result<Vec<f32>, ExpertFetchError> {
         let c = &self.config;
         let e = c.hidden_size;
         let vocab = c.vocab_size;
@@ -117,8 +170,7 @@ impl Model<'_> {
 
         let mut h = vec![0.0_f32; t * e];
         for (row, &id) in h.chunks_exact_mut(e).zip(ids) {
-            let at = id as usize * e;
-            row.copy_from_slice(&self.embed[at..at + e]);
+            self.embed.row_into(row, id as usize, e);
         }
 
         let mut blocks: Vec<Vec<f32>> = Vec::new();
@@ -135,13 +187,34 @@ impl Model<'_> {
             };
             if let Some((slot, own)) = slot {
                 let mut lent = LayerState::Kda(std::mem::replace(own, KdaState::empty()));
-                decoder_layer(&mut h, &mut blocks, weights, c, layer, t, &mut lent, cached);
+                let result = decoder_layer(
+                    &mut h,
+                    &mut blocks,
+                    weights,
+                    c,
+                    layer,
+                    t,
+                    &mut lent,
+                    cached,
+                    experts,
+                );
                 if let LayerState::Kda(used) = lent {
                     *own = used;
                 }
                 std::mem::swap(own, slot);
+                result?;
             } else {
-                decoder_layer(&mut h, &mut blocks, weights, c, layer, t, state, cached);
+                decoder_layer(
+                    &mut h,
+                    &mut blocks,
+                    weights,
+                    c,
+                    layer,
+                    t,
+                    state,
+                    cached,
+                    experts,
+                )?;
             }
         }
 
@@ -163,9 +236,9 @@ impl Model<'_> {
                 attn_res(ht, &src, &fold, blocks.len() + 1, e, c.rms_norm_eps);
             }
             rmsnorm(&mut normed, ht, self.final_norm, c.rms_norm_eps);
-            matmul(row, &normed, self.lm_head, e, vocab);
+            self.lm_head.mul(row, &normed, e, vocab);
         }
-        logits
+        Ok(logits)
     }
 }
 

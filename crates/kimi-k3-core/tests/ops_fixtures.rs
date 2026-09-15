@@ -20,8 +20,8 @@ use common::{Fixture, assert_close, manifest_tolerance, tiny_config};
 use kimi_k3_core::{
     config::K3Config,
     layer::{
-        Attention, KdaState, KdaWeights, LayerState, LayerWeights, MlaCache, MlaWeights, Mlp,
-        MoeWeights, decoder_layer, kda_layer, mla, moe,
+        Attention, KdaState, KdaWeights, LayerState, LayerWeights, Matrix, MlaCache, MlaWeights,
+        Mlp, MoeWeights, NoStreamedExperts, RoutedExperts, decoder_layer, kda_layer, mla, moe,
     },
     ops::{attn_res, kda_decay_in_place, kda_step, rmsnorm, router, shortconv_in_place, situ_glu},
 };
@@ -267,14 +267,14 @@ fn mla_matches_reference() {
     );
     let (o, g) = (f.arr("o_proj_weight"), f.arr("g_proj_weight"));
     let w = MlaWeights {
-        q_a: &q_a,
+        q_a: Matrix::F32(&q_a),
         q_a_norm: &q_a_norm,
-        q_b: &q_b,
-        kv_a: &kv_a,
+        q_b: Matrix::F32(&q_b),
+        kv_a: Matrix::F32(&kv_a),
         kv_a_norm: &kv_a_norm,
-        kv_b: &kv_b,
-        o: &o,
-        g: Some(&g),
+        kv_b: Matrix::F32(&kv_b),
+        o: Matrix::F32(&o),
+        g: Some(Matrix::F32(&g)),
     };
     let mut cache = MlaCache::new(&c, t);
     let mut y = vec![0.0; t * c.hidden_size];
@@ -324,15 +324,17 @@ impl MoeTensors {
         MoeWeights {
             gate: &self.gate,
             bias: Some(&self.bias),
-            down: &self.down,
-            up: &self.up,
+            down: Matrix::F32(&self.down),
+            up: Matrix::F32(&self.up),
             latent_norm: &self.norm,
-            shared_w1: &self.sh1,
-            shared_w3: &self.sh3,
-            shared_w2: &self.sh2,
-            w1: &self.w1,
-            w3: &self.w3,
-            w2: &self.w2,
+            shared_w1: Matrix::F32(&self.sh1),
+            shared_w3: Matrix::F32(&self.sh3),
+            shared_w2: Matrix::F32(&self.sh2),
+            experts: RoutedExperts::Resident {
+                w1: &self.w1,
+                w3: &self.w3,
+                w2: &self.w2,
+            },
         }
     }
 }
@@ -345,7 +347,16 @@ fn moe_matches_reference() {
     let t = f.shape("in")[1];
     let tensors = MoeTensors::load(&f, "", c.num_experts);
     let mut y = vec![0.0; t * c.hidden_size];
-    moe(&mut y, &x, &tensors.weights(), &c, t);
+    moe(
+        &mut y,
+        &x,
+        &tensors.weights(),
+        &c,
+        t,
+        1,
+        &mut NoStreamedExperts,
+    )
+    .expect("resident experts");
     assert_close("moe", &y, &f.arr("out"), manifest_tolerance());
 }
 
@@ -375,20 +386,20 @@ impl KdaTensors {
             o,
         ] = &self.0;
         KdaWeights {
-            q,
-            k,
-            v,
+            q: Matrix::F32(q),
+            k: Matrix::F32(k),
+            v: Matrix::F32(v),
             q_conv,
             k_conv,
             v_conv,
-            f_a,
-            f_b,
+            f_a: Matrix::F32(f_a),
+            f_b: Matrix::F32(f_b),
             a_log,
             dt_bias,
-            b,
-            g,
+            b: Matrix::F32(b),
+            g: Matrix::F32(g),
             o_norm,
-            o,
+            o: Matrix::F32(o),
         }
     }
 }
@@ -476,14 +487,14 @@ fn check_decoder_layer(file: &str) {
         .collect();
         (
             Attention::Mla(MlaWeights {
-                q_a: &mla_tensors[0],
+                q_a: Matrix::F32(&mla_tensors[0]),
                 q_a_norm: &mla_tensors[1],
-                q_b: &mla_tensors[2],
-                kv_a: &mla_tensors[3],
+                q_b: Matrix::F32(&mla_tensors[2]),
+                kv_a: Matrix::F32(&mla_tensors[3]),
                 kv_a_norm: &mla_tensors[4],
-                kv_b: &mla_tensors[5],
-                o: &mla_tensors[6],
-                g: Some(&mla_tensors[7]),
+                kv_b: Matrix::F32(&mla_tensors[5]),
+                o: Matrix::F32(&mla_tensors[6]),
+                g: Some(Matrix::F32(&mla_tensors[7])),
             }),
             LayerState::Mla(MlaCache::new(&c, t)),
         )
@@ -544,7 +555,9 @@ fn check_decoder_layer(file: &str) {
         t,
         &mut state,
         0,
-    );
+        &mut NoStreamedExperts,
+    )
+    .expect("resident experts");
     println!(
         "{file}: layer {layer_idx} ({}), blocks {nb_in} -> {}",
         if is_mla { "MLA" } else { "KDA" },

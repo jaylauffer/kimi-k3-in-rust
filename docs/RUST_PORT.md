@@ -99,9 +99,32 @@ never widened to fp32. `tests/weight_formats.rs` gates them as the C suite does:
   MXFP4 kernel reproduces the C scalar/NEON summation order; the C AVX2 path uses a
   different one and is bound to it only by the 1e-6 contract.
 
-Not ported yet: wiring bf16 and MXFP4 weights into the layers, streamed experts and the
-trunk ring, prefill expert batching, threading, and preallocated scratch. The tiny model
-needs none of them; the released checkpoint needs all of them.
+Those formats are wired through the model. Every weight read only through a matmul is a
+`layer::Matrix` tagged `F32` or `Bf16` (the embedding row gather included); weights read
+elementwise (norms, conv kernels, `A_log`, `dt_bias`, router gate and bias) stay fp32,
+the same split as `k3_bind.c`'s `reqw`/`reqn`, but tagged per matrix rather than per
+struct. A MoE layer's routed experts are either `RoutedExperts::Resident` fp32 banks or
+`Streamed` MXFP4 from a `layer::ExpertSource`, which the model's entry points take; the
+engine's source is `cache::CachedExperts`, the `ExpertCache` over the checkpoint shards.
+An expert that cannot be fetched is an `ExpertFetchError` that stops the token (and marks
+an incremental `Session` unusable) instead of C's counted drop.
+`tests/tagged_weights.rs` gates the wiring on the tiny checkpoint:
+
+- A bf16 trunk gives logits bit-identical to the same values bound as fp32, through
+  both the full forward and incremental decode.
+- Experts quantised to MXFP4 and streamed through a source match a resident fp32 bank of
+  their exact dequantisation: same argmax everywhere, measured bit-identical logits, and
+  the source is asked for exactly top-k experts per token per MoE layer. The streamed
+  model's incremental decode reproduces its own full forward bit for bit.
+- A streamed layer with no source is an error at its layer, and a session refuses
+  further tokens after one.
+
+`CachedExperts` is gated in `cache.rs` against direct loads of the cache fixture under
+eviction pressure and batch prefetch: identical packed bytes, scales and products.
+
+Not ported yet: binding the released checkpoint's safetensors names into these
+structures, the trunk ring, prefill expert batching (`k3_moe_prefill`), threading, and
+preallocated scratch.
 
 ## I/O: loadngo leads
 
@@ -136,7 +159,7 @@ reads use the page cache.
 1. Configuration parsing and safetensors I/O. *Done.*
 2. Expert-cache and trunk-streaming contracts. *Expert cache done; trunk streaming open.*
 3. Pure numerical kernels, checked against the C fixture manifest. *Done, including the
-   bf16 and MXFP4 matmuls; wiring them into the layers is open.*
+   bf16 and MXFP4 matmuls, wired through the layers with streamed experts.*
 4. Tensor binding and the tiny end-to-end model oracle. *Tiny oracle done, bit-identical
    to C; binding the released checkpoint's safetensors names open.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.

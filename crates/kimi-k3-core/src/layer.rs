@@ -1,9 +1,15 @@
 //! One decoder layer and its three sub-blocks, ported from `src/core/k3_ops.c`.
 //!
-//! Weights are borrowed fp32 slices, which is what the tiny oracle checkpoint and the
-//! op fixtures carry. The released checkpoint's bf16 trunk and streamed MXFP4 experts are
-//! a later slice; they change where weight bytes come from, not the order of arithmetic
-//! gated here.
+//! Every weight read only through a matmul is a [`Matrix`], tagged with the format it
+//! arrived in: fp32 for the op fixtures and the tiny oracle, bf16 for the released
+//! checkpoint's trunk. Weights read elementwise (norms, conv kernels, `A_log`,
+//! `dt_bias`, the router gate and bias) stay fp32 slices, exactly the C engine's
+//! `reqw`/`reqn` split in `src/model/k3_bind.c`. C tags a whole struct; here each matrix
+//! carries its own tag, so a layer can never read one format's bytes as another's.
+//!
+//! Routed experts are either resident fp32 banks (the fixtures) or streamed MXFP4 from an
+//! [`ExpertSource`]. A streamed expert that cannot be fetched is an error that stops the
+//! token, never a silently dropped contribution.
 //!
 //! Scratch buffers are allocated per call. Allocation changes no float, and the tiny
 //! model does not need the C engine's preallocated scratch layout.
@@ -17,32 +23,191 @@
     clippy::cast_possible_truncation
 )]
 
+use std::fmt;
+
 use crate::{
     config::K3Config,
+    expert::MXFP4_GROUP_SIZE,
     ops::{
-        attn_res, kda_decay_in_place, kda_step, l2norm_in_place, matmul, rmsnorm, rmsnorm_in_place,
-        router, shortconv_in_place, sigmoid, situ_glu,
+        attn_res, bf16_to_f32, kda_decay_in_place, kda_step, l2norm_in_place, matmul, matmul_bf16,
+        matmul_mxfp4, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid, situ_glu,
     },
 };
+
+/// A weight matrix read only through a matmul, in the storage format it arrived in.
+#[derive(Clone, Copy, Debug)]
+pub enum Matrix<'a> {
+    F32(&'a [f32]),
+    /// The checkpoint's own bf16 bytes, widened on read and never held at fp32.
+    Bf16(&'a [u16]),
+}
+
+impl Matrix<'_> {
+    /// `y[out] = W[out][inp] . x[inp]` through the kernel for this format.
+    pub fn mul(&self, y: &mut [f32], x: &[f32], inp: usize, out: usize) {
+        match *self {
+            Self::F32(w) => matmul(y, x, w, inp, out),
+            Self::Bf16(w) => matmul_bf16(y, x, w, inp, out),
+        }
+    }
+
+    /// Copies row `row` of a `width`-column matrix into `dst`, widening bf16. The
+    /// embedding is gathered a row at a time rather than multiplied.
+    pub fn row_into(&self, dst: &mut [f32], row: usize, width: usize) {
+        let at = row * width;
+        match *self {
+            Self::F32(w) => dst[..width].copy_from_slice(&w[at..at + width]),
+            Self::Bf16(w) => {
+                for (d, &h) in dst[..width].iter_mut().zip(&w[at..at + width]) {
+                    *d = bf16_to_f32(h);
+                }
+            }
+        }
+    }
+}
+
+/// One packed MXFP4 matrix: `rows` rows of `columns` logical values, two per packed byte,
+/// one E8M0 scale per [`MXFP4_GROUP_SIZE`] values.
+#[derive(Clone, Copy, Debug)]
+pub struct Mxfp4Matrix<'a> {
+    pub packed: &'a [u8],
+    pub scales: &'a [u8],
+    pub rows: usize,
+    pub columns: usize,
+}
+
+impl Mxfp4Matrix<'_> {
+    /// `y[rows] = W . x[columns]`, straight out of the packed bytes.
+    pub fn mul(&self, y: &mut [f32], x: &[f32]) {
+        matmul_mxfp4(
+            y,
+            x,
+            self.packed,
+            self.scales,
+            self.columns,
+            self.rows,
+            MXFP4_GROUP_SIZE,
+        );
+    }
+
+    fn check(&self, name: &str, rows: usize, columns: usize) -> Result<(), String> {
+        let packed = rows * columns / 2;
+        let scales = rows * columns.div_ceil(MXFP4_GROUP_SIZE);
+        if self.rows != rows || self.columns != columns {
+            return Err(format!(
+                "{name} is {}x{}, the layer needs {rows}x{columns}",
+                self.rows, self.columns
+            ));
+        }
+        if self.packed.len() < packed || self.scales.len() < scales {
+            return Err(format!(
+                "{name} holds {} packed and {} scale bytes, {rows}x{columns} needs {packed} and {scales}",
+                self.packed.len(),
+                self.scales.len()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One routed expert as the model consumes it: still MXFP4, never widened.
+/// `w1` is the gate and `w3` the up projection, `[moe_inter][latent]`; `w2` is the down
+/// projection, `[latent][moe_inter]`.
+#[derive(Clone, Copy, Debug)]
+pub struct PackedExpert<'a> {
+    pub w1: Mxfp4Matrix<'a>,
+    pub w2: Mxfp4Matrix<'a>,
+    pub w3: Mxfp4Matrix<'a>,
+}
+
+impl PackedExpert<'_> {
+    fn check(&self, latent: usize, inter: usize) -> Result<(), String> {
+        self.w1.check("w1", inter, latent)?;
+        self.w3.check("w3", inter, latent)?;
+        self.w2.check("w2", latent, inter)
+    }
+}
+
+/// A routed expert could not be supplied, so the token cannot be computed faithfully.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertFetchError {
+    pub layer: usize,
+    pub expert: usize,
+    pub detail: String,
+}
+
+impl fmt::Display for ExpertFetchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "routed expert {} of layer {} could not be used: {}",
+            self.expert, self.layer, self.detail
+        )
+    }
+}
+
+impl std::error::Error for ExpertFetchError {}
+
+/// Where streamed routed experts come from: a cache over the checkpoint shards in the
+/// engine, an in-memory bank in tests.
+pub trait ExpertSource {
+    /// Brings the experts one token selected resident together, so their reads can
+    /// overlap. The default does nothing; [`ExpertSource::expert`] then loads each one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertFetchError`] when the batch cannot be loaded.
+    fn prefetch(&mut self, _layer: usize, _experts: &[usize]) -> Result<(), ExpertFetchError> {
+        Ok(())
+    }
+
+    /// One expert's packed matrices, valid until the source is next used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertFetchError`] when the expert cannot be supplied.
+    fn expert(&mut self, layer: usize, expert: usize)
+    -> Result<PackedExpert<'_>, ExpertFetchError>;
+}
+
+/// The source for a model whose routed experts are all resident. A layer asking it for a
+/// streamed expert gets an error, not a zero contribution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoStreamedExperts;
+
+impl ExpertSource for NoStreamedExperts {
+    fn expert(
+        &mut self,
+        layer: usize,
+        expert: usize,
+    ) -> Result<PackedExpert<'_>, ExpertFetchError> {
+        Err(ExpertFetchError {
+            layer,
+            expert,
+            detail: "the layer streams its experts but the model was given no expert source"
+                .to_owned(),
+        })
+    }
+}
 
 /// Kimi Delta Attention weights for one layer.
 #[derive(Clone, Copy, Debug)]
 pub struct KdaWeights<'a> {
-    pub q: &'a [f32],
-    pub k: &'a [f32],
-    pub v: &'a [f32],
+    pub q: Matrix<'a>,
+    pub k: Matrix<'a>,
+    pub v: Matrix<'a>,
     pub q_conv: &'a [f32],
     pub k_conv: &'a [f32],
     pub v_conv: &'a [f32],
-    pub f_a: &'a [f32],
-    pub f_b: &'a [f32],
+    pub f_a: Matrix<'a>,
+    pub f_b: Matrix<'a>,
     /// `[heads]`, indexed per head.
     pub a_log: &'a [f32],
     pub dt_bias: &'a [f32],
-    pub b: &'a [f32],
-    pub g: &'a [f32],
+    pub b: Matrix<'a>,
+    pub g: Matrix<'a>,
     pub o_norm: &'a [f32],
-    pub o: &'a [f32],
+    pub o: Matrix<'a>,
 }
 
 /// The per-sequence memory one KDA layer carries between calls.
@@ -82,14 +247,14 @@ impl KdaState {
 /// Gated MLA weights for one layer. `g` is `None` when the output gate is disabled.
 #[derive(Clone, Copy, Debug)]
 pub struct MlaWeights<'a> {
-    pub q_a: &'a [f32],
+    pub q_a: Matrix<'a>,
     pub q_a_norm: &'a [f32],
-    pub q_b: &'a [f32],
-    pub kv_a: &'a [f32],
+    pub q_b: Matrix<'a>,
+    pub kv_a: Matrix<'a>,
     pub kv_a_norm: &'a [f32],
-    pub kv_b: &'a [f32],
-    pub o: &'a [f32],
-    pub g: Option<&'a [f32]>,
+    pub kv_b: Matrix<'a>,
+    pub o: Matrix<'a>,
+    pub g: Option<Matrix<'a>>,
 }
 
 /// Expanded per-head keys and values plus the shared, unrotated rope slot, for every
@@ -118,21 +283,33 @@ impl MlaCache {
     }
 }
 
-/// Stable `LatentMoE` weights with the routed experts resident and packed contiguously:
-/// `w1`/`w3` are `[experts][moe_inter][latent]`, `w2` is `[experts][latent][moe_inter]`.
+/// Where a `MoE` layer's routed experts live.
+#[derive(Clone, Copy, Debug)]
+pub enum RoutedExperts<'a> {
+    /// fp32 banks packed contiguously: `w1`/`w3` are `[experts][moe_inter][latent]`,
+    /// `w2` is `[experts][latent][moe_inter]`. What the fixtures carry.
+    Resident {
+        w1: &'a [f32],
+        w3: &'a [f32],
+        w2: &'a [f32],
+    },
+    /// Packed MXFP4, fetched per token from the [`ExpertSource`] the model is run with.
+    Streamed,
+}
+
+/// Stable `LatentMoE` weights. The router gate and bias stay fp32: the router carries its
+/// own inline dot product, as in C.
 #[derive(Clone, Copy, Debug)]
 pub struct MoeWeights<'a> {
     pub gate: &'a [f32],
     pub bias: Option<&'a [f32]>,
-    pub down: &'a [f32],
-    pub up: &'a [f32],
+    pub down: Matrix<'a>,
+    pub up: Matrix<'a>,
     pub latent_norm: &'a [f32],
-    pub shared_w1: &'a [f32],
-    pub shared_w3: &'a [f32],
-    pub shared_w2: &'a [f32],
-    pub w1: &'a [f32],
-    pub w3: &'a [f32],
-    pub w2: &'a [f32],
+    pub shared_w1: Matrix<'a>,
+    pub shared_w3: Matrix<'a>,
+    pub shared_w2: Matrix<'a>,
+    pub experts: RoutedExperts<'a>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -144,9 +321,9 @@ pub enum Attention<'a> {
 #[derive(Clone, Copy, Debug)]
 pub enum Mlp<'a> {
     Dense {
-        gate: &'a [f32],
-        up: &'a [f32],
-        down: &'a [f32],
+        gate: Matrix<'a>,
+        up: Matrix<'a>,
+        down: Matrix<'a>,
     },
     Moe(MoeWeights<'a>),
 }
@@ -200,12 +377,12 @@ pub fn kda_layer(
 
     for step in 0..t {
         let xt = &x[step * e..(step + 1) * e];
-        matmul(&mut q[step * p..], xt, w.q, e, p);
-        matmul(&mut kk[step * p..], xt, w.k, e, p);
-        matmul(&mut v[step * p..], xt, w.v, e, p);
-        matmul(&mut bt[step * heads..], xt, w.b, e, heads);
-        matmul(&mut fa, xt, w.f_a, e, d);
-        matmul(&mut z[step * p..], &fa, w.f_b, d, p);
+        w.q.mul(&mut q[step * p..], xt, e, p);
+        w.k.mul(&mut kk[step * p..], xt, e, p);
+        w.v.mul(&mut v[step * p..], xt, e, p);
+        w.b.mul(&mut bt[step * heads..], xt, e, heads);
+        w.f_a.mul(&mut fa, xt, e, d);
+        w.f_b.mul(&mut z[step * p..], &fa, d, p);
     }
 
     let (qs, rest) = state.conv.split_at_mut(p * hist);
@@ -265,11 +442,11 @@ pub fn kda_layer(
         for h in 0..heads {
             rmsnorm_in_place(&mut ot[h * d..(h + 1) * d], w.o_norm, c.rms_norm_eps);
         }
-        matmul(&mut gb, xt, w.g, e, p);
+        w.g.mul(&mut gb, xt, e, p);
         for (oi, &gi) in ot.iter_mut().zip(&gb) {
             *oi *= sigmoid(gi);
         }
-        matmul(&mut out[step * e..(step + 1) * e], ot, w.o, p, e);
+        w.o.mul(&mut out[step * e..(step + 1) * e], ot, p, e);
     }
 }
 
@@ -316,23 +493,17 @@ pub fn mla(
     for step in 0..t {
         let pos = cached + step;
         let xt = &x[step * e..(step + 1) * e];
-        matmul(&mut ql, xt, w.q_a, e, c.q_lora_rank);
+        w.q_a.mul(&mut ql, xt, e, c.q_lora_rank);
         rmsnorm_in_place(&mut ql, w.q_a_norm, c.rms_norm_eps);
-        matmul(
-            &mut q[step * heads * qh..],
-            &ql,
-            w.q_b,
-            c.q_lora_rank,
-            heads * qh,
-        );
+        w.q_b
+            .mul(&mut q[step * heads * qh..], &ql, c.q_lora_rank, heads * qh);
 
-        matmul(&mut ct, xt, w.kv_a, e, kvw);
+        w.kv_a.mul(&mut ct, xt, e, kvw);
         rmsnorm_in_place(&mut ct[..c.kv_lora_rank], w.kv_a_norm, c.rms_norm_eps);
         cache.rope[pos * qr..(pos + 1) * qr].copy_from_slice(&ct[c.kv_lora_rank..]);
-        matmul(
+        w.kv_b.mul(
             &mut cache.kv[pos * heads * kvd..(pos + 1) * heads * kvd],
             &ct,
-            w.kv_b,
             c.kv_lora_rank,
             heads * kvd,
         );
@@ -376,19 +547,35 @@ pub fn mla(
         }
 
         if let Some(g) = w.g {
-            matmul(&mut gbuf, &x[step * e..(step + 1) * e], g, e, heads * vh);
+            g.mul(&mut gbuf, &x[step * e..(step + 1) * e], e, heads * vh);
             for (ai, &gi) in acc.iter_mut().zip(&gbuf) {
                 *ai *= 1.0 / (1.0 + (-gi).exp());
             }
         }
-        matmul(&mut out[step * e..(step + 1) * e], &acc, w.o, heads * vh, e);
+        w.o.mul(&mut out[step * e..(step + 1) * e], &acc, heads * vh, e);
     }
 }
 
-/// Stable `LatentMoE` with resident experts: route on the full width, run the selected
-/// experts in latent space, `RMSNorm` the aggregate, up-project, then add the shared
-/// expert computed on the original input, unweighted.
-pub fn moe(out: &mut [f32], x: &[f32], w: &MoeWeights<'_>, c: &K3Config, t: usize) {
+/// Stable `LatentMoE`: route on the full width, run the selected experts in latent space,
+/// `RMSNorm` the aggregate, up-project, then add the shared expert computed on the
+/// original input, unweighted.
+///
+/// Streamed experts are handed to `experts` as a batch per token before the loop, so
+/// their reads can overlap, then multiplied straight out of MXFP4 in the router's order.
+///
+/// # Errors
+///
+/// Returns [`ExpertFetchError`] when a streamed expert cannot be fetched or has the wrong
+/// geometry. The output is then incomplete and must not be used.
+pub fn moe(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    layer_idx: usize,
+    experts: &mut dyn ExpertSource,
+) -> Result<(), ExpertFetchError> {
     let e = c.hidden_size;
     let l = c.routed_expert_hidden_size;
     let inter = c.moe_intermediate_size;
@@ -423,16 +610,35 @@ pub fn moe(out: &mut [f32], x: &[f32], w: &MoeWeights<'_>, c: &K3Config, t: usiz
             c.routed_scaling_factor,
         );
 
-        matmul(&mut z, xt, w.down, e, l);
+        w.down.mul(&mut z, xt, e, l);
         acc.fill(0.0);
+        if matches!(w.experts, RoutedExperts::Streamed) {
+            experts.prefetch(layer_idx, &idx)?;
+        }
         for (&expert, &wj) in idx.iter().zip(&wt) {
-            let e13 = expert * inter * l;
-            let e2 = expert * l * inter;
             let (gate, up) = gu.split_at_mut(inter);
-            matmul(gate, &z, &w.w1[e13..e13 + inter * l], l, inter);
-            matmul(up, &z, &w.w3[e13..e13 + inter * l], l, inter);
-            situ_glu(&mut act, &gu, inter, b1, b2);
-            matmul(&mut edn, &act, &w.w2[e2..e2 + l * inter], inter, l);
+            match w.experts {
+                RoutedExperts::Resident { w1, w3, w2 } => {
+                    let e13 = expert * inter * l;
+                    let e2 = expert * l * inter;
+                    matmul(gate, &z, &w1[e13..e13 + inter * l], l, inter);
+                    matmul(up, &z, &w3[e13..e13 + inter * l], l, inter);
+                    situ_glu(&mut act, &gu, inter, b1, b2);
+                    matmul(&mut edn, &act, &w2[e2..e2 + l * inter], inter, l);
+                }
+                RoutedExperts::Streamed => {
+                    let packed = experts.expert(layer_idx, expert)?;
+                    packed.check(l, inter).map_err(|detail| ExpertFetchError {
+                        layer: layer_idx,
+                        expert,
+                        detail,
+                    })?;
+                    packed.w1.mul(gate, &z);
+                    packed.w3.mul(up, &z);
+                    situ_glu(&mut act, &gu, inter, b1, b2);
+                    packed.w2.mul(&mut edn, &act);
+                }
+            }
             for (ai, &di) in acc.iter_mut().zip(&edn) {
                 *ai += wj * di;
             }
@@ -442,23 +648,24 @@ pub fn moe(out: &mut [f32], x: &[f32], w: &MoeWeights<'_>, c: &K3Config, t: usiz
             rmsnorm_in_place(&mut acc, w.latent_norm, c.rms_norm_eps);
         }
         let ot = &mut out[step * e..(step + 1) * e];
-        matmul(ot, &acc, w.up, l, e);
+        w.up.mul(ot, &acc, l, e);
 
         let (sgate, sup) = sgu.split_at_mut(si);
-        matmul(sgate, xt, w.shared_w1, e, si);
-        matmul(sup, xt, w.shared_w3, e, si);
+        w.shared_w1.mul(sgate, xt, e, si);
+        w.shared_w3.mul(sup, xt, e, si);
         situ_glu(&mut sact, &sgu, si, b1, b2);
-        matmul(&mut sdn, &sact, w.shared_w2, si, e);
+        w.shared_w2.mul(&mut sdn, &sact, si, e);
         for (oi, &di) in ot.iter_mut().zip(&sdn) {
             *oi += di;
         }
     }
+    Ok(())
 }
 
 fn dense_mlp(
     out: &mut [f32],
     x: &[f32],
-    weights: (&[f32], &[f32], &[f32]),
+    weights: (Matrix<'_>, Matrix<'_>, Matrix<'_>),
     c: &K3Config,
     t: usize,
 ) {
@@ -470,8 +677,8 @@ fn dense_mlp(
     for step in 0..t {
         let xt = &x[step * e..(step + 1) * e];
         let (g, u) = dgu.split_at_mut(di);
-        matmul(g, xt, gate, e, di);
-        matmul(u, xt, up, e, di);
+        gate.mul(g, xt, e, di);
+        up.mul(u, xt, e, di);
         situ_glu(
             &mut sub,
             &dgu,
@@ -479,7 +686,7 @@ fn dense_mlp(
             c.activation_situ_beta,
             c.activation_situ_linear_beta,
         );
-        matmul(&mut out[step * e..(step + 1) * e], &sub, down, di, e);
+        down.mul(&mut out[step * e..(step + 1) * e], &sub, di, e);
     }
 }
 
@@ -516,6 +723,11 @@ fn aggregate(
 /// On a boundary layer the running residual is pushed and then CLEARED, so it does not
 /// also survive as a separate softmax source there.
 ///
+/// # Errors
+///
+/// Returns [`ExpertFetchError`] when the layer's `MoE` cannot fetch a streamed expert; `h`
+/// and `state` are then partially updated and must not be used.
+///
 /// # Panics
 ///
 /// Panics when `state` does not match the layer's attention kind.
@@ -528,7 +740,8 @@ pub fn decoder_layer(
     t: usize,
     state: &mut LayerState,
     cached: usize,
-) {
+    experts: &mut dyn ExpertSource,
+) -> Result<(), ExpertFetchError> {
     let e = c.hidden_size;
     let eps = c.rms_norm_eps;
     let n = t * e;
@@ -584,12 +797,13 @@ pub fn decoder_layer(
         );
     }
     match &w.mlp {
-        Mlp::Moe(mw) => moe(&mut tmp, &hin, mw, c, t),
-        Mlp::Dense { gate, up, down } => dense_mlp(&mut tmp, &hin, (gate, up, down), c, t),
+        Mlp::Moe(mw) => moe(&mut tmp, &hin, mw, c, t, layer_idx, experts)?,
+        Mlp::Dense { gate, up, down } => dense_mlp(&mut tmp, &hin, (*gate, *up, *down), c, t),
     }
 
     for (pi, &ti) in pref.iter_mut().zip(&tmp) {
         *pi += ti;
     }
     h[..n].copy_from_slice(&pref);
+    Ok(())
 }
