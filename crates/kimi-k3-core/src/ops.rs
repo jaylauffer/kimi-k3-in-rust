@@ -342,3 +342,185 @@ pub fn attn_res(out: &mut [f32], src: &[f32], fold: &[f32], nsrc: usize, n: usiz
         }
     }
 }
+
+/// Widens one bf16 value to f32. bf16 IS the top 16 bits of an f32, so this is a pure
+/// shift with no rounding, table or exponent rebias.
+#[inline]
+#[must_use]
+pub fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits(u32::from(h) << 16)
+}
+
+/// [`matmul`] with the weight stored as bf16 and widened on read.
+///
+/// Same sixteen-accumulator partition, fused products and reduction tree as [`matmul`],
+/// and the widen is exact, so on identical values the two agree to the bit. That is the
+/// gate: any difference is a wrong stride, a dropped tail element or a mis-shifted widen.
+///
+/// # Panics
+///
+/// Panics when `w` holds fewer than `out * inp` values.
+pub fn matmul_bf16(y: &mut [f32], x: &[f32], w: &[u16], inp: usize, out: usize) {
+    assert!(
+        w.len() >= inp * out,
+        "matmul_bf16 weight holds {} values, {out}x{inp} needs {}",
+        w.len(),
+        inp * out
+    );
+    let x = &x[..inp];
+    for (yo, row) in y[..out].iter_mut().zip(w.chunks_exact(inp)) {
+        let mut a = [0.0_f64; 16];
+        let mut i = 0;
+        while i + 16 <= inp {
+            for (l, acc) in a.iter_mut().enumerate() {
+                *acc = f64::from(bf16_to_f32(row[i + l])).mul_add(f64::from(x[i + l]), *acc);
+            }
+            i += 16;
+        }
+        let b0 = (a[0] + a[4]) + (a[8] + a[12]);
+        let b1 = (a[1] + a[5]) + (a[9] + a[13]);
+        let b2 = (a[2] + a[6]) + (a[10] + a[14]);
+        let b3 = (a[3] + a[7]) + (a[11] + a[15]);
+        let mut acc = (b0 + b1) + (b2 + b3);
+        for j in i..inp {
+            acc = f64::from(bf16_to_f32(row[j])).mul_add(f64::from(x[j]), acc);
+        }
+        *yo = acc as f32;
+    }
+}
+
+/// OCP MX E2M1, indexed by the 4-bit code; bit 3 is the sign, so code 8 is `-0.0`.
+const E2M1: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// Largest MXFP4 group [`matmul_mxfp4`] accepts, the C kernel's `wf[64]` bound.
+pub const MXFP4_MAX_GROUP: usize = 64;
+
+/// An E8M0 scale byte as its power of two, `2^(b - 127)`. 255 is NaN by the OCP MX spec
+/// and maps to zero, so one bad byte cannot poison a row.
+///
+/// Built from bits rather than `powi`, so it is exact by construction: exponent field `b`
+/// with a zero mantissa is `2^(b - 127)` for `b` in 1..=254, and `2^-127` is the
+/// subnormal with only bit 22 set.
+#[inline]
+#[must_use]
+pub fn e8m0_scale(b: u8) -> f32 {
+    match b {
+        255 => 0.0,
+        0 => f32::from_bits(1 << 22),
+        _ => f32::from_bits(u32::from(b) << 23),
+    }
+}
+
+/// Dequantises MXFP4 rows: `packed` is `[rows][pcols]` (two elements per byte, the LOW
+/// nibble is the EVEN element), `scales` is `[rows][ceil(2*pcols/group)]`, and `out` is
+/// `[rows][2*pcols]`. A table lookup times a power of two, so it is exact.
+pub fn mxfp4_dequant(
+    out: &mut [f32],
+    packed: &[u8],
+    scales: &[u8],
+    rows: usize,
+    pcols: usize,
+    group: usize,
+) {
+    let width = pcols * 2;
+    let ngrp = width.div_ceil(group);
+    for r in 0..rows {
+        let pr = &packed[r * pcols..(r + 1) * pcols];
+        let sr = &scales[r * ngrp..(r + 1) * ngrp];
+        let orow = &mut out[r * width..(r + 1) * width];
+        for (g, &sb) in sr.iter().enumerate() {
+            let mult = e8m0_scale(sb);
+            let lo = g * group;
+            let hi = (lo + group).min(width);
+            for i in lo..hi {
+                let byte = pr[i >> 1];
+                let nib = if i & 1 == 1 { byte >> 4 } else { byte & 0x0F };
+                orow[i] = E2M1[usize::from(nib)] * mult;
+            }
+        }
+    }
+}
+
+/// `y[rows] = W[rows][inp] . x[inp]` with `W` read straight out of packed MXFP4, never
+/// widened to an fp32 matrix: a streamed K3 expert stays 17.55 MB instead of 132 MB.
+///
+/// This is the C scalar and NEON arithmetic: per group, the E2M1 values are summed
+/// against `x` in eight fused double accumulators (element `i` in lane `i % 8`),
+/// reduced as `((s0+s4)+(s1+s5)) + ((s2+s6)+(s3+s7))` with a fused tail, then that group
+/// sum times its power-of-two scale is added to the row. A NaN scale (255) skips its
+/// group. The C AVX2 path uses a different order; its contract with this one, and with
+/// dequantise-then-[`matmul`], is a relative error below 1e-6, not bit identity.
+///
+/// # Panics
+///
+/// Panics when `inp` is odd (the packed stride is `inp / 2` bytes) or `group` exceeds
+/// [`MXFP4_MAX_GROUP`].
+pub fn matmul_mxfp4(
+    y: &mut [f32],
+    x: &[f32],
+    packed: &[u8],
+    scales: &[u8],
+    inp: usize,
+    rows: usize,
+    group: usize,
+) {
+    assert!(
+        inp % 2 == 0,
+        "matmul_mxfp4 needs an even input width (two elements per packed byte), got {inp}"
+    );
+    assert!(
+        group > 0 && group <= MXFP4_MAX_GROUP,
+        "matmul_mxfp4 group {group} is outside 1..={MXFP4_MAX_GROUP}"
+    );
+    let pcols = inp / 2;
+    let ngrp = inp.div_ceil(group);
+    let gbyte = group / 2;
+    // Widened once: float to double is exact, and x does not depend on the row.
+    let xd: Vec<f64> = x[..inp].iter().map(|&v| f64::from(v)).collect();
+
+    for (r, yr) in y[..rows].iter_mut().enumerate() {
+        let pr = &packed[r * pcols..(r + 1) * pcols];
+        let sr = &scales[r * ngrp..(r + 1) * ngrp];
+        let mut acc = 0.0_f64;
+        for (g, &sb) in sr.iter().enumerate() {
+            if sb == 255 {
+                continue;
+            }
+            let pb = &pr[g * gbyte..];
+            let n = (inp - g * group).min(group);
+            let xdg = &xd[g * group..g * group + n];
+
+            let mut wf = [0.0_f32; MXFP4_MAX_GROUP];
+            let half = n >> 1;
+            for j in 0..half {
+                let byte = pb[j];
+                wf[2 * j] = E2M1[usize::from(byte & 0x0F)];
+                wf[2 * j + 1] = E2M1[usize::from(byte >> 4)];
+            }
+            if n & 1 == 1 {
+                wf[n - 1] = E2M1[usize::from(pb[half] & 0x0F)];
+            }
+
+            let mut s = [0.0_f64; 8];
+            let mut i = 0;
+            while i + 8 <= n {
+                for (l, lane) in s.iter_mut().enumerate() {
+                    *lane = f64::from(wf[i + l]).mul_add(xdg[i + l], *lane);
+                }
+                i += 8;
+            }
+            let b0 = s[0] + s[4];
+            let b1 = s[1] + s[5];
+            let b2 = s[2] + s[6];
+            let b3 = s[3] + s[7];
+            let mut sub = (b0 + b1) + (b2 + b3);
+            for j in i..n {
+                sub = f64::from(wf[j]).mul_add(xdg[j], sub);
+            }
+            acc += sub * f64::from(e8m0_scale(sb));
+        }
+        *yr = acc as f32;
+    }
+}

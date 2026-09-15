@@ -81,9 +81,27 @@ the bit rather than to a tolerance.
   both, which places the difference in the platform's `expf`/`tanhf` rather than in the
   port. The committed gates are therefore the exact-token ones, which hold everywhere.
 
-Not ported yet: the bf16 and MXFP4 matmuls, streamed experts and the trunk ring,
-prefill expert batching, threading, and preallocated scratch. The tiny model needs none
-of them; the released checkpoint needs all of them.
+The released checkpoint's two weight formats have their kernels in `ops` too:
+`matmul_bf16` for the bf16 trunk (widened on read), and `mxfp4_dequant` plus
+`matmul_mxfp4`, which multiplies straight out of packed MXFP4 so a routed expert is
+never widened to fp32. `tests/weight_formats.rs` gates them as the C suite does:
+
+- `matmul_bf16` is bit-identical to `matmul` on the same values, over generated bf16
+  patterns that include denormals and huge exponents, at a 257x129 shape that exercises
+  every tail.
+- `mxfp4_dequant` is exact on `tests/fixtures/mxfp4.json`, released K3 expert bytes
+  (64 x 3584), and differs from the swapped-nibble order the fixture records.
+- `matmul_mxfp4` meets the C contract of relative error below 1e-6 against
+  dequantise-then-matmul on those bytes (measured 0), handles a short final group, skips
+  a NaN (255) scale group, and refuses an odd input width.
+- Bit parity with C on the Mac mini, same generator and inputs: `matmul_bf16` FNV-1a
+  `eea07659fdebcb0e` and `matmul_mxfp4` `ee6d38bf1b9f4046` from both engines. The Rust
+  MXFP4 kernel reproduces the C scalar/NEON summation order; the C AVX2 path uses a
+  different one and is bound to it only by the 1e-6 contract.
+
+Not ported yet: wiring bf16 and MXFP4 weights into the layers, streamed experts and the
+trunk ring, prefill expert batching, threading, and preallocated scratch. The tiny model
+needs none of them; the released checkpoint needs all of them.
 
 ## I/O: loadngo leads
 
@@ -117,8 +135,8 @@ reads use the page cache.
 
 1. Configuration parsing and safetensors I/O. *Done.*
 2. Expert-cache and trunk-streaming contracts. *Expert cache done; trunk streaming open.*
-3. Pure numerical kernels, checked against the C fixture manifest. *fp32 kernels done;
-   bf16 and MXFP4 matmuls open.*
+3. Pure numerical kernels, checked against the C fixture manifest. *Done, including the
+   bf16 and MXFP4 matmuls; wiring them into the layers is open.*
 4. Tensor binding and the tiny end-to-end model oracle. *Tiny oracle done, bit-identical
    to C; binding the released checkpoint's safetensors names open.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
