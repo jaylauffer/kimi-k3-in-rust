@@ -9,7 +9,7 @@ use std::{
     collections::HashMap,
     fmt,
     fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -17,6 +17,8 @@ use serde::{
     Deserialize,
     de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, Visitor},
 };
+
+use crate::io::{ReadRequest, ShardFiles, ShardIoError, fit};
 
 const WIDEN_CHUNK_BYTES: usize = 4 << 20;
 
@@ -82,9 +84,12 @@ impl TensorInfo {
 }
 
 /// An immutable, name-indexed view of all safetensors shards in a directory.
+///
+/// The shards stay open for the index's lifetime and every tensor read goes through
+/// their [`ShardFiles`] proactor.
 #[derive(Debug)]
 pub struct SafeTensorIndex {
-    shard_paths: Vec<PathBuf>,
+    io: ShardFiles,
     tensors: Vec<TensorInfo>,
     tensor_indices: HashMap<String, usize>,
 }
@@ -142,8 +147,9 @@ impl SafeTensorIndex {
             }
         }
 
+        let io = ShardFiles::open(&shard_paths)?;
         Ok(Self {
-            shard_paths,
+            io,
             tensors,
             tensor_indices,
         })
@@ -152,7 +158,7 @@ impl SafeTensorIndex {
     /// Returns every shard path in its stable, zero-based shard order.
     #[must_use]
     pub fn shard_paths(&self) -> &[PathBuf] {
-        &self.shard_paths
+        self.io.paths()
     }
 
     /// Returns every indexed tensor in header discovery order.
@@ -174,18 +180,17 @@ impl SafeTensorIndex {
     /// # Errors
     ///
     /// Returns [`SafeTensorError`] if the tensor did not originate from this index or
-    /// its file cannot be reopened and read in full.
+    /// its bytes cannot be read in full.
     pub fn read_raw(&self, tensor: &TensorInfo) -> Result<Vec<u8>, SafeTensorError> {
-        let mut bytes = vec![0; tensor.nbytes];
-        self.read_exact(tensor, &mut bytes)?;
-        Ok(bytes)
+        Ok(self
+            .io
+            .read(tensor.shard, tensor.offset, vec![0; tensor.nbytes])?)
     }
 
     /// Reads a bounded byte range from one shard.
     ///
-    /// This is the primitive used for a contiguous routed-expert run. Higher-level
-    /// loaders must derive the range from indexed [`TensorInfo`] values rather than
-    /// accepting an unchecked checkpoint offset from a caller.
+    /// Higher-level loaders must derive the range from indexed [`TensorInfo`] values
+    /// rather than accepting an unchecked checkpoint offset from a caller.
     ///
     /// # Errors
     ///
@@ -197,24 +202,23 @@ impl SafeTensorIndex {
         offset: u64,
         output: &mut [u8],
     ) -> Result<(), SafeTensorError> {
-        let path = self
-            .shard_paths
-            .get(shard)
-            .ok_or_else(|| SafeTensorError::UnknownShard {
-                name: format!("range at byte {offset}"),
-                shard,
-            })?;
-        let mut file = File::open(path).map_err(|error| SafeTensorError::OpenShard {
-            path: path.clone(),
-            error: error.to_string(),
-        })?;
-        file.seek(SeekFrom::Start(offset))
-            .and_then(|_| file.read_exact(output))
-            .map_err(|error| SafeTensorError::ShortRead {
-                path: path.clone(),
-                name: format!("range at byte {offset}"),
-                error: error.to_string(),
-            })
+        let bytes = self.io.read(shard, offset, vec![0; output.len()])?;
+        output.copy_from_slice(&bytes);
+        Ok(())
+    }
+
+    /// Reads a batch of bounded shard ranges through the index's proactor, every
+    /// request submitted before any completion is collected.
+    ///
+    /// This is the primitive for routed-expert loads: one request per contiguous expert,
+    /// each reading straight into the buffer it was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SafeTensorError`] if any request names an unknown shard or cannot be
+    /// read in full.
+    pub fn read_batch(&self, requests: Vec<ReadRequest>) -> Result<Vec<Vec<u8>>, SafeTensorError> {
+        Ok(self.io.read_batch(requests)?)
     }
 
     /// Reads and widens `tensor` into exactly `output.len()` `f32` values.
@@ -242,12 +246,7 @@ impl SafeTensorIndex {
 
         let element_size = tensor.dtype.element_size();
         let chunk_elements = WIDEN_CHUNK_BYTES / element_size;
-        let mut raw = vec![0_u8; chunk_elements * element_size];
-        let path = self.tensor_path(tensor)?;
-        let mut file = File::open(path).map_err(|error| SafeTensorError::OpenShard {
-            path: path.to_path_buf(),
-            error: error.to_string(),
-        })?;
+        let mut raw = Vec::with_capacity(chunk_elements * element_size);
 
         for (element_offset, destination) in output.chunks_mut(chunk_elements).enumerate() {
             let bytes = destination.len() * element_size;
@@ -267,36 +266,12 @@ impl SafeTensorIndex {
                 .ok_or_else(|| SafeTensorError::OffsetOverflow {
                     name: tensor.name.clone(),
                 })?;
-            read_exact_at(&mut file, path, absolute_offset, &mut raw[..bytes], tensor)?;
-            widen_into(tensor.dtype, &raw[..bytes], destination);
+            // One reused allocation for every chunk: the kernel fills it and hands it back.
+            fit(&mut raw, bytes);
+            raw = self.io.read(tensor.shard, absolute_offset, raw)?;
+            widen_into(tensor.dtype, &raw, destination);
         }
         Ok(())
-    }
-
-    fn read_exact(&self, tensor: &TensorInfo, output: &mut [u8]) -> Result<(), SafeTensorError> {
-        if output.len() != tensor.nbytes {
-            return Err(SafeTensorError::RawOutputLength {
-                name: tensor.name.clone(),
-                expected: tensor.nbytes,
-                actual: output.len(),
-            });
-        }
-        let path = self.tensor_path(tensor)?;
-        let mut file = File::open(path).map_err(|error| SafeTensorError::OpenShard {
-            path: path.to_path_buf(),
-            error: error.to_string(),
-        })?;
-        read_exact_at(&mut file, path, tensor.offset, output, tensor)
-    }
-
-    fn tensor_path(&self, tensor: &TensorInfo) -> Result<&Path, SafeTensorError> {
-        self.shard_paths
-            .get(tensor.shard)
-            .map(PathBuf::as_path)
-            .ok_or_else(|| SafeTensorError::UnknownShard {
-                name: tensor.name.clone(),
-                shard: tensor.shard,
-            })
     }
 }
 
@@ -352,12 +327,14 @@ pub enum SafeTensorError {
         expected: usize,
         actual: usize,
     },
-    /// A read stopped before the required tensor bytes arrived.
-    ShortRead {
-        path: PathBuf,
-        name: String,
-        error: String,
-    },
+    /// A shard read through the proactor failed or stopped early.
+    Io(ShardIoError),
+}
+
+impl From<ShardIoError> for SafeTensorError {
+    fn from(error: ShardIoError) -> Self {
+        Self::Io(error)
+    }
 }
 
 impl fmt::Display for SafeTensorError {
@@ -442,11 +419,7 @@ impl fmt::Display for SafeTensorError {
                 formatter,
                 "output for {name} has {actual} elements; expected {expected}"
             ),
-            Self::ShortRead { path, name, error } => write!(
-                formatter,
-                "short read for tensor {name} from {}: {error}",
-                path.display()
-            ),
+            Self::Io(error) => error.fmt(formatter),
         }
     }
 }
@@ -627,22 +600,6 @@ fn scan_shard(
         path: path.to_path_buf(),
         detail: error.to_string(),
     })
-}
-
-fn read_exact_at(
-    file: &mut File,
-    path: &Path,
-    offset: u64,
-    output: &mut [u8],
-    tensor: &TensorInfo,
-) -> Result<(), SafeTensorError> {
-    file.seek(SeekFrom::Start(offset))
-        .and_then(|_| file.read_exact(output))
-        .map_err(|error| SafeTensorError::ShortRead {
-            path: path.to_path_buf(),
-            name: tensor.name.clone(),
-            error: error.to_string(),
-        })
 }
 
 fn widen_into(dtype: DType, input: &[u8], output: &mut [f32]) {

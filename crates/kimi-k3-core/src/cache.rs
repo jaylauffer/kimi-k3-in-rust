@@ -206,7 +206,7 @@ impl ExpertCache {
         let key_index = self.key_index(layer, expert)?;
         self.histogram[key_index] = self.histogram[key_index].saturating_add(1);
         self.trace.push(ExpertKey { layer, expert });
-        self.admit(index, layer, expert, Admission::Demand)
+        self.admit(index, layer, expert)
     }
 
     /// Loads one expert without recording a model request.
@@ -224,38 +224,70 @@ impl ExpertCache {
         expert: usize,
     ) -> Result<ResidentExpert, CacheError> {
         self.key_index(layer, expert)?;
-        self.admit(index, layer, expert, Admission::Demand)
+        self.admit(index, layer, expert)
     }
 
     /// Warms a unique batch of experts and returns the count newly loaded.
     ///
-    /// The reservation and publication logic is intentionally sequential for now: it
-    /// establishes the no-aliasing contract before the direct-I/O parallel reader is
-    /// introduced. Already-resident and duplicate IDs are skipped without changing
-    /// demand hit/miss counters, matching the C batch path.
+    /// Mirrors the C cache's three phases. Resolution and slot reservation are serial,
+    /// because choosing a slot reads and updates the LRU, and every reserved slot stays
+    /// pinned until publication so no two experts in one batch can share storage. All
+    /// reads then go to the proactor as one batch, each straight into its slot. Finally
+    /// the experts are published. Already-resident and duplicate IDs are skipped
+    /// without changing demand hit/miss counters, matching the C batch path.
+    ///
+    /// On any error nothing from the batch is published, and reserved slots are left
+    /// empty and unpinned.
     ///
     /// # Errors
     ///
-    /// Returns [`CacheError`] for invalid keys, failed expert resolution/I/O, or a fully
-    /// pinned cache.
+    /// Returns [`CacheError`] for invalid keys, failed expert resolution/I/O, or too few
+    /// unpinned slots for the batch.
     pub fn prefetch_many(
         &mut self,
         index: &SafeTensorIndex,
         layer: usize,
         experts: &[usize],
     ) -> Result<usize, CacheError> {
-        let mut loaded = 0;
-        let mut seen = Vec::with_capacity(experts.len());
+        let mut unique = Vec::with_capacity(experts.len());
         for &expert in experts {
             self.key_index(layer, expert)?;
-            if seen.contains(&expert) || self.is_resident(layer, expert) {
-                continue;
+            if !unique.contains(&expert) && !self.is_resident(layer, expert) {
+                unique.push(expert);
             }
-            seen.push(expert);
-            self.admit(index, layer, expert, Admission::BatchPrefetch)?;
-            loaded += 1;
         }
-        Ok(loaded)
+
+        let mut reserved: Vec<(usize, ExpertKey, ExpertRef)> = Vec::with_capacity(unique.len());
+        for expert in unique {
+            let key = ExpertKey { layer, expert };
+            match self.reserve(index, key) {
+                Ok((slot, layout)) => reserved.push((slot, key, layout)),
+                Err(error) => {
+                    self.release(&reserved);
+                    return Err(error);
+                }
+            }
+        }
+
+        let batch = reserved
+            .iter()
+            .map(|(slot, _, layout)| (layout, std::mem::take(&mut self.slots[*slot].bytes)))
+            .collect();
+        let loaded = match ExpertRef::load_batch(index, batch) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                self.release(&reserved);
+                return Err(error.into());
+            }
+        };
+
+        let count = reserved.len();
+        for ((slot, key, layout), bytes) in reserved.into_iter().zip(loaded) {
+            self.stats.bytes_read += layout.nbytes as u64;
+            self.stats.prefetch_reads += 1;
+            self.publish(slot, key, layout, bytes);
+        }
+        Ok(count)
     }
 
     /// Borrows the canonical expert bytes for a still-resident handle.
@@ -281,14 +313,11 @@ impl ExpertCache {
         index: &SafeTensorIndex,
         layer: usize,
         expert: usize,
-        admission: Admission,
     ) -> Result<ResidentExpert, CacheError> {
         let key_index = self.key_index(layer, expert)?;
         let key = ExpertKey { layer, expert };
         if let Some(slot) = self.slot_of[key_index] {
-            if admission == Admission::Demand {
-                self.stats.hits += 1;
-            }
+            self.stats.hits += 1;
             self.touch(slot);
             let layout = self.slots[slot]
                 .layout
@@ -296,11 +325,30 @@ impl ExpertCache {
                 .ok_or(CacheError::StaleHandle { key })?;
             return Ok(ResidentExpert { slot, key, layout });
         }
-        if admission == Admission::Demand {
-            self.stats.misses += 1;
-        }
+        self.stats.misses += 1;
 
-        let layout = ExpertRef::resolve(index, layer, expert)?;
+        let (slot, layout) = self.reserve(index, key)?;
+        let buffer = std::mem::take(&mut self.slots[slot].bytes);
+        let bytes = match ExpertRef::load_batch(index, vec![(&layout, buffer)]) {
+            Ok(mut loaded) => loaded.pop().unwrap_or_default(),
+            Err(error) => {
+                self.release(&[(slot, key, layout)]);
+                return Err(error.into());
+            }
+        };
+        self.stats.bytes_read += layout.nbytes as u64;
+        self.publish(slot, key, layout.clone(), bytes);
+        Ok(ResidentExpert { slot, key, layout })
+    }
+
+    /// Resolves `key` and claims a slot for it: evicted, emptied, and pinned so a later
+    /// reservation in the same batch cannot claim it again.
+    fn reserve(
+        &mut self,
+        index: &SafeTensorIndex,
+        key: ExpertKey,
+    ) -> Result<(usize, ExpertRef), CacheError> {
+        let layout = ExpertRef::resolve(index, key.layer, key.expert)?;
         if layout.nbytes > self.slot_stride {
             return Err(CacheError::ExpertTooLarge {
                 key,
@@ -310,17 +358,27 @@ impl ExpertCache {
         }
         let slot = self.pick_victim().ok_or(CacheError::AllPinned)?;
         self.evict(slot);
-        layout.load_into(index, &mut self.slots[slot].bytes[..layout.nbytes])?;
-        self.stats.bytes_read +=
-            u64::try_from(layout.nbytes).map_err(|_| CacheError::CapacityOverflow)?;
-        if admission == Admission::BatchPrefetch {
-            self.stats.prefetch_reads += 1;
+        self.slots[slot].pinned = true;
+        Ok((slot, layout))
+    }
+
+    /// Returns reserved slots to the pool after a failed load. They stay empty.
+    fn release(&mut self, reserved: &[(usize, ExpertKey, ExpertRef)]) {
+        for &(slot, _, _) in reserved {
+            self.slots[slot].pinned = false;
         }
-        self.slots[slot].key = Some(key);
-        self.slots[slot].layout = Some(layout.clone());
+    }
+
+    /// Makes a loaded expert resident in its reserved slot.
+    fn publish(&mut self, slot: usize, key: ExpertKey, layout: ExpertRef, bytes: Vec<u8>) {
+        let key_index = key.layer * self.experts + key.expert;
+        let entry = &mut self.slots[slot];
+        entry.bytes = bytes;
+        entry.key = Some(key);
+        entry.layout = Some(layout);
+        entry.pinned = false;
         self.slot_of[key_index] = Some(slot);
         self.touch(slot);
-        Ok(ResidentExpert { slot, key, layout })
     }
 
     fn key_index(&self, layer: usize, expert: usize) -> Result<usize, CacheError> {
@@ -336,11 +394,12 @@ impl ExpertCache {
     }
 
     fn pick_victim(&self) -> Option<usize> {
+        // An empty slot can already be reserved (pinned) by the batch in progress.
         if let Some((slot, _)) = self
             .slots
             .iter()
             .enumerate()
-            .find(|(_, slot)| slot.key.is_none())
+            .find(|(_, slot)| slot.key.is_none() && !slot.pinned)
         {
             return Some(slot);
         }
@@ -465,12 +524,6 @@ impl From<ExpertError> for CacheError {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum Admission {
-    Demand,
-    BatchPrefetch,
-}
-
 #[derive(Debug)]
 struct Slot {
     key: Option<ExpertKey>,
@@ -484,7 +537,9 @@ impl Slot {
     fn new(slot_stride: usize) -> Self {
         Self {
             key: None,
-            bytes: vec![0; slot_stride],
+            // Reserved, not written: like the C arena, a slot's pages are committed by
+            // the first expert read into it rather than by zeroing the whole budget.
+            bytes: Vec::with_capacity(slot_stride),
             layout: None,
             used_at: 0,
             pinned: false,
@@ -573,6 +628,38 @@ mod tests {
         assert_eq!(cache.stats().prefetch_reads, 24);
         assert_eq!(cache.stats().hits, 24);
         assert!(cache.stats().prefetch_reads <= cache.stats().hits);
+    }
+
+    #[test]
+    fn a_batch_into_a_full_cache_gives_every_expert_its_own_slot() {
+        // Every slot is full, so each reservation must evict, and no two experts in the
+        // batch may be handed the same slot. Aliasing would show up as one expert's
+        // bytes under another's key.
+        let index = fixture_index();
+        let mut cache = cache(&index, 5);
+        for expert in 0..5 {
+            cache.get(&index, 0, expert).expect("expert admits");
+        }
+
+        let batch = [10, 11, 12, 13, 14];
+        assert_eq!(
+            cache
+                .prefetch_many(&index, 0, &batch)
+                .expect("batch prefetches"),
+            5
+        );
+        for expert in 0..5 {
+            assert!(!cache.is_resident(0, expert), "expert {expert} not evicted");
+        }
+        for expert in batch {
+            assert!(cache.is_resident(0, expert));
+            let resident = cache.get(&index, 0, expert).expect("resident expert");
+            assert_eq!(
+                cache.bytes(&resident).expect("handle stays resident"),
+                direct_bytes(&index, expert)
+            );
+        }
+        assert_eq!(cache.stats().evictions, 5);
     }
 
     #[test]

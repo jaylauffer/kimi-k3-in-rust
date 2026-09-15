@@ -8,4 +8,5 @@
 pub mod cache;
 pub mod config;
 pub mod expert;
+pub mod io;
 pub mod safetensors;

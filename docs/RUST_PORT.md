@@ -53,6 +53,34 @@ disk reads from demand hits. The current batch reader is deliberately sequential
 the no-aliasing and accounting gates are established; the later direct-I/O parallel
 implementation must preserve these public semantics and fixture tests.
 
+## I/O: loadngo leads
+
+Every shard read goes through `loadngo-proactor` (`kimi-k3-core::io`), pinned to an
+exact loadngo commit in `crates/kimi-k3-core/Cargo.toml`. Shards are opened once
+(overlapped on Windows) and each read is a positioned completion read. That one path
+is `io_uring` on Linux, IOCP on Windows, kqueue on macOS and iOS, and epoll on
+Android, in place of the C engine's per-OS `pread`/`O_DIRECT`/`F_NOCACHE` shims and
+prefetch threads.
+
+- `ShardFiles::read_batch` submits a whole batch before collecting completions,
+  resumes short reads, and treats end of file inside a range as an error (including
+  Windows' `ERROR_HANDLE_EOF`).
+- Buffers travel with the read and come back filled, so `ExpertCache` reads each
+  expert straight into its slot's storage: no zeroed temporary and no copy.
+  Slots reserve capacity rather than zeroing the budget, so pages are committed by
+  the first read, as with the C arena.
+- `ExpertCache::prefetch_many` follows the C three-phase shape: reserve distinct,
+  pinned slots serially; read every expert in one batch; publish.
+
+Concurrency is a property of the backend, not of this crate. `io_uring` and IOCP
+service a batch concurrently. The kqueue and epoll backends currently complete a
+regular-file read synchronously during submission, so on macOS, iOS and Android a
+batch still runs one read at a time. Offloading those file reads belongs in
+loadngo, and the port needs no change when it lands.
+
+Direct I/O (`O_DIRECT`/`F_NOCACHE`) and aligned slot memory are not implemented yet;
+reads use the page cache.
+
 ## Port order
 
 1. Configuration parsing and safetensors I/O.

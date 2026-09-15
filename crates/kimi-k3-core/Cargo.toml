@@ -11,5 +11,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+# All shard I/O: positioned completion reads on io_uring, IOCP, kqueue or epoll.
+# Pinned to an exact loadngo commit; not yet published to crates.io.
+loadngo-proactor = { git = "https://github.com/jaylauffer/loadngo", rev = "b13b079d548979e8ba383d10d448a11f2b292d3e" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

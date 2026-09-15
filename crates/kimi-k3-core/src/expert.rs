@@ -6,7 +6,10 @@
 
 use std::fmt;
 
-use crate::safetensors::{DType, SafeTensorError, SafeTensorIndex, TensorInfo};
+use crate::{
+    io::{ReadRequest, fit},
+    safetensors::{DType, SafeTensorError, SafeTensorIndex, TensorInfo},
+};
 
 /// Number of logical MXFP4 values covered by one E8M0 scale.
 pub const MXFP4_GROUP_SIZE: usize = 32;
@@ -165,26 +168,100 @@ impl ExpertRef {
                 actual: output.len(),
             });
         }
-        if self.contiguous {
-            index.read_range(self.shard, self.offset, output)?;
-            return Ok(());
-        }
-
-        for (matrix_index, matrix) in MATRIX_NAMES.iter().enumerate() {
-            let layout = &self.matrices[matrix_index];
-            copy_tensor(
-                index,
-                &tensor_name(self.layer, self.expert, matrix, "weight_packed"),
-                &mut output[layout.packed_offset..layout.packed_offset + layout.packed_bytes],
-            )?;
-            copy_tensor(
-                index,
-                &tensor_name(self.layer, self.expert, matrix, "weight_scale"),
-                &mut output[layout.scale_offset..layout.scale_offset + layout.scale_bytes],
-            )?;
-        }
+        let mut loaded = Self::load_batch(index, vec![(self, Vec::new())])?;
+        output.copy_from_slice(&loaded.pop().unwrap_or_default());
         Ok(())
     }
+
+    /// Loads several experts in one proactor batch, each into the buffer paired with it.
+    ///
+    /// Every buffer is fitted to its expert's canonical size and handed to the read
+    /// itself, so passing a cache slot's storage loads the expert with no copy. A
+    /// contiguous expert is one positioned read; a repacked one is six, submitted in the
+    /// same batch and assembled afterwards. Returns the filled buffers in input order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExpertError`] if a tensor is missing or any read fails. The buffers are
+    /// consumed either way.
+    pub fn load_batch(
+        index: &SafeTensorIndex,
+        experts: Vec<(&Self, Vec<u8>)>,
+    ) -> Result<Vec<Vec<u8>>, ExpertError> {
+        let mut requests = Vec::with_capacity(experts.len());
+        let mut plans = Vec::with_capacity(experts.len());
+        for (expert, mut buffer) in experts {
+            fit(&mut buffer, expert.nbytes);
+            if expert.contiguous {
+                plans.push(LoadPlan::Whole {
+                    request: requests.len(),
+                });
+                requests.push(ReadRequest {
+                    shard: expert.shard,
+                    offset: expert.offset,
+                    buffer,
+                });
+                continue;
+            }
+            let first = requests.len();
+            for matrix in MATRIX_NAMES {
+                for suffix in ["weight_packed", "weight_scale"] {
+                    let name = tensor_name(expert.layer, expert.expert, matrix, suffix);
+                    let tensor = index
+                        .tensor(&name)
+                        .ok_or(ExpertError::MissingTensor { name })?;
+                    requests.push(ReadRequest {
+                        shard: tensor.shard,
+                        offset: tensor.offset,
+                        buffer: vec![0; tensor.nbytes],
+                    });
+                }
+            }
+            plans.push(LoadPlan::Pieces {
+                expert,
+                first,
+                buffer,
+            });
+        }
+
+        let mut filled: Vec<Option<Vec<u8>>> =
+            index.read_batch(requests)?.into_iter().map(Some).collect();
+        let mut take = |request: usize| filled[request].take().unwrap_or_default();
+        Ok(plans
+            .into_iter()
+            .map(|plan| match plan {
+                LoadPlan::Whole { request } => take(request),
+                LoadPlan::Pieces {
+                    expert,
+                    first,
+                    mut buffer,
+                } => {
+                    for (matrix_index, layout) in expert.matrices.iter().enumerate() {
+                        let packed = take(first + matrix_index * 2);
+                        let scales = take(first + matrix_index * 2 + 1);
+                        buffer[layout.packed_offset..layout.packed_offset + layout.packed_bytes]
+                            .copy_from_slice(&packed);
+                        buffer[layout.scale_offset..layout.scale_offset + layout.scale_bytes]
+                            .copy_from_slice(&scales);
+                    }
+                    buffer
+                }
+            })
+            .collect())
+    }
+}
+
+/// How one expert in a [`ExpertRef::load_batch`] maps onto its batch requests.
+enum LoadPlan<'a> {
+    /// A contiguous expert read by a single request into its own buffer.
+    Whole { request: usize },
+    /// A repacked expert: six requests starting at `first`, in `w1`..`w3`
+    /// packed-then-scales order, copied into `buffer` at their canonical offsets.
+    Pieces {
+        expert: &'a ExpertRef,
+        first: usize,
+        buffer: Vec<u8>,
+    },
 }
 
 /// A malformed or missing routed-expert tensor layout.
@@ -321,17 +398,6 @@ fn validate_pair<'a>(
     })
 }
 
-fn copy_tensor(index: &SafeTensorIndex, name: &str, output: &mut [u8]) -> Result<(), ExpertError> {
-    let tensor = index
-        .tensor(name)
-        .ok_or_else(|| ExpertError::MissingTensor {
-            name: name.to_owned(),
-        })?;
-    let bytes = index.read_raw(tensor)?;
-    output.copy_from_slice(&bytes);
-    Ok(())
-}
-
 fn matrix_layout(
     pair: &TensorPair<'_>,
     contiguous: bool,
@@ -428,6 +494,35 @@ mod tests {
         assert_eq!(first_byte(1, true), 221);
         assert_eq!(first_byte(2, false), 245);
         assert_eq!(first_byte(2, true), 1);
+    }
+
+    #[test]
+    fn a_batch_load_matches_loading_each_expert_alone() {
+        let index = fixture_index();
+        let experts = (0..24)
+            .map(|expert| ExpertRef::resolve(&index, 0, expert).expect("expert resolves"))
+            .collect::<Vec<_>>();
+
+        let alone = experts
+            .iter()
+            .map(|expert| {
+                let mut bytes = vec![0; expert.nbytes];
+                expert.load_into(&index, &mut bytes).expect("expert loads");
+                bytes
+            })
+            .collect::<Vec<_>>();
+        // Reused, wrongly sized buffers must still come back exactly expert-sized.
+        let batch = ExpertRef::load_batch(
+            &index,
+            experts
+                .iter()
+                .enumerate()
+                .map(|(position, expert)| (expert, vec![0xAA; position * 100]))
+                .collect(),
+        )
+        .expect("batch loads");
+
+        assert_eq!(batch, alone);
     }
 
     #[test]
