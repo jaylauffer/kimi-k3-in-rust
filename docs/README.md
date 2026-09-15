@@ -17,6 +17,7 @@
 | [TESTING.md](TESTING.md) | what each gate proves |
 | [BENCHMARKING.md](BENCHMARKING.md) | how to measure without fooling yourself |
 | [ROADMAP.md](ROADMAP.md) | what is missing, in priority order |
+| [RUST_PORT.md](RUST_PORT.md) | parity-first C-to-Rust port status and acceptance gates |
 | [data/](data/) | the raw measurement output every table is transcribed from |
 
 ## Upstream material
