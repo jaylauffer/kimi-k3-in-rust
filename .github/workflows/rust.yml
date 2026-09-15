@@ -1,0 +1,52 @@
+# Rust port gates for kimi-k3-core, separate from the upstream C workflow (ci.yml) so the
+# fork keeps rebasing cleanly onto upstream.
+#
+# Everything here runs without model weights: the op fixtures, the tiny 13-layer oracle,
+# the weight-format kernels on released MXFP4 bytes, and the expert cache fixture.
+# GitHub-hosted runners give the port its only real Windows and x86-64 runs; the lab's
+# self-hosted runners are ARM and are registered per repository.
+name: Rust
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kimi-k3-core:
+    name: kimi-k3-core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      # One platform failing must not hide what the others report.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          rustc --version
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (all + pedantic, warnings are errors)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
