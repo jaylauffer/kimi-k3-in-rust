@@ -16,8 +16,8 @@ implementation is not considered complete merely because it compiles.
 | `src/io/k3_st.c` | `kimi-k3-core::safetensors` | existing dtype, offset, escaped-name, and short-read fixtures |
 | `src/cache/k3_cache.c` | `kimi-k3-core::expert_cache` | prefetch, eviction, and mixed access tests |
 | `src/io/k3_trunk.c` | `kimi-k3-core::trunk` | one-slot guard and streaming-concurrency tests |
-| `src/core/k3_ops.c` | `kimi-k3-core::ops` | the existing numeric fixture manifest and full-size scale test |
-| `src/model/k3_bind.c` | `kimi-k3-core::model` | tiny-model teacher forcing, greedy, and incremental oracle |
+| `src/core/k3_ops.c` | `kimi-k3-core::ops`, `kimi-k3-core::layer` | the existing numeric fixture manifest and full-size scale test |
+| `tests/unit/k3_model.c`, `src/model/k3_bind.c` | `kimi-k3-core::model` | tiny-model teacher forcing, greedy, and incremental oracle |
 | `src/cli/k3_run.c` | `kimi-k3-cli` | CLI result and memory-budget parity |
 
 ## Implemented slices
@@ -53,6 +53,38 @@ disk reads from demand hits. The current batch reader is deliberately sequential
 the no-aliasing and accounting gates are established; the later direct-I/O parallel
 implementation must preserve these public semantics and fixture tests.
 
+`kimi-k3-core::ops`, `layer` and `model` run the whole model on resident fp32 weights:
+RMSNorm, SiTU-GLU, `ShortConv`, the KDA decay and recurrence, the router, Block
+Attention Residuals and the matmul kernel; the KDA and Gated MLA layers (MLA with a KV
+cache), Stable `LatentMoE`, the dense MLP and the decoder layer; then embedding, the
+model-level aggregator, final norm and head. Each kernel keeps the C scalar path's
+summation order, fused products and float/double conversions, so results match C to
+the bit rather than to a tolerance.
+
+- `tests/ops_fixtures.rs` runs every `tests/fixtures/ops` fixture at the manifest
+  tolerance, including the `ShortConv` continuation, per-head `A_log`, router set and
+  unbiased weights, and both decoder-layer fixtures (a non-boundary KDA layer and an
+  MLA layer on a block boundary).
+- `tests/tiny_oracle.rs` holds the tiny 13-layer checkpoint to `ref_k3.json` exactly, as
+  `k3_model.c` does: 20/20 teacher-forced positions, bit-identical logits with one reused
+  KDA state slot, 20/20 greedy tokens by full recompute, and 20/20 incremental tokens.
+  It goes one step further than the C gate: every incremental step's logits must be
+  bit-identical to the full forward's at that position.
+- Bit parity with C, checked 2026-09-15 by hashing the gate-1 logits (all 32 positions
+  x 256, FNV-1a) from both engines on the same machine, C built with the Makefile's
+  `-O3 -mcpu=native -ffp-contract=off`:
+  - M4 Pro Mac mini (Apple clang, Apple libm): `68a4648a958e36a1` from both.
+  - `agnes`, Raspberry Pi 4, Debian aarch64 (gcc 14.2, glibc): `de363746ad9bf8ea` from
+    both, with all 37 Rust tests passing there.
+
+  The two platforms differ from each other and each engine agrees with the other on
+  both, which places the difference in the platform's `expf`/`tanhf` rather than in the
+  port. The committed gates are therefore the exact-token ones, which hold everywhere.
+
+Not ported yet: the bf16 and MXFP4 matmuls, streamed experts and the trunk ring,
+prefill expert batching, threading, and preallocated scratch. The tiny model needs none
+of them; the released checkpoint needs all of them.
+
 ## I/O: loadngo leads
 
 Every shard read goes through `loadngo-proactor` (`kimi-k3-core::io`), pinned to an
@@ -73,20 +105,22 @@ prefetch threads.
   pinned slots serially; read every expert in one batch; publish.
 
 Concurrency is a property of the backend, not of this crate. `io_uring` and IOCP
-service a batch concurrently. The kqueue and epoll backends currently complete a
-regular-file read synchronously during submission, so on macOS, iOS and Android a
-batch still runs one read at a time. Offloading those file reads belongs in
-loadngo, and the port needs no change when it lands.
+service a batch concurrently, and since loadngo `98d58d5a` (pinned here from
+`0971c29e`) the kqueue and epoll backends hand regular-file reads to a worker pool, so
+a batch runs concurrently on macOS, iOS and Android too. On the Mac mini a batch of 128
+uncached 64 KiB reads went from 17.1 ms to 2.7 ms; the port needed no change.
 
 Direct I/O (`O_DIRECT`/`F_NOCACHE`) and aligned slot memory are not implemented yet;
 reads use the page cache.
 
 ## Port order
 
-1. Configuration parsing and safetensors I/O.
-2. Expert-cache and trunk-streaming contracts.
-3. Pure numerical kernels, checked against the C fixture manifest.
-4. Tensor binding and the tiny end-to-end model oracle.
+1. Configuration parsing and safetensors I/O. *Done.*
+2. Expert-cache and trunk-streaming contracts. *Expert cache done; trunk streaming open.*
+3. Pure numerical kernels, checked against the C fixture manifest. *fp32 kernels done;
+   bf16 and MXFP4 matmuls open.*
+4. Tensor binding and the tiny end-to-end model oracle. *Tiny oracle done, bit-identical
+   to C; binding the released checkpoint's safetensors names open.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
