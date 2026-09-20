@@ -126,6 +126,58 @@ Not ported yet: binding the released checkpoint's safetensors names into these
 structures, the trunk ring, prefill expert batching (`k3_moe_prefill`), threading, and
 preallocated scratch.
 
+### Real-checkpoint tensor names, confirmed 2026-09-20
+
+`~/k3model/` holds the released checkpoint's metadata only (`config.json`,
+`model.safetensors.index.json`, the tokenizer files) fetched from
+`moonshotai/Kimi-K3` at commit `f831ab66814297da540d832a5235f8e904f29d06` and
+verified sha256-exact against the values Hugging Face's API reports for
+each file -- not the 1.56 TB of weight shards themselves, which no local
+storage exists for yet (the external drive earmarked for them is a
+separate, still-open decision).
+
+Read against the index's 497,220 real tensor names, `k3_moe`
+(`src/core/k3_ops.c:537-656`, itself verified there against
+`modeling_kimi_linear.py:815-838`) resolves what first looked like two
+competing representations of the routed-expert weights into one coherent
+picture -- there is no discrepancy to design around, just two distinct
+pieces `k3_bind.c` already names correctly:
+
+- **One shared per-layer bottleneck**, applied identically regardless of
+  which experts are routed to: `block_sparse_moe.routed_expert_down_proj.weight`
+  (H=7168 -> latent=3584, `w->down`), `routed_expert_norm.weight` (RMSNorm
+  of the *summed* expert output, never per-expert, `w->latent_norm`), and
+  `routed_expert_up_proj.weight` (latent -> H, `w->up`). Plain matrices --
+  these bind as ordinary `layer::Matrix` (`Bf16` or `F32`), the same as
+  every other non-expert weight already wired through the model.
+- **896 per-expert MXFP4 cores**, each entirely inside that 3584-dim
+  latent space (3584 -> `moe_intermediate_size`=3072 -> 3584):
+  `block_sparse_moe.experts.<id>.{w1,w2,w3}.{weight_packed,weight_scale}`.
+  This is exactly the six-tensor-per-expert shape `kimi-k3-core::expert`
+  and `cache::CachedExperts` already implement and gate against the C
+  cache fixture -- nothing new needed there.
+- A separate, always-on **shared expert** (`num_shared_experts`=2, fused
+  into one wider MLP, intermediate `moe_intermediate_size * n_shared`
+  =6144) runs on the *original*, non-latent-projected input and is added
+  with no routing weight at all: `shared_experts.{gate_proj,up_proj,down_proj}.weight`.
+  Also plain matrices, not expert-indexed.
+
+Real config values behind the numbers above, from `text_config` in the
+downloaded `config.json`: `hidden_size`=7168, `routed_expert_hidden_size`
+(the latent width)=3584, `moe_intermediate_size`=3072, `num_experts`=896,
+`num_experts_per_token`=16, `num_shared_experts`=2,
+`latent_moe_use_norm`=true (matches `k3_cfg.h`'s `latent_norm` field
+exactly).
+
+The remaining real-checkpoint-binding work is therefore: extend
+`kimi-k3-core::model`'s tensor-binding layer to read the three shared
+per-layer matrices above by name (trivial -- same shape as any other
+`layer::Matrix`) alongside the already-implemented per-expert MXFP4 path,
+using `~/k3model/model.safetensors.index.json` as the name/shard map. This
+does not need the actual weight bytes to implement or unit-test against a
+synthetic fixture shaped like the real names; it needs them only to
+validate against the real checkpoint once storage exists.
+
 ## I/O: loadngo leads
 
 Every shard read goes through `loadngo-proactor` (`kimi-k3-core::io`), pinned to an
