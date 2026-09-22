@@ -122,6 +122,30 @@ impl ShardFiles {
     /// completed before a submission error is returned, so no buffer is left with the
     /// kernel.
     pub fn read_batch(&self, requests: Vec<ReadRequest>) -> Result<Vec<Vec<u8>>, ShardIoError> {
+        self.wait_batch(self.submit_batch(requests)?)
+    }
+
+    /// Submits every request without waiting for any completion, so the operating
+    /// system can complete them while the caller does other, non-I/O work.
+    ///
+    /// Nothing here spawns a thread: submission itself does not drive the proactor,
+    /// and completion is only ever observed later, when [`Self::wait_batch`] polls
+    /// for it. A caller that wants overlap -- start a prefetch, compute on data
+    /// already in hand, then wait -- gets it for free from this split; a caller
+    /// that wants the old blocking behavior gets exactly that from
+    /// [`Self::read_batch`], which is just this immediately followed by
+    /// [`Self::wait_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardIoError::UnknownShard`] if any request names an unopened
+    /// shard, or [`ShardIoError::Proactor`] if the proactor refuses a submission
+    /// (every already-submitted read is still completed before the error returns,
+    /// so no buffer is left with the kernel).
+    pub(crate) fn submit_batch(
+        &self,
+        requests: Vec<ReadRequest>,
+    ) -> Result<PendingBatch, ShardIoError> {
         if let Some(request) = requests
             .iter()
             .find(|request| request.shard >= self.files.len())
@@ -130,7 +154,6 @@ impl ShardFiles {
                 shard: request.shard,
             });
         }
-        let _drive = self.drive.lock().unwrap_or_else(PoisonError::into_inner);
 
         let mut outputs = Vec::with_capacity(requests.len());
         let mut round = Vec::with_capacity(requests.len());
@@ -147,49 +170,108 @@ impl ShardFiles {
                 buffer: request.buffer,
             });
         }
+        let submitted = self.submit(round);
+        Ok(PendingBatch { submitted, outputs })
+    }
 
+    /// Drives the proactor until every request `pending` was submitted with has
+    /// completed, resuming a short read exactly as [`Self::read_batch`] always has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardIoError`] for a poll failure, a failed read, or end of file
+    /// inside a requested range.
+    pub(crate) fn wait_batch(&self, pending: PendingBatch) -> Result<Vec<Vec<u8>>, ShardIoError> {
+        let PendingBatch {
+            submitted,
+            mut outputs,
+        } = pending;
+        let mut round = self.collect(submitted, &mut outputs)?;
         while !round.is_empty() {
-            let mut next = Vec::new();
-            for (meta, result) in self.submit_and_collect(round)? {
-                let path = &self.paths[meta.shard];
-                let transfer = result.map_err(|error| read_error(path, meta.offset, &error))?;
-                let bytes = transfer.buf.into_vec();
-                if bytes.is_empty() {
-                    return Err(ShardIoError::UnexpectedEof {
-                        path: path.clone(),
-                        offset: meta.offset,
-                        missing: meta.wanted,
-                    });
-                }
-                let got = bytes.len();
-                let output = &mut outputs[meta.index];
-                if output.is_empty() {
-                    *output = bytes;
-                } else {
-                    output.extend_from_slice(&bytes);
-                }
-                if got < meta.wanted {
-                    let advanced = u64::try_from(got)
-                        .ok()
-                        .and_then(|got| meta.offset.checked_add(got))
-                        .ok_or_else(|| ShardIoError::OffsetOverflow { path: path.clone() })?;
-                    next.push(Pending {
-                        index: meta.index,
-                        shard: meta.shard,
-                        offset: advanced,
-                        buffer: vec![0; meta.wanted - got],
-                    });
-                }
-            }
-            round = next;
+            round = self.collect(self.submit(round), &mut outputs)?;
         }
         Ok(outputs)
     }
 
-    fn submit_and_collect(
+    /// Drives the proactor until every submitted request completes, folding each
+    /// result into `outputs` and returning any short read as a new round to resume.
+    fn collect(
         &self,
-        round: Vec<Pending>,
-    ) -> Result<Vec<(Meta, IoResult)>, ShardIoError> {
+        submitted: Submitted,
+        outputs: &mut [Vec<u8>],
+    ) -> Result<Vec<Pending>, ShardIoError> {
+        let _drive = self.drive.lock().unwrap_or_else(PoisonError::into_inner);
+        while submitted
+            .results
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|result| result.is_some())
+            .count()
+            < submitted.metas.len()
+        {
+            self.proactor
+                .run_once()
+                .map_err(|error| ShardIoError::Proactor {
+                    error: error.to_string(),
+                })?;
+        }
+        if let Some(error) = submitted.submit_error {
+            return Err(ShardIoError::Proactor {
+                error: error.to_string(),
+            });
+        }
+
+        let collected = std::mem::take(
+            &mut *submitted
+                .results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let mut next = Vec::new();
+        for (meta, result) in submitted.metas.into_iter().zip(collected) {
+            let result = result.ok_or_else(|| ShardIoError::Proactor {
+                error: "a submitted read never completed".to_owned(),
+            })?;
+            let path = &self.paths[meta.shard];
+            let transfer = result.map_err(|error| read_error(path, meta.offset, &error))?;
+            let bytes = transfer.buf.into_vec();
+            if bytes.is_empty() {
+                return Err(ShardIoError::UnexpectedEof {
+                    path: path.clone(),
+                    offset: meta.offset,
+                    missing: meta.wanted,
+                });
+            }
+            let got = bytes.len();
+            let output = &mut outputs[meta.index];
+            if output.is_empty() {
+                *output = bytes;
+            } else {
+                output.extend_from_slice(&bytes);
+            }
+            if got < meta.wanted {
+                let advanced = u64::try_from(got)
+                    .ok()
+                    .and_then(|got| meta.offset.checked_add(got))
+                    .ok_or_else(|| ShardIoError::OffsetOverflow { path: path.clone() })?;
+                next.push(Pending {
+                    index: meta.index,
+                    shard: meta.shard,
+                    offset: advanced,
+                    buffer: vec![0; meta.wanted - got],
+                });
+            }
+        }
+        Ok(next)
+    }
+
+    /// Submits every request to the proactor and returns immediately, without
+    /// driving it -- so nothing here waits, and no thread is involved. A
+    /// submission failure still submits nothing further, but `metas` and
+    /// `results` cover everything submitted before it, so [`Self::collect`] can
+    /// still drain those completions before the error surfaces.
+    fn submit(&self, round: Vec<Pending>) -> Submitted {
         let results: Arc<Mutex<Vec<Option<IoResult>>>> =
             Arc::new(Mutex::new((0..round.len()).map(|_| None).collect()));
         let handle = self.proactor.handle();
@@ -225,41 +307,30 @@ impl ShardFiles {
             });
         }
 
-        // Drain everything that was submitted, whether or not a later submission failed.
-        while results
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter(|result| result.is_some())
-            .count()
-            < metas.len()
-        {
-            self.proactor
-                .run_once()
-                .map_err(|error| ShardIoError::Proactor {
-                    error: error.to_string(),
-                })?;
+        Submitted {
+            results,
+            metas,
+            submit_error,
         }
-        if let Some(error) = submit_error {
-            return Err(ShardIoError::Proactor {
-                error: error.to_string(),
-            });
-        }
-
-        let collected =
-            std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
-        metas
-            .into_iter()
-            .zip(collected)
-            .map(|(meta, result)| {
-                result
-                    .map(|result| (meta, result))
-                    .ok_or_else(|| ShardIoError::Proactor {
-                        error: "a submitted read never completed".to_owned(),
-                    })
-            })
-            .collect()
     }
+}
+
+/// Everything [`ShardFiles::submit_batch`] needs [`ShardFiles::wait_batch`] to
+/// finish later: what was submitted, plus the output buffers assembled so far
+/// (already-empty requests are filled immediately and need no completion).
+pub(crate) struct PendingBatch {
+    submitted: Submitted,
+    outputs: Vec<Vec<u8>>,
+}
+
+/// One round of reads submitted to the proactor, not yet drained.
+struct Submitted {
+    results: Arc<Mutex<Vec<Option<IoResult>>>>,
+    metas: Vec<Meta>,
+    /// Set when a submission failed partway through a round; surfaced only after
+    /// every read that did get submitted has been drained, matching the always-
+    /// drain-what-was-submitted contract [`ShardFiles::read_batch`] has always had.
+    submit_error: Option<io::Error>,
 }
 
 /// Makes `buffer` exactly `len` bytes long, reusing its allocation.
@@ -456,6 +527,55 @@ mod tests {
         assert_eq!(
             files.read(1, 0, vec![0; 8]),
             Err(ShardIoError::UnknownShard { shard: 1 })
+        );
+    }
+
+    #[test]
+    fn submit_then_wait_reads_the_same_bytes_as_read_batch_with_work_done_in_between() {
+        let path = cache_shard();
+        let expected = fs::read(&path).expect("fixture reads");
+        let files = ShardFiles::open(std::slice::from_ref(&path)).expect("shard opens");
+
+        let span = expected.len() - 2048;
+        let ranges: Vec<(usize, usize)> = (0..16_usize)
+            .map(|index| ((index * 733) % span, 512 + index * 3))
+            .collect();
+        let requests = ranges
+            .iter()
+            .map(|&(offset, len)| ReadRequest {
+                shard: 0,
+                offset: offset as u64,
+                buffer: vec![0; len],
+            })
+            .collect();
+
+        // The point of the split: real, non-I/O work happens here, between
+        // submission and waiting, with the reads already in flight.
+        let pending = files.submit_batch(requests).expect("submits");
+        let mut unrelated_work = 0_u64;
+        for value in 0..1_000_000_u64 {
+            unrelated_work = unrelated_work.wrapping_add(value);
+        }
+        std::hint::black_box(unrelated_work);
+
+        let buffers = files.wait_batch(pending).expect("waits");
+        assert_eq!(buffers.len(), ranges.len());
+        for (&(offset, len), buffer) in ranges.iter().zip(&buffers) {
+            assert_eq!(buffer.as_slice(), &expected[offset..offset + len]);
+        }
+    }
+
+    #[test]
+    fn submit_batch_refuses_an_unknown_shard_before_any_read() {
+        let files = ShardFiles::open(&[cache_shard()]).expect("shard opens");
+        let requests = vec![ReadRequest {
+            shard: 1,
+            offset: 0,
+            buffer: vec![0; 8],
+        }];
+        assert_eq!(
+            files.submit_batch(requests).err(),
+            Some(ShardIoError::UnknownShard { shard: 1 })
         );
     }
 }

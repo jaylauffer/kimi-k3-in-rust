@@ -14,3 +14,4 @@ pub mod layer;
 pub mod model;
 pub mod ops;
 pub mod safetensors;
+pub mod trunk;

@@ -26,12 +26,158 @@ use std::fmt;
 
 use crate::{
     config::K3Config,
+    io::{PendingBatch, ReadRequest},
     layer::{
         Attention, KdaWeights, LayerWeights, Matrix, MlaWeights, Mlp, MoeWeights, RoutedExperts,
     },
     model::Model,
-    safetensors::{SafeTensorError, SafeTensorIndex, TensorInfo},
+    safetensors::{SafeTensorError, SafeTensorIndex, TensorInfo, widen_into},
 };
+
+/// A single-read safety margin: `read_bf16_into` chunks because a real read past
+/// roughly 2 GiB fails with EINVAL (see its own docs). [`BoundStorage::submit_layer`]
+/// reads one tensor per request with no such chunking, so it refuses to plan a
+/// read past this bound rather than risk the same failure asynchronously, where
+/// there is no per-chunk loop to catch it early.
+const MAX_SAFE_SINGLE_READ_BYTES: usize = 1 << 30;
+
+/// Whether a bound tensor is read elementwise (kept fp32) or only through a
+/// matmul (kept in the checkpoint's own bf16 bytes). Mirrors C's `reqw` versus
+/// `reqn` split; see the module docs.
+#[derive(Clone, Copy, Debug)]
+enum TensorKind {
+    F32,
+    Bf16,
+}
+
+/// The tensors one decoder layer needs, in the exact set [`BoundStorage::load_layer`]
+/// reads -- shared with [`BoundStorage::submit_layer`] so the blocking and async
+/// paths can never name a different set of tensors for the same layer.
+fn layer_plan(
+    index: &SafeTensorIndex,
+    config: &K3Config,
+    layer: usize,
+) -> Vec<(String, TensorKind)> {
+    let mut plan = Vec::new();
+    for suffix in [
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attention_res_norm.weight",
+        "self_attention_res_proj.weight",
+        "mlp_res_norm.weight",
+        "mlp_res_proj.weight",
+    ] {
+        plan.push((layer_name(layer, suffix), TensorKind::F32));
+    }
+    attention_plan(config, layer, &mut plan);
+    mlp_plan(index, config, layer, &mut plan);
+    plan
+}
+
+fn attention_plan(config: &K3Config, layer: usize, plan: &mut Vec<(String, TensorKind)>) {
+    if config.is_mla(layer) {
+        plan.push((
+            layer_name(layer, "self_attn.q_a_proj.weight"),
+            TensorKind::Bf16,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.q_a_layernorm.weight"),
+            TensorKind::F32,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.q_b_proj.weight"),
+            TensorKind::Bf16,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.kv_a_proj_with_mqa.weight"),
+            TensorKind::Bf16,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.kv_a_layernorm.weight"),
+            TensorKind::F32,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.kv_b_proj.weight"),
+            TensorKind::Bf16,
+        ));
+        plan.push((
+            layer_name(layer, "self_attn.o_proj.weight"),
+            TensorKind::Bf16,
+        ));
+        if config.mla_use_output_gate {
+            plan.push((
+                layer_name(layer, "self_attn.g_proj.weight"),
+                TensorKind::Bf16,
+            ));
+        }
+        return;
+    }
+    for suffix in [
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.g_proj.weight",
+        "self_attn.o_proj.weight",
+        "self_attn.f_a_proj.weight",
+        "self_attn.f_b_proj.weight",
+        "self_attn.b_proj.weight",
+    ] {
+        plan.push((layer_name(layer, suffix), TensorKind::Bf16));
+    }
+    for suffix in [
+        "self_attn.q_conv1d.weight",
+        "self_attn.k_conv1d.weight",
+        "self_attn.v_conv1d.weight",
+        "self_attn.A_log",
+        "self_attn.dt_bias",
+        "self_attn.o_norm.weight",
+    ] {
+        plan.push((layer_name(layer, suffix), TensorKind::F32));
+    }
+}
+
+fn mlp_plan(
+    index: &SafeTensorIndex,
+    config: &K3Config,
+    layer: usize,
+    plan: &mut Vec<(String, TensorKind)>,
+) {
+    if config.is_dense(layer) {
+        for suffix in [
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        ] {
+            plan.push((layer_name(layer, suffix), TensorKind::Bf16));
+        }
+        return;
+    }
+    plan.push((
+        layer_name(layer, "block_sparse_moe.gate.weight"),
+        TensorKind::F32,
+    ));
+    let bias_name = layer_name(layer, "block_sparse_moe.gate.e_score_correction_bias");
+    if index.tensor(&bias_name).is_some() {
+        plan.push((bias_name, TensorKind::F32));
+    }
+    for suffix in [
+        "block_sparse_moe.routed_expert_down_proj.weight",
+        "block_sparse_moe.routed_expert_up_proj.weight",
+    ] {
+        plan.push((layer_name(layer, suffix), TensorKind::Bf16));
+    }
+    plan.push((
+        layer_name(layer, "block_sparse_moe.routed_expert_norm.weight"),
+        TensorKind::F32,
+    ));
+    for suffix in [
+        "block_sparse_moe.shared_experts.gate_proj.weight",
+        "block_sparse_moe.shared_experts.up_proj.weight",
+        "block_sparse_moe.shared_experts.down_proj.weight",
+    ] {
+        plan.push((layer_name(layer, suffix), TensorKind::Bf16));
+    }
+}
 
 /// Every tensor name lives under this prefix except `lm_head`, which the
 /// checkpoint stores one level up (`language_model.lm_head.weight`, no `.model.`).
@@ -49,6 +195,9 @@ pub enum BindError {
     Read(String, SafeTensorError),
     /// [`BoundStorage::model`] was asked to build a model but a layer was never loaded.
     LayerNotLoaded(usize),
+    /// [`BoundStorage::submit_layer`] refused to plan an unchunked single read past
+    /// [`MAX_SAFE_SINGLE_READ_BYTES`].
+    TensorTooLargeForOneRead { name: String, nbytes: usize },
 }
 
 impl fmt::Display for BindError {
@@ -64,6 +213,10 @@ impl fmt::Display for BindError {
                     "layer {layer} was never loaded into this storage"
                 )
             }
+            Self::TensorTooLargeForOneRead { name, nbytes } => write!(
+                formatter,
+                "tensor {name:?} is {nbytes} bytes, too large for one unchunked async read"
+            ),
         }
     }
 }
@@ -76,6 +229,22 @@ impl std::error::Error for BindError {}
 pub struct BoundStorage {
     f32: HashMap<String, Vec<f32>>,
     bf16: HashMap<String, Vec<u16>>,
+}
+
+/// One tensor [`BoundStorage::submit_layer`] has submitted a read for, along
+/// with what [`BoundStorage::absorb_layer`] needs to store the result: which map
+/// it belongs in, and (for the `F32` path) the source `dtype` to widen from.
+struct PlannedRead {
+    name: String,
+    kind: TensorKind,
+    tensor: TensorInfo,
+}
+
+/// A whole layer's reads, submitted but not yet waited on. Produced by
+/// [`BoundStorage::submit_layer`], consumed by [`BoundStorage::absorb_layer`].
+pub(crate) struct PendingLayer {
+    reads: Vec<PlannedRead>,
+    pending: PendingBatch,
 }
 
 impl BoundStorage {
@@ -120,103 +289,90 @@ impl BoundStorage {
         config: &K3Config,
         layer: usize,
     ) -> Result<(), BindError> {
-        let f32_names = [
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "self_attention_res_norm.weight",
-            "self_attention_res_proj.weight",
-            "mlp_res_norm.weight",
-            "mlp_res_proj.weight",
-        ];
-        for name in f32_names {
-            self.load_layer_f32(index, layer, name)?;
-        }
-
-        if config.is_mla(layer) {
-            self.load_layer_bf16(index, layer, "self_attn.q_a_proj.weight")?;
-            self.load_layer_f32(index, layer, "self_attn.q_a_layernorm.weight")?;
-            self.load_layer_bf16(index, layer, "self_attn.q_b_proj.weight")?;
-            self.load_layer_bf16(index, layer, "self_attn.kv_a_proj_with_mqa.weight")?;
-            self.load_layer_f32(index, layer, "self_attn.kv_a_layernorm.weight")?;
-            self.load_layer_bf16(index, layer, "self_attn.kv_b_proj.weight")?;
-            self.load_layer_bf16(index, layer, "self_attn.o_proj.weight")?;
-            if config.mla_use_output_gate {
-                self.load_layer_bf16(index, layer, "self_attn.g_proj.weight")?;
-            }
-        } else {
-            for name in [
-                "self_attn.q_proj.weight",
-                "self_attn.k_proj.weight",
-                "self_attn.v_proj.weight",
-                "self_attn.g_proj.weight",
-                "self_attn.o_proj.weight",
-                "self_attn.f_a_proj.weight",
-                "self_attn.f_b_proj.weight",
-                "self_attn.b_proj.weight",
-            ] {
-                self.load_layer_bf16(index, layer, name)?;
-            }
-            for name in [
-                "self_attn.q_conv1d.weight",
-                "self_attn.k_conv1d.weight",
-                "self_attn.v_conv1d.weight",
-                "self_attn.A_log",
-                "self_attn.dt_bias",
-                "self_attn.o_norm.weight",
-            ] {
-                self.load_layer_f32(index, layer, name)?;
+        for (name, kind) in layer_plan(index, config, layer) {
+            match kind {
+                TensorKind::F32 => self.read_f32_into(index, &name)?,
+                TensorKind::Bf16 => self.read_bf16_into(index, &name)?,
             }
         }
+        Ok(())
+    }
 
-        if config.is_dense(layer) {
-            for name in [
-                "mlp.gate_proj.weight",
-                "mlp.up_proj.weight",
-                "mlp.down_proj.weight",
-            ] {
-                self.load_layer_bf16(index, layer, name)?;
+    /// Submits every tensor one layer needs without waiting for any of them, so
+    /// the caller can compute on an already-resident layer -- no I/O involved --
+    /// while the operating system services these reads in the background.
+    /// [`Self::absorb_layer`] collects the results later. This, not a reader
+    /// thread, is `crate::trunk`'s prefetch: [`crate::io::ShardFiles`]'s own
+    /// submit/wait split, driven from here.
+    ///
+    /// One read per tensor, never chunked, unlike [`Self::load_layer`]'s
+    /// [`Self::read_bf16_into`] -- see [`MAX_SAFE_SINGLE_READ_BYTES`] for why that
+    /// is safe for real per-layer tensors and refused rather than risked otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::MissingTensor`] if a required tensor is absent, or
+    /// [`BindError::TensorTooLargeForOneRead`] if one exceeds the safe bound.
+    pub(crate) fn submit_layer(
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        layer: usize,
+    ) -> Result<PendingLayer, BindError> {
+        let plan = layer_plan(index, config, layer);
+        let mut reads = Vec::with_capacity(plan.len());
+        let mut requests = Vec::with_capacity(plan.len());
+        for (name, kind) in plan {
+            let tensor = tensor_or_missing(index, &name)?.clone();
+            if tensor.nbytes > MAX_SAFE_SINGLE_READ_BYTES {
+                return Err(BindError::TensorTooLargeForOneRead {
+                    name,
+                    nbytes: tensor.nbytes,
+                });
             }
-        } else {
-            self.load_layer_f32(index, layer, "block_sparse_moe.gate.weight")?;
-            if index
-                .tensor(&layer_name(
-                    layer,
-                    "block_sparse_moe.gate.e_score_correction_bias",
-                ))
-                .is_some()
-            {
-                self.load_layer_f32(
-                    index,
-                    layer,
-                    "block_sparse_moe.gate.e_score_correction_bias",
-                )?;
+            requests.push(ReadRequest {
+                shard: tensor.shard,
+                offset: tensor.offset,
+                buffer: vec![0u8; tensor.nbytes],
+            });
+            reads.push(PlannedRead { name, kind, tensor });
+        }
+        let pending = index
+            .submit_reads(requests)
+            .map_err(|error| BindError::Read(format!("layer {layer} batch"), error))?;
+        Ok(PendingLayer { reads, pending })
+    }
+
+    /// Waits for every read [`Self::submit_layer`] started and stores the results,
+    /// exactly as [`Self::load_layer`] would have for the same layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::Read`] if the proactor failed or a read did not
+    /// complete in full.
+    pub(crate) fn absorb_layer(
+        &mut self,
+        index: &SafeTensorIndex,
+        pending: PendingLayer,
+    ) -> Result<(), BindError> {
+        let PendingLayer { reads, pending } = pending;
+        let buffers = index
+            .wait_reads(pending)
+            .map_err(|error| BindError::Read("layer batch".to_owned(), error))?;
+        for (planned, raw) in reads.into_iter().zip(buffers) {
+            match planned.kind {
+                TensorKind::F32 => {
+                    let mut values = vec![0.0f32; planned.tensor.numel()];
+                    widen_into(planned.tensor.dtype, &raw, &mut values);
+                    self.f32.insert(planned.name, values);
+                }
+                TensorKind::Bf16 => {
+                    let mut values = Vec::with_capacity(planned.tensor.numel());
+                    for pair in raw.chunks_exact(2) {
+                        values.push(u16::from_le_bytes([pair[0], pair[1]]));
+                    }
+                    self.bf16.insert(planned.name, values);
+                }
             }
-            self.load_layer_bf16(
-                index,
-                layer,
-                "block_sparse_moe.routed_expert_down_proj.weight",
-            )?;
-            self.load_layer_bf16(
-                index,
-                layer,
-                "block_sparse_moe.routed_expert_up_proj.weight",
-            )?;
-            self.load_layer_f32(index, layer, "block_sparse_moe.routed_expert_norm.weight")?;
-            self.load_layer_bf16(
-                index,
-                layer,
-                "block_sparse_moe.shared_experts.gate_proj.weight",
-            )?;
-            self.load_layer_bf16(
-                index,
-                layer,
-                "block_sparse_moe.shared_experts.up_proj.weight",
-            )?;
-            self.load_layer_bf16(
-                index,
-                layer,
-                "block_sparse_moe.shared_experts.down_proj.weight",
-            )?;
         }
         Ok(())
     }
@@ -227,24 +383,6 @@ impl BoundStorage {
 
     fn load_bf16(&mut self, index: &SafeTensorIndex, suffix: &str) -> Result<(), BindError> {
         self.read_bf16_into(index, &full_name(suffix))
-    }
-
-    fn load_layer_f32(
-        &mut self,
-        index: &SafeTensorIndex,
-        layer: usize,
-        suffix: &str,
-    ) -> Result<(), BindError> {
-        self.read_f32_into(index, &layer_name(layer, suffix))
-    }
-
-    fn load_layer_bf16(
-        &mut self,
-        index: &SafeTensorIndex,
-        layer: usize,
-        suffix: &str,
-    ) -> Result<(), BindError> {
-        self.read_bf16_into(index, &layer_name(layer, suffix))
     }
 
     fn read_f32_into(&mut self, index: &SafeTensorIndex, name: &str) -> Result<(), BindError> {

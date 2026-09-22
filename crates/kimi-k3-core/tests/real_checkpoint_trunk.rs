@@ -1,0 +1,104 @@
+//! Validates `kimi-k3-core::trunk::TrunkRing` against the real, released
+//! checkpoint: that prefetch-then-bind sequencing actually overlaps I/O with
+//! nothing (no thread, no blocking call in between) and, most importantly,
+//! that the ring produces exactly the same weights `bind::BoundStorage`'s
+//! direct, already-validated path would for the same layers.
+//!
+//! Ignored by default, same reason and same checkpoint as
+//! `real_checkpoint_binding.rs`: run explicitly with
+//! `cargo test -p kimi-k3-core --test real_checkpoint_trunk -- --ignored --nocapture`.
+
+use std::env;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use kimi_k3_core::{
+    bind::BoundStorage,
+    config::K3Config,
+    layer::{Attention, Matrix, Mlp},
+    safetensors::SafeTensorIndex,
+    trunk::TrunkRing,
+};
+
+fn checkpoint_dir() -> PathBuf {
+    env::var("KIMI_K3_CHECKPOINT")
+        .map_or_else(|_| PathBuf::from("/Volumes/Jarraya/kimi-k3"), PathBuf::from)
+}
+
+fn matrix_len(matrix: &Matrix<'_>) -> usize {
+    match *matrix {
+        Matrix::F32(values) => values.len(),
+        Matrix::Bf16(values) => values.len(),
+    }
+}
+
+/// A handful of numbers that identify a layer's weights well enough to catch
+/// the ring returning the wrong layer, a stale slot, or truncated data --
+/// without needing `LayerWeights` to implement equality.
+fn fingerprint(layer: &kimi_k3_core::layer::LayerWeights<'_>) -> (usize, usize, u64) {
+    let attn_len = match layer.attention {
+        Attention::Kda(w) => matrix_len(&w.o),
+        Attention::Mla(w) => matrix_len(&w.o),
+    };
+    let (mlp_len, mut hash): (usize, u64) = match &layer.mlp {
+        Mlp::Dense { down, .. } => (matrix_len(down), 0),
+        Mlp::Moe(weights) => (matrix_len(&weights.down), 0),
+    };
+    for &value in layer.in_norm {
+        hash = hash
+            .wrapping_mul(31)
+            .wrapping_add(u64::from(value.to_bits()));
+    }
+    (attn_len, mlp_len, hash)
+}
+
+#[test]
+#[ignore = "needs the real ~1.4 TB checkpoint locally; run explicitly with --ignored"]
+fn ring_matches_direct_binding_across_a_pin_boundary_and_prefetch() {
+    let dir = checkpoint_dir();
+    let config = K3Config::from_path(dir.join("config.json")).expect("real config parses");
+    let index = SafeTensorIndex::open(&dir).expect("real checkpoint indexes");
+
+    // Ground truth: bind layers 0..=3 directly, the already-validated path.
+    let mut direct_storage = BoundStorage::new();
+    for layer in 0..=3 {
+        direct_storage
+            .load_layer(&index, &config, layer)
+            .unwrap_or_else(|error| panic!("direct load of layer {layer} failed: {error}"));
+    }
+    let direct_fingerprints: Vec<_> = (0..=3)
+        .map(|layer| fingerprint(&direct_storage.layer_weights(&config, layer).unwrap()))
+        .collect();
+
+    // Ring: pin only layer 0, stream 1..=3 through a two-slot ring, prefetching
+    // one layer ahead each time -- exactly the intended call pattern.
+    let mut ring = TrunkRing::open(&index, &config, 1, 2).expect("ring opens");
+    assert!(ring.is_pinned(0));
+    assert!(!ring.is_pinned(1));
+
+    let start = Instant::now();
+    let mut ring_fingerprints = Vec::new();
+    for layer in 0..=3 {
+        if layer < 3 {
+            ring.prefetch(&index, &config, layer + 1).expect("prefetch");
+        }
+        let bound = ring
+            .bind(&index, &config, layer)
+            .unwrap_or_else(|error| panic!("ring bind of layer {layer} failed: {error}"));
+        ring_fingerprints.push(fingerprint(&bound));
+    }
+    eprintln!("ring walked layers 0..=3 in {:?}", start.elapsed());
+
+    assert_eq!(
+        ring_fingerprints, direct_fingerprints,
+        "the ring must return exactly what direct binding does, layer for layer"
+    );
+
+    let (hits, misses) = ring.stats();
+    eprintln!("ring stats: {hits} hits, {misses} misses");
+    assert!(
+        hits >= 2,
+        "layers 2 and 3 were each prefetched one iteration ahead, so binding them \
+         should find completed prefetches (hits), not block on a fresh load"
+    );
+}

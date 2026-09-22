@@ -18,7 +18,7 @@ use serde::{
     de::{DeserializeSeed, Error as _, IgnoredAny, MapAccess, Visitor},
 };
 
-use crate::io::{ReadRequest, ShardFiles, ShardIoError, fit};
+use crate::io::{PendingBatch, ReadRequest, ShardFiles, ShardIoError, fit};
 
 const WIDEN_CHUNK_BYTES: usize = 4 << 20;
 
@@ -219,6 +219,37 @@ impl SafeTensorIndex {
     /// read in full.
     pub fn read_batch(&self, requests: Vec<ReadRequest>) -> Result<Vec<Vec<u8>>, SafeTensorError> {
         Ok(self.io.read_batch(requests)?)
+    }
+
+    /// Submits a batch without waiting for any completion, so the caller can do
+    /// unrelated, non-I/O work -- such as running the model forward on a layer
+    /// already resident -- while the operating system services these reads in
+    /// the background. [`Self::wait_reads`] collects them. This is
+    /// `crate::trunk`'s prefetch primitive: never a reader thread, just the
+    /// loadngo proactor's own submit/wait split.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SafeTensorError`] if any request names an unknown shard.
+    pub(crate) fn submit_reads(
+        &self,
+        requests: Vec<ReadRequest>,
+    ) -> Result<PendingBatch, SafeTensorError> {
+        Ok(self.io.submit_batch(requests)?)
+    }
+
+    /// Drives the proactor until every request `pending` was submitted with has
+    /// completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SafeTensorError`] for a poll failure, a failed read, or end of
+    /// file inside a requested range.
+    pub(crate) fn wait_reads(
+        &self,
+        pending: PendingBatch,
+    ) -> Result<Vec<Vec<u8>>, SafeTensorError> {
+        Ok(self.io.wait_batch(pending)?)
     }
 
     /// Reads and widens `tensor` into exactly `output.len()` `f32` values.
@@ -602,7 +633,12 @@ fn scan_shard(
     })
 }
 
-fn widen_into(dtype: DType, input: &[u8], output: &mut [f32]) {
+/// Widens `input` (raw stored bytes of `dtype`) into `output`, one value each.
+///
+/// `crate::trunk` uses this directly on a fully-collected async read, where
+/// [`SafeTensorIndex::read_f32`]'s own chunk-then-widen loop doesn't apply --
+/// the bytes already arrived from one proactor wait, not a synchronous read.
+pub(crate) fn widen_into(dtype: DType, input: &[u8], output: &mut [f32]) {
     match dtype {
         DType::U8 => {
             for (&value, destination) in input.iter().zip(output) {
