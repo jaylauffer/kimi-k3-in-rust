@@ -362,8 +362,49 @@ reads use the page cache.
    *`TrunkRing::forward` runs a real forward pass sourced from the ring, wired to
    the real `cache::CachedExperts` streamed-expert source with prefill expert
    batching, bit-identical to `Model::forward` on real data across a dense/MoE
-   layer boundary. Still open: the CLI/tokenizer themselves, and preallocated
-   scratch.*
+   layer boundary. `tokenizer::Tokenizer` is done and checked token-for-token
+   against the real `tiktoken` library on the real checkpoint's vocabulary. Still
+   open: the CLI itself, full-memory modes, and preallocated scratch.*
+
+### Tokenizer, done 2026-09-23
+
+`kimi-k3-core::tokenizer` ports `third_party/tok.h` (vendored, Apache-2.0 --
+byte-level BPE: vocabulary, pre-tokenizer, merge algorithm, encode/decode) and
+`src/tokenizer/k3_tok.h` (first-party -- the K3-specific loader that populates
+it directly from the released `tiktoken.model`/`tokenizer_config.json`, since
+K3 ships no `tokenizer.json`). Only the one fixed configuration K3 actually
+uses is ported: the Kimi pre-tokenizer (`\p{Han}`-run rule, Han excluded from
+the letter classes) and the `rankbpe` merge rule (merge the pair whose
+concatenation has the lowest vocabulary id -- there is no merges list in this
+format), not the general cl100k/o200k/merges-list machinery `tok.h` also
+supports for other tokenizer families.
+
+No external regex engine, and none needed: the C source hand-writes every
+pre-tokenizer rule as explicit greedy character-class scanning rather than
+calling a real regex engine, which is what makes a faithful, dependency-free
+Rust port possible at all -- the pattern's lookaheads and `&&` class
+intersection aren't expressible in Rust's `std` `regex` crate, and adding
+`fancy-regex` for one file was rejected. The Unicode range tables (`uni_L`,
+`uni_N`, `uni_S` from `tok_unicode.h`; `uni_U`, `uni_X` from
+`tok_unicode_o200k.h`; `is_han` from `tok.h`) are embedded verbatim: every
+`(lo, hi)` pair was extracted programmatically from the C headers, not
+hand-transcribed, and checked sorted, non-overlapping, and matching each
+table's own declared entry count before use.
+
+Validated against real, independent ground truth, not just this project's own
+C engine: `tests/fixtures/tokenizer/parity.json` holds real `tiktoken` library
+encode results, built by loading the actual checkpoint's 163,584-rank
+`tiktoken.model` into a real `tiktoken.Encoding` with the Kimi regex pattern
+and encoding 65 strings spanning CJK, emoji, ZWJ sequences, RTL text, accents,
+contractions, numeric-grouping boundaries, consecutive special tokens, and
+non-BMP codepoints. All 65 match token-for-token
+(`crates/kimi-k3-core/tests/tokenizer_parity.rs`, not `#[ignore]`d -- the
+fixture ships in the repo, only building the real `Tokenizer` needs the
+checkpoint locally), decode round-trips exactly, and this port's own
+encode-then-decode reproduces every fixture string. Also confirmed the harness
+actually catches a mismatch rather than passing vacuously, by corrupting one
+fixture's expected ids and watching it fail with the right diagnostic before
+reverting.
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
 baseline until the Rust end-to-end oracle and CLI are complete.
