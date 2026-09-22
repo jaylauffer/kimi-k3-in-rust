@@ -254,6 +254,30 @@ hit/miss labels were backwards, counting every successful prefetch as a "miss"
 because absorbing an already-in-flight read was conflated with never having
 prefetched at all.
 
+### Forward pass wired to the ring, done 2026-09-23
+
+`TrunkRing::forward` mirrors `model::Model::run`'s full-recompute path exactly
+-- embedding, per-layer state, the model-level attention-residual aggregator,
+final norm, LM head -- but sources each decoder layer from the ring via
+`prefetch(L + 1)` then `bind(L)` instead of indexing a pre-materialized
+`Vec<LayerWeights>`. `decoder_layer` itself is the same already-tested free
+function either way, so this only risked the orchestration loop around it, not
+the numerics. New `TopLevelWeights` bundles `embed`/`lm_head`/`final_norm`/
+`out_res`: not part of the ring, since every one of them is needed once per
+position rather than once per layer, unlike the trunk.
+
+Validated against the real checkpoint (same file, `#[ignore]`d): built a
+one-layer view of the real config pinned to layer 0 -- the checkpoint's one
+dense, non-MoE layer, so `layer::NoStreamedExperts` is honestly correct there
+rather than standing in for the unimplemented expert-cache wiring -- ran the
+same token ids through both `TrunkRing::forward` and the existing, already-
+validated `Model::forward`, and got bit-identical logits. Multi-layer block
+aggregation across a dense/MoE boundary and the real streamed-expert path
+(wiring `cache::CachedExperts` in as the ring's `ExpertSource`) remain
+unexercised by this specific test -- that integration, prefill expert
+batching, and the CLI/tokenizer are what is left before this is a real,
+runnable inference path end to end.
+
 ## I/O: loadngo leads
 
 Every shard read goes through `loadngo-proactor` (`kimi-k3-core::io`), pinned to an
@@ -295,6 +319,11 @@ reads use the page cache.
    downloaded checkpoint. Full-model resident binding is not the target -- see the trunk
    ring, next.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
+   *`TrunkRing::forward` runs a real forward pass sourced from the ring,
+   bit-identical to `Model::forward` on real data for the checkpoint's one
+   dense layer. Still open: wiring `cache::CachedExperts` in as the ring's
+   `ExpertSource` for the other 92 (MoE) layers, prefill expert batching, and
+   the CLI/tokenizer themselves.*
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
 baseline until the Rust end-to-end oracle and CLI are complete.
