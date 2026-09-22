@@ -15,9 +15,9 @@ use std::time::Instant;
 use kimi_k3_core::{
     bind::BoundStorage,
     config::K3Config,
-    layer::{Attention, Matrix, Mlp},
+    layer::{Attention, Matrix, Mlp, NoStreamedExperts},
     safetensors::SafeTensorIndex,
-    trunk::TrunkRing,
+    trunk::{TopLevelWeights, TrunkRing},
 };
 
 fn checkpoint_dir() -> PathBuf {
@@ -100,5 +100,58 @@ fn ring_matches_direct_binding_across_a_pin_boundary_and_prefetch() {
         hits >= 2,
         "layers 2 and 3 were each prefetched one iteration ahead, so binding them \
          should find completed prefetches (hits), not block on a fresh load"
+    );
+}
+
+/// `TrunkRing::forward`'s driver loop (embedding, state init, the final norm
+/// and LM head) is a near-verbatim copy of `Model::run`'s, adapted to source
+/// each layer from the ring instead of a resident `Vec`. This proves that copy
+/// is exact -- bit-identical logits -- for real data, without needing the
+/// streamed-expert cache wired up: layer 0 is the checkpoint's one dense,
+/// non-MoE layer, so `NoStreamedExperts` is honestly correct here, not a stub
+/// standing in for something unimplemented. Multi-layer block aggregation
+/// across a dense/MoE boundary and the real streamed-expert path are exercised
+/// by other tests (`bind`'s own gates, `cache.rs`), not this one.
+#[test]
+#[ignore = "needs the real ~1.4 TB checkpoint locally; run explicitly with --ignored"]
+fn ring_forward_matches_model_forward_bit_exactly_on_the_real_dense_layer() {
+    let dir = checkpoint_dir();
+    let mut config = K3Config::from_path(dir.join("config.json")).expect("real config parses");
+    assert!(config.is_dense(0), "layer 0 must be dense for this test");
+    config.num_hidden_layers = 1;
+    let index = SafeTensorIndex::open(&dir).expect("real checkpoint indexes");
+    let ids = [42_u32, 100, 7];
+
+    let mut storage = BoundStorage::new();
+    storage
+        .load_top_level(&index)
+        .expect("top-level tensors bind");
+    storage
+        .load_layer(&index, &config, 0)
+        .expect("layer 0 binds");
+    let model = storage.model(&config).expect("one-layer model builds");
+    let direct_logits = model
+        .forward(&ids, &mut NoStreamedExperts)
+        .expect("direct forward succeeds");
+
+    let mut ring = TrunkRing::open(&index, &config, 1, 1).expect("ring opens with layer 0 pinned");
+    let top = TopLevelWeights {
+        embed: model.embed,
+        lm_head: model.lm_head,
+        final_norm: model.final_norm,
+        out_res: model.out_res,
+    };
+    let ring_logits = ring
+        .forward(&index, &config, &top, &ids, &mut NoStreamedExperts)
+        .expect("ring forward succeeds");
+
+    assert_eq!(
+        ring_logits.len(),
+        direct_logits.len(),
+        "same sequence, same vocab, same logits shape"
+    );
+    assert_eq!(
+        ring_logits, direct_logits,
+        "TrunkRing::forward must be bit-identical to Model::forward on the same data"
     );
 }

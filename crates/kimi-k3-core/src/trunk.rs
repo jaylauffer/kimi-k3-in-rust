@@ -27,10 +27,16 @@
 //! replaced as layers stream through -- consistent with the rest of this port
 //! not yet implementing direct I/O or aligned slot memory (see `docs/RUST_PORT.md`).
 
+use std::fmt;
+
 use crate::{
     bind::{BindError, BoundStorage, PendingLayer},
     config::K3Config,
-    layer::LayerWeights,
+    layer::{
+        ExpertFetchError, ExpertSource, KdaState, LayerState, LayerWeights, Matrix, MlaCache,
+        decoder_layer,
+    },
+    ops::{attn_res, rmsnorm},
     safetensors::SafeTensorIndex,
 };
 
@@ -217,4 +223,126 @@ impl TrunkRing {
     pub fn stats(&self) -> (u64, u64) {
         (self.hits, self.misses)
     }
+
+    /// Logits for every position of `ids`, recomputed from an empty state,
+    /// sourcing each decoder layer from this ring instead of a fully resident
+    /// [`crate::model::Model`]. The `embed`/`final_norm`/`lm_head`/`out_res`
+    /// tensors are not part of the ring -- they are loaded once, up front, via
+    /// [`crate::bind::BoundStorage::load_top_level`], since unlike the trunk
+    /// they are needed for every position in one pass, not once per layer.
+    ///
+    /// Mirrors [`crate::model::Model::forward`]'s full-recompute path exactly
+    /// (`Positions::All`, no shared KDA slot); the incremental [`crate::model::Session`]
+    /// path is not ported to stream through a ring.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrunkForwardError::Bind`] if a layer's tensors cannot be read,
+    /// or [`TrunkForwardError::Expert`] if a streamed expert cannot be fetched.
+    pub fn forward(
+        &mut self,
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        top: &TopLevelWeights<'_>,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+    ) -> Result<Vec<f32>, TrunkForwardError> {
+        let e = config.hidden_size;
+        let vocab = config.vocab_size;
+        let t = ids.len();
+
+        let mut h = vec![0.0_f32; t * e];
+        for (row, &id) in h.chunks_exact_mut(e).zip(ids) {
+            top.embed.row_into(row, id as usize, e);
+        }
+
+        let mut states: Vec<LayerState> = (0..config.num_hidden_layers)
+            .map(|layer| {
+                if config.is_mla(layer) {
+                    LayerState::Mla(MlaCache::new(config, t))
+                } else {
+                    LayerState::Kda(KdaState::new(config))
+                }
+            })
+            .collect();
+
+        let mut blocks: Vec<Vec<f32>> = Vec::new();
+        let last_layer = config.num_hidden_layers - 1;
+        for (layer, state) in states.iter_mut().enumerate() {
+            // Prefetch the next layer BEFORE binding this one: `bind`'s returned
+            // weights borrow `&mut self` for exactly this iteration, so nothing
+            // can call `prefetch` again (also `&mut self`) until that borrow's
+            // last use, the `decoder_layer` call below, ends. See the module
+            // docs for why this ordering still gets real overlap.
+            if layer < last_layer {
+                self.prefetch(index, config, layer + 1)
+                    .map_err(TrunkForwardError::Bind)?;
+            }
+            let weights = self
+                .bind(index, config, layer)
+                .map_err(TrunkForwardError::Bind)?;
+            decoder_layer(
+                &mut h,
+                &mut blocks,
+                &weights,
+                config,
+                layer,
+                t,
+                state,
+                0,
+                experts,
+            )
+            .map_err(TrunkForwardError::Expert)?;
+        }
+
+        let mut logits = vec![0.0_f32; t * vocab];
+        let mut src = vec![0.0_f32; (blocks.len() + 1) * e];
+        let mut normed = vec![0.0_f32; e];
+        for (row, step) in logits.chunks_exact_mut(vocab).zip(0..t) {
+            let ht = &mut h[step * e..(step + 1) * e];
+            if let Some((norm, proj)) = top.out_res {
+                let fold: Vec<f32> = norm.iter().zip(proj).map(|(&n, &p)| n * p).collect();
+                for (b, block) in blocks.iter().enumerate() {
+                    src[b * e..(b + 1) * e].copy_from_slice(&block[step * e..(step + 1) * e]);
+                }
+                src[blocks.len() * e..].copy_from_slice(ht);
+                attn_res(ht, &src, &fold, blocks.len() + 1, e, config.rms_norm_eps);
+            }
+            rmsnorm(&mut normed, ht, top.final_norm, config.rms_norm_eps);
+            top.lm_head.mul(row, &normed, e, vocab);
+        }
+        Ok(logits)
+    }
 }
+
+/// The tensors [`TrunkRing::forward`] needs outside the layer stack -- loaded
+/// once via [`crate::bind::BoundStorage::load_top_level`], not part of the ring
+/// since, unlike the trunk, every one of them is needed for every position in
+/// one pass rather than once per layer.
+pub struct TopLevelWeights<'a> {
+    /// `[vocab][hidden]`, gathered one row per token.
+    pub embed: Matrix<'a>,
+    pub lm_head: Matrix<'a>,
+    pub final_norm: &'a [f32],
+    /// `output_attn_res_{norm,proj}`, the one aggregator outside the layers.
+    pub out_res: Option<(&'a [f32], &'a [f32])>,
+}
+
+/// Either half of what [`TrunkRing::forward`] can fail on: a layer's tensors
+/// could not be read, or a streamed expert could not be fetched.
+#[derive(Debug)]
+pub enum TrunkForwardError {
+    Bind(BindError),
+    Expert(ExpertFetchError),
+}
+
+impl fmt::Display for TrunkForwardError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bind(error) => write!(formatter, "{error}"),
+            Self::Expert(error) => write!(formatter, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for TrunkForwardError {}
