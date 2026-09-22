@@ -279,14 +279,22 @@ fn streamed_mxfp4_experts_match_their_dequantised_resident_bank() {
         .forward(&ids, &mut NoStreamedExperts)
         .expect("resident");
 
-    // Every MoE layer fetches top-k experts for every token, each once.
+    // `moe_prefill` fetches each layer's UNIQUE routed experts once per prefill
+    // chunk, not once per (token, slot) that selected them (`layer::moe_prefill`'s
+    // whole point) -- so `fetched` is an upper bound, not an exact count, and
+    // depends on how much the real router's choices overlap across tokens.
     let moe_layers = (0..c.num_hidden_layers).filter(|&l| !c.is_dense(l)).count();
-    let expected = ids.len() * c.num_experts_per_token * moe_layers;
-    assert_eq!(
-        source.fetched, expected,
-        "streamed path was not used for every expert"
+    let no_dedup_upper_bound = ids.len() * c.num_experts_per_token * moe_layers;
+    assert!(
+        source.fetched > 0 && source.fetched <= no_dedup_upper_bound,
+        "streamed path was not used for every expert (fetched {} not in (0, {}])",
+        source.fetched,
+        no_dedup_upper_bound
     );
-    assert_eq!(source.prefetched, expected);
+    assert_eq!(
+        source.fetched, source.prefetched,
+        "every prefetched expert must be exactly the set later fetched, deduplicated the same way"
+    );
 
     let got_tokens: Vec<usize> = got.chunks_exact(vocab).map(argmax).collect();
     let want_tokens: Vec<usize> = want.chunks_exact(vocab).map(argmax).collect();

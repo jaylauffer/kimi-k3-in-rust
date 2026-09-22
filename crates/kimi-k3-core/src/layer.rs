@@ -662,6 +662,175 @@ pub fn moe(
     Ok(())
 }
 
+/// Bounds the contribution buffer regardless of how long a prefill chunk runs
+/// -- `CHUNK * topk * latent_width` floats, not the whole prompt at once. At
+/// `topk=16`, `latent_width=3584` that's 3.7 MB per token of contribution
+/// storage; a 32k-token prompt would otherwise want gigabytes of it. Matches
+/// C's own `CHUNK` constant in `moe_prefill_chunk`.
+const MOE_PREFILL_CHUNK: usize = 64;
+
+/// [`moe`], but for `t > 1` streamed-expert tokens processed together (a
+/// prompt prefill): each unique expert the chunk's tokens route to is fetched
+/// ONCE and applied to every token that selected it, instead of once per
+/// token that selected it. Ported from `k3_moe_prefill`/`moe_prefill_chunk` in
+/// `src/core/k3_ops.c`.
+///
+/// Bit-identical to calling [`moe`] once per token: this only changes fetch
+/// order and count, never the arithmetic (`tests/moe_prefill.rs` gates the
+/// two paths against each other). Falls straight through to [`moe`] for a
+/// single token, or when the experts are resident (nothing to dedup: a
+/// resident bank has no per-fetch cost), so a caller can always use this and
+/// get the per-token path exactly where batching would not help.
+///
+/// # Errors
+///
+/// Returns [`ExpertFetchError`] when a streamed expert cannot be fetched.
+pub fn moe_prefill(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    layer_idx: usize,
+    experts: &mut dyn ExpertSource,
+) -> Result<(), ExpertFetchError> {
+    if t <= 1 || !matches!(w.experts, RoutedExperts::Streamed) {
+        return moe(out, x, w, c, t, layer_idx, experts);
+    }
+    let e = c.hidden_size;
+    let mut start = 0;
+    while start < t {
+        let n = (t - start).min(MOE_PREFILL_CHUNK);
+        let chunk_out = &mut out[start * e..(start + n) * e];
+        let chunk_x = &x[start * e..(start + n) * e];
+        if n == 1 {
+            moe(chunk_out, chunk_x, w, c, 1, layer_idx, experts)?;
+        } else {
+            moe_prefill_chunk(chunk_out, chunk_x, w, c, n, layer_idx, experts)?;
+        }
+        start += n;
+    }
+    Ok(())
+}
+
+/// One prefill chunk of `t` (2..=`MOE_PREFILL_CHUNK`) tokens, batched and
+/// deduplicated by unique expert. See [`moe_prefill`].
+fn moe_prefill_chunk(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    layer_idx: usize,
+    experts: &mut dyn ExpertSource,
+) -> Result<(), ExpertFetchError> {
+    let e = c.hidden_size;
+    let l = c.routed_expert_hidden_size;
+    let inter = c.moe_intermediate_size;
+    let si = inter * c.num_shared_experts;
+    let topk = c.num_experts_per_token;
+    let b1 = c.activation_situ_beta;
+    let b2 = c.activation_situ_linear_beta;
+
+    // 1. Route every token and down-project it, and collect the chunk's unique
+    // experts, expert-major order for step 2 below.
+    let mut ridx = vec![0_usize; t * topk];
+    let mut rwt = vec![0.0_f32; t * topk];
+    let mut zz = vec![0.0_f32; t * l];
+    let mut seen = vec![false; c.num_experts];
+    let mut uniq = Vec::with_capacity(t * topk);
+    for step in 0..t {
+        let xt = &x[step * e..(step + 1) * e];
+        let it = &mut ridx[step * topk..(step + 1) * topk];
+        let wtt = &mut rwt[step * topk..(step + 1) * topk];
+        router(
+            it,
+            wtt,
+            xt,
+            w.gate,
+            w.bias,
+            e,
+            c.num_experts,
+            topk,
+            c.moe_renormalize,
+            c.routed_scaling_factor,
+        );
+        w.down.mul(&mut zz[step * l..(step + 1) * l], xt, e, l);
+        for &expert in it.iter() {
+            if !seen[expert] {
+                seen[expert] = true;
+                uniq.push(expert);
+            }
+        }
+    }
+
+    // 2. Expert-major: fetch each unique expert ONCE and apply it to every
+    // (token, slot) that selected it.
+    experts.prefetch(layer_idx, &uniq)?;
+    let mut contrib = vec![0.0_f32; t * topk * l];
+    let mut gu = vec![0.0_f32; 2 * inter];
+    let mut act = vec![0.0_f32; inter];
+    let mut edn = vec![0.0_f32; l];
+    for &expert_id in &uniq {
+        let packed = experts.expert(layer_idx, expert_id)?;
+        packed.check(l, inter).map_err(|detail| ExpertFetchError {
+            layer: layer_idx,
+            expert: expert_id,
+            detail,
+        })?;
+        for step in 0..t {
+            let it = &ridx[step * topk..(step + 1) * topk];
+            let zt = &zz[step * l..(step + 1) * l];
+            for (j, &selected) in it.iter().enumerate() {
+                if selected != expert_id {
+                    continue;
+                }
+                let (gate, up) = gu.split_at_mut(inter);
+                packed.w1.mul(gate, zt);
+                packed.w3.mul(up, zt);
+                situ_glu(&mut act, &gu, inter, b1, b2);
+                packed.w2.mul(&mut edn, &act);
+                let at = (step * topk + j) * l;
+                contrib[at..at + l].copy_from_slice(&edn);
+            }
+        }
+    }
+
+    // 3. Per token, sum contributions in the ORIGINAL top-k order, then the
+    // shared-expert tail exactly as `moe` does it, so every float matches.
+    let mut acc = vec![0.0_f32; l];
+    let mut sgu = vec![0.0_f32; 2 * si];
+    let mut sact = vec![0.0_f32; si];
+    let mut sdn = vec![0.0_f32; e];
+    for step in 0..t {
+        let xt = &x[step * e..(step + 1) * e];
+        let ot = &mut out[step * e..(step + 1) * e];
+        let wtt = &rwt[step * topk..(step + 1) * topk];
+        acc.fill(0.0);
+        for j in 0..topk {
+            let wj = wtt[j];
+            let cb = &contrib[(step * topk + j) * l..(step * topk + j + 1) * l];
+            for (ai, &ci) in acc.iter_mut().zip(cb) {
+                *ai += wj * ci;
+            }
+        }
+        if c.latent_moe_use_norm {
+            rmsnorm_in_place(&mut acc, w.latent_norm, c.rms_norm_eps);
+        }
+        w.up.mul(ot, &acc, l, e);
+
+        let (sgate, sup) = sgu.split_at_mut(si);
+        w.shared_w1.mul(sgate, xt, e, si);
+        w.shared_w3.mul(sup, xt, e, si);
+        situ_glu(&mut sact, &sgu, si, b1, b2);
+        w.shared_w2.mul(&mut sdn, &sact, si, e);
+        for (oi, &di) in ot.iter_mut().zip(&sdn) {
+            *oi += di;
+        }
+    }
+    Ok(())
+}
+
 fn dense_mlp(
     out: &mut [f32],
     x: &[f32],
@@ -797,7 +966,7 @@ pub fn decoder_layer(
         );
     }
     match &w.mlp {
-        Mlp::Moe(mw) => moe(&mut tmp, &hin, mw, c, t, layer_idx, experts)?,
+        Mlp::Moe(mw) => moe_prefill(&mut tmp, &hin, mw, c, t, layer_idx, experts)?,
         Mlp::Dense { gate, up, down } => dense_mlp(&mut tmp, &hin, (*gate, *up, *down), c, t),
     }
 
