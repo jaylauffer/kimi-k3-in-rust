@@ -122,9 +122,11 @@ an incremental `Session` unusable) instead of C's counted drop.
 `CachedExperts` is gated in `cache.rs` against direct loads of the cache fixture under
 eviction pressure and batch prefetch: identical packed bytes, scales and products.
 
-Not ported yet: prefill expert batching (`k3_moe_prefill`), threading (deliberately --
-see below), and preallocated scratch. Binding the released checkpoint's safetensors
-names and the trunk ring are both done -- see below.
+Not ported yet: prefill expert batching (`k3_moe_prefill`) and preallocated
+scratch. Threading is out of scope deliberately, per Jay's direction to use the
+loadngo proactor instead (see `trunk`'s own section below). Binding the
+released checkpoint's safetensors names, the trunk ring, and wiring the real
+streamed-expert cache into a forward pass are all done -- see below.
 
 ### Real-checkpoint tensor names, confirmed 2026-09-20
 
@@ -271,12 +273,21 @@ one-layer view of the real config pinned to layer 0 -- the checkpoint's one
 dense, non-MoE layer, so `layer::NoStreamedExperts` is honestly correct there
 rather than standing in for the unimplemented expert-cache wiring -- ran the
 same token ids through both `TrunkRing::forward` and the existing, already-
-validated `Model::forward`, and got bit-identical logits. Multi-layer block
-aggregation across a dense/MoE boundary and the real streamed-expert path
-(wiring `cache::CachedExperts` in as the ring's `ExpertSource`) remain
-unexercised by this specific test -- that integration, prefill expert
-batching, and the CLI/tokenizer are what is left before this is a real,
-runnable inference path end to end.
+validated `Model::forward`, and got bit-identical logits.
+
+**The real streamed-expert path is also done, same day.** `TrunkRing::forward`
+already took `experts: &mut dyn ExpertSource` generically, and
+`cache::CachedExperts` (the engine's real `ExpertSource`, independently tested
+in `cache.rs`) already implements that trait -- so wiring it in needed no
+change to `trunk.rs` at all. A second real-checkpoint test
+(`ring_forward_matches_model_forward_with_the_real_streamed_expert_cache`)
+proves that: layers 0..=3 (one dense, three MoE) through both
+`TrunkRing::forward` and direct `Model::forward`, each with its own fresh
+`ExpertCache` over the same index, land on bit-identical logits -- real
+per-token top-k routing from the real gate weights, not simulated.
+
+Prefill expert batching and the CLI/tokenizer are what is left before this is
+a real, runnable inference path end to end.
 
 ## I/O: loadngo leads
 
@@ -319,11 +330,10 @@ reads use the page cache.
    downloaded checkpoint. Full-model resident binding is not the target -- see the trunk
    ring, next.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
-   *`TrunkRing::forward` runs a real forward pass sourced from the ring,
-   bit-identical to `Model::forward` on real data for the checkpoint's one
-   dense layer. Still open: wiring `cache::CachedExperts` in as the ring's
-   `ExpertSource` for the other 92 (MoE) layers, prefill expert batching, and
-   the CLI/tokenizer themselves.*
+   *`TrunkRing::forward` runs a real forward pass sourced from the ring, wired to
+   the real `cache::CachedExperts` streamed-expert source, bit-identical to
+   `Model::forward` on real data across a dense/MoE layer boundary. Still open:
+   prefill expert batching, and the CLI/tokenizer themselves.*
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
 baseline until the Rust end-to-end oracle and CLI are complete.
