@@ -122,9 +122,9 @@ an incremental `Session` unusable) instead of C's counted drop.
 `CachedExperts` is gated in `cache.rs` against direct loads of the cache fixture under
 eviction pressure and batch prefetch: identical packed bytes, scales and products.
 
-Not ported yet: binding the released checkpoint's safetensors names into these
-structures, the trunk ring, prefill expert batching (`k3_moe_prefill`), threading, and
-preallocated scratch.
+Not ported yet: the trunk ring, prefill expert batching (`k3_moe_prefill`), threading,
+and preallocated scratch. Binding the released checkpoint's safetensors names is done --
+see below.
 
 ### Real-checkpoint tensor names, confirmed 2026-09-20
 
@@ -174,14 +174,35 @@ downloaded `config.json`: `hidden_size`=7168, `routed_expert_hidden_size`
 `latent_moe_use_norm`=true (matches `k3_cfg.h`'s `latent_norm` field
 exactly).
 
-The remaining real-checkpoint-binding work is therefore: extend
-`kimi-k3-core::model`'s tensor-binding layer to read the three shared
-per-layer matrices above by name (trivial -- same shape as any other
-`layer::Matrix`) alongside the already-implemented per-expert MXFP4 path,
-using `~/k3model/model.safetensors.index.json` as the name/shard map. This
-does not need the actual weight bytes to implement or unit-test against a
-synthetic fixture shaped like the real names; it needs them only to
-validate against the real checkpoint once storage exists.
+### Real-checkpoint binding, done 2026-09-23
+
+`kimi-k3-core::bind` reads the checkpoint's real `language_model.model.layers.N.*`
+names (the three shared per-layer matrices above, plus every other trunk weight)
+into `LayerWeights`/`Model`. `BoundStorage` separates reading (`load_top_level`,
+`load_layer`, owned buffers) from borrowing (`layer_weights`, `model`, pure
+lookups with no further I/O), so a caller can bind one layer or a small window
+without the whole ~109 GB packed trunk resident at once -- nothing in this lab
+has that much free RAM. A `MoE` layer's routed experts always bind
+`RoutedExperts::Streamed`; 896 experts per layer is never resident.
+
+Validated directly against the real checkpoint on `/Volumes/Jarraya` (not just a
+synthetic fixture, now that storage and the full download both exist):
+`cargo test -p kimi-k3-core --test real_checkpoint_binding -- --ignored --nocapture`
+indexes all 497,220 real tensors across 96 shards in ~100ms, reads the ~4.7 GB
+embedding table and LM head correctly, and binds layers 0 (dense) and 1 (first
+MoE) with every shape matching `config.json`. That run caught two real bugs
+before landing: `read_raw`'s single unchunked read fails with EINVAL past
+roughly 2 GiB (`embed_tokens`/`lm_head` are each ~2.35 GB), fixed by chunking
+the bf16 read the same way `read_f32` already does; and `lm_head.weight` was
+initially loaded under the wrong, prefixed name, since the checkpoint stores it
+one level up from every other tensor (`language_model.lm_head.weight`, no
+`.model.`).
+
+Binding all 93 layers into one resident `Model` still is not attempted or
+planned as a real inference path: the packed bf16 trunk alone is roughly
+109 GB, which does not fit in memory on any machine in this lab, Mac mini
+included. Real end-to-end inference against the released checkpoint needs the
+trunk ring (below) to stream layers through a bounded window instead.
 
 ## I/O: loadngo leads
 
@@ -217,8 +238,10 @@ reads use the page cache.
 2. Expert-cache and trunk-streaming contracts. *Expert cache done; trunk streaming open.*
 3. Pure numerical kernels, checked against the C fixture manifest. *Done, including the
    bf16 and MXFP4 matmuls, wired through the layers with streamed experts.*
-4. Tensor binding and the tiny end-to-end model oracle. *Tiny oracle done, bit-identical
-   to C; binding the released checkpoint's safetensors names open.*
+4. Tensor binding and the tiny end-to-end model oracle. *Done: tiny oracle bit-identical
+   to C, and the released checkpoint's real names bind and validate against the actual
+   downloaded checkpoint. Full-model resident binding is not the target -- see the trunk
+   ring, next.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
