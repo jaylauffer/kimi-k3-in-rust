@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bind;
 pub mod cache;
 pub mod config;
 pub mod expert;
