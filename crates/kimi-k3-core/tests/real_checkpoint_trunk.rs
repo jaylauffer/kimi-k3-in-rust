@@ -14,7 +14,9 @@ use std::time::Instant;
 
 use kimi_k3_core::{
     bind::BoundStorage,
+    cache::{CachedExperts, ExpertCache},
     config::K3Config,
+    expert::ExpertRef,
     layer::{Attention, Matrix, Mlp, NoStreamedExperts},
     safetensors::SafeTensorIndex,
     trunk::{TopLevelWeights, TrunkRing},
@@ -153,5 +155,91 @@ fn ring_forward_matches_model_forward_bit_exactly_on_the_real_dense_layer() {
     assert_eq!(
         ring_logits, direct_logits,
         "TrunkRing::forward must be bit-identical to Model::forward on the same data"
+    );
+}
+
+/// The dense-layer test above deliberately used `NoStreamedExperts`, honest for
+/// a dense layer but not a real test of the streamed-expert path: 92 of the
+/// checkpoint's 93 layers are `MoE`, and `TrunkRing::forward` accepting `experts:
+/// &mut dyn ExpertSource` generically means `cache::CachedExperts` (the
+/// engine's real, already independently-tested `ExpertSource`) plugs in with
+/// no change to `trunk.rs` at all -- so this test's job is to prove that is
+/// actually true against real routing and real expert bytes, not to add new
+/// production code. Layers 0..=3 (one dense, three `MoE`) run through both
+/// `TrunkRing::forward` and direct `Model::forward`, each with its own fresh
+/// `ExpertCache` over the same index, and must still land on bit-identical
+/// logits: real per-token top-k routing, decided by the real gate weights, is
+/// deterministic given the same weights and the same input.
+#[test]
+#[ignore = "needs the real ~1.4 TB checkpoint locally; run explicitly with --ignored"]
+fn ring_forward_matches_model_forward_with_the_real_streamed_expert_cache() {
+    let dir = checkpoint_dir();
+    let mut config = K3Config::from_path(dir.join("config.json")).expect("real config parses");
+    assert!(config.is_dense(0), "layer 0 must be dense for this test");
+    assert!(!config.is_dense(1), "layer 1 must be MoE for this test");
+    config.num_hidden_layers = 4;
+    let index = SafeTensorIndex::open(&dir).expect("real checkpoint indexes");
+    let ids = [42_u32, 100, 7];
+
+    let probe = ExpertRef::resolve(&index, 1, 0).expect("layer 1 expert 0 resolves");
+    let new_cache = || {
+        ExpertCache::new(
+            config.num_hidden_layers,
+            config.num_experts,
+            config.num_experts_per_token,
+            1 << 30, // 1 GiB: comfortably more than top_k + 1 experts' worth
+            &probe,
+        )
+        .expect("expert cache sizes")
+    };
+
+    let mut storage = BoundStorage::new();
+    storage
+        .load_top_level(&index)
+        .expect("top-level tensors bind");
+    for layer in 0..config.num_hidden_layers {
+        storage
+            .load_layer(&index, &config, layer)
+            .unwrap_or_else(|error| panic!("layer {layer} binds: {error}"));
+    }
+    let model = storage.model(&config).expect("four-layer model builds");
+    let mut direct_cache = new_cache();
+    let start = Instant::now();
+    let direct_logits = model
+        .forward(&ids, &mut CachedExperts::new(&mut direct_cache, &index))
+        .expect("direct forward with real streamed experts succeeds");
+    eprintln!(
+        "direct forward over layers 0..=3 took {:?}",
+        start.elapsed()
+    );
+
+    let mut ring = TrunkRing::open(&index, &config, 1, 2).expect("ring opens");
+    let top = TopLevelWeights {
+        embed: model.embed,
+        lm_head: model.lm_head,
+        final_norm: model.final_norm,
+        out_res: model.out_res,
+    };
+    let mut ring_cache = new_cache();
+    let start = Instant::now();
+    let ring_logits = ring
+        .forward(
+            &index,
+            &config,
+            &top,
+            &ids,
+            &mut CachedExperts::new(&mut ring_cache, &index),
+        )
+        .expect("ring forward with real streamed experts succeeds");
+    eprintln!("ring forward over layers 0..=3 took {:?}", start.elapsed());
+
+    assert_eq!(
+        ring_logits, direct_logits,
+        "TrunkRing::forward must be bit-identical to Model::forward with the real \
+         streamed-expert cache too, not just the dense-layer NoStreamedExperts case"
+    );
+    assert!(
+        direct_logits.iter().all(|value| value.is_finite()),
+        "real routed-expert output must be finite, not NaN/inf from a wiring mistake"
     );
 }
