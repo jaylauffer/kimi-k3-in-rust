@@ -359,12 +359,46 @@ reads use the page cache.
    downloaded checkpoint. Full-model resident binding is not the target -- see the trunk
    ring, next.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
-   *`TrunkRing::forward` runs a real forward pass sourced from the ring, wired to
-   the real `cache::CachedExperts` streamed-expert source with prefill expert
-   batching, bit-identical to `Model::forward` on real data across a dense/MoE
-   layer boundary. `tokenizer::Tokenizer` is done and checked token-for-token
-   against the real `tiktoken` library on the real checkpoint's vocabulary. Still
-   open: the CLI itself, full-memory modes, and preallocated scratch.*
+   *Done: the `k3` CLI runs a real prompt through the real released checkpoint
+   end to end -- tokenize, stream 91 of 93 layers per forward pass through
+   `TrunkRing` and the real streamed-expert cache with prefill batching,
+   greedy-decode, detokenize -- and produces correct output; see "End-to-end
+   generation" below. Still open: the named memory-preset ladder with free-RAM
+   auto-sizing, `--incremental`/KV-cache carry-forward (decode is full recompute
+   only, matching the C engine's own default mode), `--spec`/`--draft-trunk`
+   speculative decode, `--save-state`/`--load-state`, `--ultra-low-memory`, and
+   preallocated scratch.*
+
+### End-to-end generation, verified 2026-09-23
+
+`k3 <checkpoint-dir> --prompt "The capital of France is" --gen 3 --pin-layers 2
+--ring-slots 2` ran against the real, full 1.4 TB checkpoint on `/Volumes/Jarraya`
+and produced `The capital of France is Paris.",` followed by a lone `+` on the
+next line -- factually correct, and the trailing quote/comma/`+` are exactly
+what a raw, non-instruction-tuned base model continuing training-data-shaped
+text looks like, not a bug (Kimi K3 as released is a base model; no chat
+template is applied here). Indexed 497,220 tensors, tokenized the prompt to 5
+real ids, streamed 91 of the 93 layers fresh through a two-slot ring on every
+one of the 3 forward passes (136 hits, 137 misses total, matching `~3x` the
+91 non-pinned layers), and detokenized the generated ids back to exactly that
+text. This is the first real, non-simulated confirmation that binding, the
+trunk ring, the real streamed-expert cache, prefill batching, and the
+tokenizer all compose correctly against the actual checkpoint, not just
+against each other in isolation.
+
+Took 771 seconds for 3 tokens: full recompute (`O(sequence length squared)`,
+the C engine's own default, per `src/cli/k3_run.c`'s own "DECODE STRATEGY"
+note) with only 2 of 93 layers pinned is the
+deliberately slowest, smallest-memory corner of the tradeoff space -- proving
+correctness at minimal footprint first, not a performance result. A first
+attempt at the same command with `--pin-layers 20` (~23 GB pinned) pushed the
+process to 33 GB RSS + 24 GB compressed on a machine running other real work
+at the time and made it briefly nearly unusable; killed immediately, memory
+recovered instantly, and `--pin-layers 2` (~2.3 GB) was used for the run
+above instead. `--incremental` (not yet ported) is what would make repeated
+generation affordable without needing a large pinned prefix; full recompute's
+cost is fundamentally `O(sequence length)` forward passes each re-touching
+most of the trunk, by design, not a bug to fix here.
 
 ### Tokenizer, done 2026-09-23
 
