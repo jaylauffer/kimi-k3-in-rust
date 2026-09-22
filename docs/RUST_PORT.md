@@ -122,9 +122,9 @@ an incremental `Session` unusable) instead of C's counted drop.
 `CachedExperts` is gated in `cache.rs` against direct loads of the cache fixture under
 eviction pressure and batch prefetch: identical packed bytes, scales and products.
 
-Not ported yet: the trunk ring, prefill expert batching (`k3_moe_prefill`), threading,
-and preallocated scratch. Binding the released checkpoint's safetensors names is done --
-see below.
+Not ported yet: prefill expert batching (`k3_moe_prefill`), threading (deliberately --
+see below), and preallocated scratch. Binding the released checkpoint's safetensors
+names and the trunk ring are both done -- see below.
 
 ### Real-checkpoint tensor names, confirmed 2026-09-20
 
@@ -204,6 +204,56 @@ planned as a real inference path: the packed bf16 trunk alone is roughly
 included. Real end-to-end inference against the released checkpoint needs the
 trunk ring (below) to stream layers through a bounded window instead.
 
+### Trunk ring, done 2026-09-23
+
+`kimi-k3-core::trunk::TrunkRing` is the Rust port of `src/io/k3_trunk.c`: a
+pinned layer prefix held resident for the ring's whole lifetime, plus the rest
+streamed through a small ring, walked in the fixed forward layer order every
+token visits (layer 0, 1, ..., `num_hidden_layers - 1`) -- see that C file's own
+header for why that fixed order is what makes one-layer-ahead prefetch safe
+with nothing to predict, and why a cyclic LRU would be the worst possible
+policy for this access pattern.
+
+Prefetch is the loadngo proactor's own async submit/wait split, deliberately
+never a reader thread (Jay: "we should be utilizing the loadngo proactor and
+avoiding threading"). That split didn't exist in `kimi-k3-core::io` before this
+-- `ShardFiles` only exposed blocking submit-then-wait -- so `read_batch` is
+now `submit_batch` immediately followed by `wait_batch` (a behavior-preserving
+refactor; its own existing tests are unchanged, plus a new one proving real
+work can happen between submitting and waiting). `bind.rs`'s per-layer tensor
+list moved out of `load_layer`'s body into a shared `layer_plan`, so the new
+async pair (`BoundStorage::submit_layer`/`absorb_layer`) and the existing
+blocking `load_layer` can never name a different set of tensors for the same
+layer.
+
+Caller contract: call `prefetch(L + 1)` *before* `bind(L)`, not after --
+`bind`'s returned `LayerWeights` borrows from `&mut self`, so nothing can call
+`prefetch` again (which also needs `&mut self`) while that borrow is still
+alive for the compute pass. Prefetching the next layer first, then binding and
+computing on the current one, gets the overlap anyway: the read is already
+submitted to the operating system by the time `bind`'s wait (if any) and the
+caller's compute run, so both proceed concurrently with it regardless of Rust's
+own aliasing rules on the Rust-side calls.
+
+Not ported from the C engine: budget-based automatic sizing of the pinned
+prefix (`k3_trunk_open`'s `budget_bytes`) and preallocated, uniformly-sized
+ring slots for `O_DIRECT`. A caller here states `pin_layers`/`ring_slots`
+directly; ring slots are ordinary per-layer allocations, freed and replaced as
+layers stream through, consistent with this port not yet implementing direct
+I/O or aligned slot memory anywhere.
+
+Validated against the real checkpoint (`real_checkpoint_trunk.rs`, `#[ignore]`d,
+run explicitly): opened a ring with layer 0 pinned and a two-slot streaming
+ring, walked layers 0..=3 using the prefetch-then-bind pattern, and confirmed
+every layer's weights exactly match what `BoundStorage`'s already-validated
+direct path produces for the same layers (fingerprinted by matrix lengths plus
+a running hash over `in_norm`, since `LayerWeights` has no equality check) --
+not simulated, and with genuine prefetch hits observed (2 hits, 1 miss across 3
+non-pinned layers). That run caught a real bug in the first draft: `bind`'s
+hit/miss labels were backwards, counting every successful prefetch as a "miss"
+because absorbing an already-in-flight read was conflated with never having
+prefetched at all.
+
 ## I/O: loadngo leads
 
 Every shard read goes through `loadngo-proactor` (`kimi-k3-core::io`), pinned to an
@@ -235,7 +285,9 @@ reads use the page cache.
 ## Port order
 
 1. Configuration parsing and safetensors I/O. *Done.*
-2. Expert-cache and trunk-streaming contracts. *Expert cache done; trunk streaming open.*
+2. Expert-cache and trunk-streaming contracts. *Done: expert cache, and the trunk ring
+   streams per-layer weights through the loadngo proactor's async submit/wait split,
+   validated against the real checkpoint.*
 3. Pure numerical kernels, checked against the C fixture manifest. *Done, including the
    bf16 and MXFP4 matmuls, wired through the layers with streamed experts.*
 4. Tensor binding and the tiny end-to-end model oracle. *Done: tiny oracle bit-identical
