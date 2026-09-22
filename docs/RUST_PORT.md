@@ -132,9 +132,14 @@ preallocated scratch.
 `model.safetensors.index.json`, the tokenizer files) fetched from
 `moonshotai/Kimi-K3` at commit `f831ab66814297da540d832a5235f8e904f29d06` and
 verified sha256-exact against the values Hugging Face's API reports for
-each file -- not the 1.56 TB of weight shards themselves, which no local
-storage exists for yet (the external drive earmarked for them is a
-separate, still-open decision).
+each file -- not the 1.56 TB of weight shards themselves. Storage now
+exists: the external NVMe formerly earmarked for this (previously "Untitled",
+1.1 TiB of unrelated Windows/personal data) was reclaimed and wiped
+2026-09-21/22, and is now an empty 2 TB APFS volume named `Jarraya`,
+mounted at `/Volumes/Jarraya` on the Mac mini (~2.0 TB free, confirmed via
+`diskutil`). That fits the 1.56 TB checkpoint plus 109 GB packed trunk with
+room to spare. The actual download from `moonshotai/Kimi-K3` at the pinned
+commit above has not started -- this only resolves where it will land.
 
 Read against the index's 497,220 real tensor names, `k3_moe`
 (`src/core/k3_ops.c:537-656`, itself verified there against
