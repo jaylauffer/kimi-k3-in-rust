@@ -41,6 +41,19 @@ MODIFICATIONS
   structures directly from the released tiktoken.model and tokenizer_config.json, so no
   intermediate tokenizer.json conversion step is required.
 
+RUST PORT
+
+  crates/kimi-k3-core/src/tokenizer.rs is a Rust port of tok.h (the Kimi pre-tokenizer
+  and rankbpe paths only -- see that file's own doc comment for why the general
+  cl100k/o200k/merges-list machinery is not ported) and of k3_tok.h's loader. It embeds
+  the Unicode range tables from tok_unicode.h and tok_unicode_o200k.h directly (every
+  (lo, hi) pair extracted programmatically from those files, verified sorted,
+  non-overlapping, and matching each table's own declared entry count before use), and
+  is licensed under the Apache License, Version 2.0, the same as the vendored C sources
+  it derives from. Checked token-for-token against the real tiktoken library encoding
+  the real checkpoint's vocabulary, not just against the C engine's own test suite --
+  see crates/kimi-k3-core/tests/tokenizer_parity.rs and docs/RUST_PORT.md.
+
 ================================================================================
 MODEL WEIGHTS
 ================================================================================

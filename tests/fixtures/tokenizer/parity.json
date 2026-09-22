@@ -1,0 +1,1145 @@
+[
+  {
+    "text": "Hello, world!",
+    "ids": [
+      19180,
+      11,
+      2695,
+      0
+    ],
+    "decoded": "Hello, world!"
+  },
+  {
+    "text": "  leading and trailing spaces  ",
+    "ids": [
+      220,
+      8134,
+      316,
+      42711,
+      14803,
+      256
+    ],
+    "decoded": "  leading and trailing spaces  "
+  },
+  {
+    "text": "line1\nline2\r\nline3",
+    "ids": [
+      1611,
+      16,
+      198,
+      1611,
+      17,
+      462,
+      1611,
+      18
+    ],
+    "decoded": "line1\nline2\r\nline3"
+  },
+  {
+    "text": "tabs\tand\tmore\ttabs",
+    "ids": [
+      58308,
+      58443,
+      3575,
+      529,
+      5604,
+      5609
+    ],
+    "decoded": "tabs\tand\tmore\ttabs"
+  },
+  {
+    "text": "contractions: I'm, you're, we've, they'll, it'd, don't, can't",
+    "ids": [
+      61651,
+      6387,
+      25,
+      6806,
+      11,
+      8645,
+      11,
+      22205,
+      11,
+      55481,
+      11,
+      483,
+      12362,
+      11,
+      4536,
+      11,
+      8971
+    ],
+    "decoded": "contractions: I'm, you're, we've, they'll, it'd, don't, can't"
+  },
+  {
+    "text": "numbers: 0 1 42 12345 999999",
+    "ids": [
+      71476,
+      25,
+      220,
+      15,
+      220,
+      16,
+      220,
+      5512,
+      220,
+      6694,
+      2899,
+      220,
+      11275,
+      11275
+    ],
+    "decoded": "numbers: 0 1 42 12345 999999"
+  },
+  {
+    "text": "punctuation!!! ...?? ---",
+    "ids": [
+      79,
+      114695,
+      20118,
+      6118,
+      9598,
+      20996
+    ],
+    "decoded": "punctuation!!! ...?? ---"
+  },
+  {
+    "text": "CamelCase and snake_case and kebab-case",
+    "ids": [
+      111821,
+      8081,
+      316,
+      58108,
+      39188,
+      316,
+      2591,
+      58689,
+      56344
+    ],
+    "decoded": "CamelCase and snake_case and kebab-case"
+  },
+  {
+    "text": "中文测试：你好世界",
+    "ids": [
+      16717,
+      9555,
+      2648,
+      33845,
+      2243
+    ],
+    "decoded": "中文测试：你好世界"
+  },
+  {
+    "text": "混合 mixed 文字 text 123",
+    "ids": [
+      13935,
+      15682,
+      220,
+      8662,
+      2913,
+      220,
+      6694
+    ],
+    "decoded": "混合 mixed 文字 text 123"
+  },
+  {
+    "text": "emoji: 😀🎉🚀 family: 👨‍👩‍👧‍👦",
+    "ids": [
+      33120,
+      25,
+      70005,
+      222,
+      5885,
+      236,
+      231,
+      5885,
+      40101,
+      3545,
+      25,
+      130732,
+      101,
+      67963,
+      64390,
+      102,
+      67963,
+      64390,
+      100,
+      67963,
+      64390,
+      99
+    ],
+    "decoded": "emoji: 😀🎉🚀 family: 👨‍👩‍👧‍👦"
+  },
+  {
+    "text": "accents: café naïve résumé Zürich",
+    "ids": [
+      8611,
+      1017,
+      25,
+      70591,
+      7915,
+      44187,
+      367,
+      23606,
+      7671,
+      1941,
+      2970,
+      14541,
+      969
+    ],
+    "decoded": "accents: café naïve résumé Zürich"
+  },
+  {
+    "text": "日本語のテスト、ひらがなとカタカナ",
+    "ids": [
+      4546,
+      63011,
+      4663,
+      25875,
+      33360,
+      343,
+      127935,
+      16800,
+      10389,
+      11839,
+      9219,
+      26121,
+      21449,
+      26121,
+      42125
+    ],
+    "decoded": "日本語のテスト、ひらがなとカタカナ"
+  },
+  {
+    "text": "한국어 테스트입니다",
+    "ids": [
+      17079,
+      54078,
+      28763,
+      160618,
+      87637
+    ],
+    "decoded": "한국어 테스트입니다"
+  },
+  {
+    "text": "Ω≈ç√∫˜µ≤≥÷",
+    "ids": [
+      145389,
+      23149,
+      230,
+      7231,
+      74804,
+      12273,
+      104,
+      135,
+      250,
+      119082,
+      65200,
+      37124,
+      88279
+    ],
+    "decoded": "Ω≈ç√∫˜µ≤≥÷"
+  },
+  {
+    "text": "https://example.com/path?query=value&other=123",
+    "ids": [
+      1927,
+      1316,
+      17480,
+      1304,
+      73505,
+      30,
+      4964,
+      100520,
+      5,
+      2348,
+      28,
+      6694
+    ],
+    "decoded": "https://example.com/path?query=value&other=123"
+  },
+  {
+    "text": "code: fn main() { println!(\"hi\"); }",
+    "ids": [
+      2431,
+      25,
+      8006,
+      2777,
+      539,
+      384,
+      47647,
+      28547,
+      9663,
+      11896,
+      457
+    ],
+    "decoded": "code: fn main() { println!(\"hi\"); }"
+  },
+  {
+    "text": "<|end_of_msg|> literal special token usage",
+    "ids": [
+      163586,
+      34459,
+      3611,
+      7652,
+      13774
+    ],
+    "decoded": "<|end_of_msg|> literal special token usage"
+  },
+  {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+  },
+  {
+    "text": " ",
+    "ids": [
+      220
+    ],
+    "decoded": " "
+  },
+  {
+    "text": "a",
+    "ids": [
+      64
+    ],
+    "decoded": "a"
+  },
+  {
+    "text": "   multiple     spaces     between     words   ",
+    "ids": [
+      256,
+      6810,
+      257,
+      14803,
+      257,
+      2951,
+      257,
+      7030,
+      274
+    ],
+    "decoded": "   multiple     spaces     between     words   "
+  },
+  {
+    "text": "Русский текст для теста",
+    "ids": [
+      22559,
+      28768,
+      32890,
+      148468,
+      26384,
+      5599,
+      18299,
+      780
+    ],
+    "decoded": "Русский текст для теста"
+  },
+  {
+    "text": "🇺🇸🇯🇵🇰🇷 flags",
+    "ids": [
+      32166,
+      118581,
+      32166,
+      107,
+      32166,
+      113,
+      32166,
+      108,
+      32166,
+      115,
+      10141
+    ],
+    "decoded": "🇺🇸🇯🇵🇰🇷 flags"
+  },
+  {
+    "text": "zero​width​space",
+    "ids": [
+      7290,
+      19400,
+      7071,
+      19400,
+      7878
+    ],
+    "decoded": "zero​width​space"
+  },
+  {
+    "text": "[BOS][EOS]",
+    "ids": [
+      163584,
+      163585
+    ],
+    "decoded": "[BOS][EOS]"
+  },
+  {
+    "text": "[BOS] [EOS]",
+    "ids": [
+      163584,
+      220,
+      163585
+    ],
+    "decoded": "[BOS] [EOS]"
+  },
+  {
+    "text": "start[BOS]middle[EOS]end",
+    "ids": [
+      5402,
+      163584,
+      61186,
+      163585,
+      517
+    ],
+    "decoded": "start[BOS]middle[EOS]end"
+  },
+  {
+    "text": "[BOS][BOS][BOS]",
+    "ids": [
+      163584,
+      163584,
+      163584
+    ],
+    "decoded": "[BOS][BOS][BOS]"
+  },
+  {
+    "text": "  <|end_of_msg|>  ",
+    "ids": [
+      256,
+      163586,
+      256
+    ],
+    "decoded": "  <|end_of_msg|>  "
+  },
+  {
+    "text": "",
+    "ids": [],
+    "decoded": ""
+  },
+  {
+    "text": "1234567890",
+    "ids": [
+      6694,
+      12972,
+      16242,
+      15
+    ],
+    "decoded": "1234567890"
+  },
+  {
+    "text": "1 22 333 4444 55555",
+    "ids": [
+      16,
+      220,
+      2270,
+      220,
+      15176,
+      220,
+      24446,
+      19,
+      220,
+      23700,
+      3807
+    ],
+    "decoded": "1 22 333 4444 55555"
+  },
+  {
+    "text": "3.14159265",
+    "ids": [
+      18,
+      13,
+      18702,
+      43247,
+      4268
+    ],
+    "decoded": "3.14159265"
+  },
+  {
+    "text": "1,234,567.89",
+    "ids": [
+      16,
+      11,
+      18697,
+      11,
+      31344,
+      13,
+      7173
+    ],
+    "decoded": "1,234,567.89"
+  },
+  {
+    "text": "a\n\n\nb",
+    "ids": [
+      64,
+      3898,
+      65
+    ],
+    "decoded": "a\n\n\nb"
+  },
+  {
+    "text": "a\r\n\r\nb",
+    "ids": [
+      64,
+      2298,
+      65
+    ],
+    "decoded": "a\r\n\r\nb"
+  },
+  {
+    "text": "a   \n   b",
+    "ids": [
+      64,
+      15403,
+      256,
+      291
+    ],
+    "decoded": "a   \n   b"
+  },
+  {
+    "text": "a\tb\tc",
+    "ids": [
+      64,
+      3214,
+      2529
+    ],
+    "decoded": "a\tb\tc"
+  },
+  {
+    "text": "trailing newline\n",
+    "ids": [
+      523,
+      16627,
+      76090,
+      198
+    ],
+    "decoded": "trailing newline\n"
+  },
+  {
+    "text": "\nleading newline",
+    "ids": [
+      198,
+      50203,
+      76090
+    ],
+    "decoded": "\nleading newline"
+  },
+  {
+    "text": "\n\n\n",
+    "ids": [
+      3898
+    ],
+    "decoded": "\n\n\n"
+  },
+  {
+    "text": "   ",
+    "ids": [
+      274
+    ],
+    "decoded": "   "
+  },
+  {
+    "text": "a\n",
+    "ids": [
+      64,
+      198
+    ],
+    "decoded": "a\n"
+  },
+  {
+    "text": "a \n b",
+    "ids": [
+      64,
+      1420,
+      291
+    ],
+    "decoded": "a \n b"
+  },
+  {
+    "text": "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog ",
+    "ids": [
+      2108,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      276,
+      5072,
+      16331,
+      69275,
+      60062,
+      1312,
+      276,
+      29292,
+      7751,
+      220
+    ],
+    "decoded": "the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog the quick brown fox jumps over the lazy dog "
+  },
+  {
+    "text": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中",
+    "ids": [
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435,
+      435
+    ],
+    "decoded": "中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中中"
+  },
+  {
+    "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "ids": [
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908,
+      101908
+    ],
+    "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  {
+    "text": "English 中文 日本語 한국어 العربية עברית ไทย",
+    "ids": [
+      44372,
+      220,
+      16717,
+      220,
+      4546,
+      63011,
+      78560,
+      54078,
+      28763,
+      120413,
+      12441,
+      33480,
+      51589,
+      34403,
+      220,
+      52791,
+      37016,
+      31452
+    ],
+    "decoded": "English 中文 日本語 한국어 العربية עברית ไทย"
+  },
+  {
+    "text": "Han-adjacent: 中text中 and text中text",
+    "ids": [
+      117728,
+      30112,
+      73,
+      23033,
+      25,
+      220,
+      435,
+      3501,
+      435,
+      316,
+      2913,
+      435,
+      3501
+    ],
+    "decoded": "Han-adjacent: 中text中 and text中text"
+  },
+  {
+    "text": "مرحبا بالعالم שלום עולם",
+    "ids": [
+      40011,
+      7570,
+      4265,
+      1063,
+      47116,
+      5042,
+      52137,
+      37056,
+      84242,
+      33480,
+      38252,
+      34102
+    ],
+    "decoded": "مرحبا بالعالم שלום עולם"
+  },
+  {
+    "text": "I'm you're we've they'll it'd don't can't won't",
+    "ids": [
+      17172,
+      8645,
+      22205,
+      55481,
+      483,
+      12362,
+      4536,
+      8971,
+      14164
+    ],
+    "decoded": "I'm you're we've they'll it'd don't can't won't"
+  },
+  {
+    "text": "'tis 'twas",
+    "ids": [
+      1769,
+      289,
+      542,
+      20236,
+      314
+    ],
+    "decoded": "'tis 'twas"
+  },
+  {
+    "text": "'s't're've'm'll'd",
+    "ids": [
+      1048,
+      1769,
+      4746,
+      7962,
+      14404,
+      6683,
+      12362
+    ],
+    "decoded": "'s't're've'm'll'd"
+  },
+  {
+    "text": "a b c　d",
+    "ids": [
+      64,
+      5406,
+      65,
+      64731,
+      66,
+      14224,
+      67
+    ],
+    "decoded": "a b c　d"
+  },
+  {
+    "text": "é à ñ",
+    "ids": [
+      68,
+      37484,
+      261,
+      71043,
+      326,
+      136,
+      225
+    ],
+    "decoded": "é à ñ"
+  },
+  {
+    "text": "supercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocious",
+    "ids": [
+      18785,
+      12440,
+      361,
+      24772,
+      334,
+      6340,
+      8549,
+      682,
+      338,
+      3028,
+      280,
+      496,
+      5938,
+      12440,
+      361,
+      24772,
+      334,
+      6340,
+      8549,
+      682,
+      338,
+      3028,
+      280,
+      496,
+      5938,
+      12440,
+      361,
+      24772,
+      334,
+      6340,
+      8549,
+      682,
+      338,
+      3028,
+      280,
+      496,
+      5938,
+      12440,
+      361,
+      24772,
+      334,
+      6340,
+      8549,
+      682,
+      338,
+      3028,
+      280,
+      496,
+      5938,
+      12440,
+      361,
+      24772,
+      334,
+      6340,
+      8549,
+      682,
+      338,
+      162249
+    ],
+    "decoded": "supercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocioussupercalifragilisticexpialidocious"
+  },
+  {
+    "text": "a‌b‍c",
+    "ids": [
+      64,
+      13047,
+      65,
+      67963,
+      66
+    ],
+    "decoded": "a‌b‍c"
+  },
+  {
+    "text": "👍🏽 👨‍👩‍👧 🏳️‍🌈 #️⃣",
+    "ids": [
+      64390,
+      235,
+      92949,
+      121,
+      130732,
+      101,
+      67963,
+      64390,
+      102,
+      67963,
+      64390,
+      100,
+      17137,
+      237,
+      111,
+      31615,
+      67963,
+      5885,
+      234,
+      230,
+      1214,
+      31615,
+      123048
+    ],
+    "decoded": "👍🏽 👨‍👩‍👧 🏳️‍🌈 #️⃣"
+  },
+  {
+    "text": "!!!???...,,,;;;:::",
+    "ids": [
+      20118,
+      46518,
+      1614,
+      38259,
+      11,
+      45404,
+      60204
+    ],
+    "decoded": "!!!???...,,,;;;:::"
+  },
+  {
+    "text": "(((nested)))",
+    "ids": [
+      18607,
+      82046,
+      11286
+    ],
+    "decoded": "(((nested)))"
+  },
+  {
+    "text": "path/to/file.txt",
+    "ids": [
+      4953,
+      49520,
+      34947,
+      8842
+    ],
+    "decoded": "path/to/file.txt"
+  },
+  {
+    "text": "user@example.com",
+    "ids": [
+      2482,
+      31,
+      17480,
+      1304
+    ],
+    "decoded": "user@example.com"
+  },
+  {
+    "text": "𝕳𝖊𝖑𝖑𝖔 𝔀𝔬𝔯𝔩𝔡",
+    "ids": [
+      11889,
+      243,
+      111,
+      11889,
+      244,
+      232,
+      11889,
+      244,
+      239,
+      11889,
+      244,
+      239,
+      11889,
+      244,
+      242,
+      131021,
+      222,
+      142435,
+      105,
+      142435,
+      107,
+      11889,
+      140171,
+      142435,
+      94
+    ],
+    "decoded": "𝕳𝖊𝖑𝖑𝖔 𝔀𝔬𝔯𝔩𝔡"
+  },
+  {
+    "text": "🀄🁵🂡",
+    "ids": [
+      5885,
+      222,
+      226,
+      5885,
+      223,
+      113,
+      5885,
+      224,
+      94
+    ],
+    "decoded": "🀄🁵🂡"
+  }
+]
