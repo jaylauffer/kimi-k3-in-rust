@@ -113,8 +113,9 @@ an incremental `Session` unusable) instead of C's counted drop.
 - A bf16 trunk gives logits bit-identical to the same values bound as fp32, through
   both the full forward and incremental decode.
 - Experts quantised to MXFP4 and streamed through a source match a resident fp32 bank of
-  their exact dequantisation: same argmax everywhere, measured bit-identical logits, and
-  the source is asked for exactly top-k experts per token per MoE layer. The streamed
+  their exact dequantisation: same argmax everywhere, measured bit-identical logits (this
+  gate predates prefill batching below and still passes unchanged under it, since
+  batching only changes fetch order and count, never the arithmetic). The streamed
   model's incremental decode reproduces its own full forward bit for bit.
 - A streamed layer with no source is an error at its layer, and a session refuses
   further tokens after one.
@@ -122,11 +123,39 @@ an incremental `Session` unusable) instead of C's counted drop.
 `CachedExperts` is gated in `cache.rs` against direct loads of the cache fixture under
 eviction pressure and batch prefetch: identical packed bytes, scales and products.
 
-Not ported yet: prefill expert batching (`k3_moe_prefill`) and preallocated
-scratch. Threading is out of scope deliberately, per Jay's direction to use the
-loadngo proactor instead (see `trunk`'s own section below). Binding the
-released checkpoint's safetensors names, the trunk ring, and wiring the real
-streamed-expert cache into a forward pass are all done -- see below.
+Not ported yet: preallocated scratch. Threading is out of scope deliberately,
+per Jay's direction to use the loadngo proactor instead (see `trunk`'s own
+section below). Binding the released checkpoint's safetensors names, the
+trunk ring, wiring the real streamed-expert cache into a forward pass, and
+prefill expert batching are all done -- see below.
+
+### Prefill expert batching, done 2026-09-23
+
+`layer::moe_prefill`, ported from `k3_moe_prefill`/`moe_prefill_chunk` in
+`src/core/k3_ops.c`: for `t > 1` streamed-expert tokens processed together (a
+prompt prefill), routes and down-projects every token first, then fetches each
+UNIQUE expert across the whole chunk exactly once and applies it to every
+(token, slot) that selected it, instead of fetching an expert again for every
+token that happened to pick it. Chunked at 64 tokens (matching C's own
+`CHUNK`) so the contribution buffer stays bounded regardless of prompt length.
+Falls straight through to the existing per-token `moe` for a single token or
+resident experts, where there is nothing to dedup -- `decoder_layer`'s one MoE
+call site goes through `moe_prefill` unconditionally now, so `Model::forward`,
+`TrunkRing::forward`, and `Session::feed` (whose own `T = 1` calls hit the
+same fallback) all get this with no caller change.
+
+Bit-identical to calling `moe` once per token, not just faster: the existing
+tiny-checkpoint streamed-expert gate (`tagged_weights.rs`) now exercises this
+path (a multi-token forward through streamed MXFP4 experts always did) and
+still reports `maxrel 0.000e0, bit-identical: true` against the resident
+reference. That gate's fetch-count assertion had assumed no deduplication
+ever happens -- true before this, false by design after -- fixed to check
+that `fetched` is a nonzero upper bound and always equals `prefetched` (both
+count the same deduplicated set), instead of an exact count that depended on
+there being no dedup to begin with. Also re-verified on the real checkpoint:
+`real_checkpoint_trunk.rs`'s streamed-expert-cache test exercises this path
+for real three-token, three-MoE-layer input and still gets bit-identical
+ring-vs-direct logits.
 
 ### Real-checkpoint tensor names, confirmed 2026-09-20
 
@@ -331,9 +360,10 @@ reads use the page cache.
    ring, next.*
 5. CLI, tokenizer, full-memory modes, and released-checkpoint validation.
    *`TrunkRing::forward` runs a real forward pass sourced from the ring, wired to
-   the real `cache::CachedExperts` streamed-expert source, bit-identical to
-   `Model::forward` on real data across a dense/MoE layer boundary. Still open:
-   prefill expert batching, and the CLI/tokenizer themselves.*
+   the real `cache::CachedExperts` streamed-expert source with prefill expert
+   batching, bit-identical to `Model::forward` on real data across a dense/MoE
+   layer boundary. Still open: the CLI/tokenizer themselves, and preallocated
+   scratch.*
 
 `cargo test` is the Rust gate for completed slices. `make test` remains the C
 baseline until the Rust end-to-end oracle and CLI are complete.
