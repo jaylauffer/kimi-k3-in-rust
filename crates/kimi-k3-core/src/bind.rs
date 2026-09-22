@@ -550,10 +550,30 @@ impl BoundStorage {
                     .map_err(|_| BindError::LayerNotLoaded(layer))?,
             );
         }
-        let norm_name = full_name("output_attn_res_norm.weight");
-        let proj_name = full_name("output_attn_res_proj.weight");
+        let top = self.top_level()?;
         Ok(Model {
             config: config.clone(),
+            embed: top.embed,
+            lm_head: top.lm_head,
+            final_norm: top.final_norm,
+            out_res: top.out_res,
+            layers,
+        })
+    }
+
+    /// Builds just the tensors a model needs outside its layer stack, from
+    /// tensors [`Self::load_top_level`] already loaded -- the entry point for a
+    /// caller that sources layers from a [`crate::trunk::TrunkRing`] instead of
+    /// loading every layer into this same `BoundStorage` for [`Self::model`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BindError::MissingTensor`] if [`Self::load_top_level`] was
+    /// never called.
+    pub fn top_level(&self) -> Result<crate::trunk::TopLevelWeights<'_>, BindError> {
+        let norm_name = full_name("output_attn_res_norm.weight");
+        let proj_name = full_name("output_attn_res_proj.weight");
+        Ok(crate::trunk::TopLevelWeights {
             embed: self.matrix(&full_name("embed_tokens.weight"))?,
             lm_head: self.matrix("language_model.lm_head.weight")?,
             final_norm: self.f32_slice(&full_name("norm.weight"))?,
@@ -562,7 +582,6 @@ impl BoundStorage {
                 .get(&norm_name)
                 .zip(self.f32.get(&proj_name))
                 .map(|(norm, proj)| (norm.as_slice(), proj.as_slice())),
-            layers,
         })
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/kimi-k3-core"]
-default-members = ["crates/kimi-k3-core"]
+members = ["crates/kimi-k3-core", "crates/kimi-k3-cli"]
+default-members = ["crates/kimi-k3-core", "crates/kimi-k3-cli"]
 resolver = "2"
 
 [workspace.package]

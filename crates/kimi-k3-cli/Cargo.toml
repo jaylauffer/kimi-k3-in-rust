@@ -1,0 +1,18 @@
+[package]
+name = "kimi-k3-cli"
+version = "0.1.0"
+description = "CLI for the Rust Kimi K3 inference engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "k3"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+kimi-k3-core = { path = "../kimi-k3-core" }
