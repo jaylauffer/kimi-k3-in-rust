@@ -46,6 +46,15 @@ jobs:
           ref: dev
           path: loadngo
 
+      # loadngo's workspace manifest names a qcoin-types path dependency, and
+      # Cargo loads that whole workspace for any loadngo path crate. Same pinned
+      # revision loadngo's own Windows CI uses (loadngo .github/workflows/ci.yml).
+      - uses: actions/checkout@v4
+        with:
+          repository: jaylauffer/qcoin
+          ref: 6579c0a54635ef913806922a88049a6b5e68e840
+          path: qcoin
+
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
