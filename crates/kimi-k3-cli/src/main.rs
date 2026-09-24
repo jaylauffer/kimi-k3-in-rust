@@ -64,9 +64,14 @@ struct Args {
     max_context_given: bool,
     accel: accel::AccelKind,
     recompute: bool,
+    fs_base: Option<PathBuf>,
+    cas_root: Option<PathBuf>,
+    cas_key: Option<PathBuf>,
+    no_tools: bool,
 }
 
 impl Args {
+    #[allow(clippy::too_many_lines)] // one flat match arm per flag
     fn parse() -> Result<Self, String> {
         let mut raw = env::args().skip(1);
         let mut model_dir = None;
@@ -85,6 +90,10 @@ impl Args {
         let mut max_context_given = false;
         let mut accel = accel::AccelKind::Cpu;
         let mut recompute = false;
+        let mut fs_base = None;
+        let mut cas_root = None;
+        let mut cas_key = None;
+        let mut no_tools = false;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -117,6 +126,10 @@ impl Args {
                 "--config" => config_path = Some(PathBuf::from(next_value(&mut raw, "--config")?)),
                 "--layers" => layers = Some(parse_arg(&mut raw, "--layers")?),
                 "--recompute" => recompute = true,
+                "--no-tools" => no_tools = true,
+                "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
+                "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
+                "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
                 "--accel" => accel = accel::AccelKind::parse(&next_value(&mut raw, "--accel")?)?,
                 other if !other.starts_with('-') && model_dir.is_none() => {
                     model_dir = Some(PathBuf::from(other));
@@ -166,6 +179,10 @@ impl Args {
             max_context_given,
             accel,
             recompute,
+            fs_base,
+            cas_root,
+            cas_key,
+            no_tools,
         })
     }
 }
@@ -216,6 +233,12 @@ fn print_usage() {
          example: k3 /Volumes/Jarraya/kimi-k3 --chat --gen 64 --max-context 512\n\
          In chat: /help, /continue, /undo, /reset, /stats, /quit. Ctrl-C cancels\n\
          generation at a safe layer/output boundary; Ctrl-D exits at the prompt.\n\
+         \x20 --fs-base DIR        optional: Kimi Linear chat reads local files (read-only)\n\
+         \x20                      with relative paths starting here (default: current dir)\n\
+         \x20 --cas-root DIR       optional: also offer the newest snapshot in this Archive CAS\n\
+         \x20                      root that verifies against --cas-key (a public key)\n\
+         \x20 --cas-key PATH       optional: trusted Dilithium public key for --cas-root\n\
+         \x20 --no-tools           optional: chat without file tools\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
          \x20 --accel cpu|ane      optional device for the bf16 trunk products (default cpu,\n\

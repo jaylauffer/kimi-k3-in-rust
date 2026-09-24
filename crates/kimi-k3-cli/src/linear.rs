@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
+use loadngo_inference::tools::{FsTools, Toolbox};
 
 use crate::{Args, accel, chat};
 
@@ -32,6 +33,53 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
         return Err("non-finite logits; refusing to emit a token".into());
     }
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
+}
+
+/// Read-only file tools for chat: the local drive, plus a signed CAS snapshot when
+/// `--cas-root` and `--cas-key` are given and it verifies. Reported on stderr.
+fn toolbox(args: &Args) -> Toolbox {
+    let mut tools = Toolbox::default();
+    if args.no_tools {
+        eprintln!("file tools: off (--no-tools)");
+        return tools;
+    }
+    let base = args
+        .fs_base
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| ".".into());
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    eprintln!(
+        "file tools: local drive, read-only, relative to {}",
+        base.display()
+    );
+    for tool in FsTools::new(base, home.as_deref()).into_tools() {
+        tools.push(tool);
+    }
+    match (&args.cas_root, &args.cas_key) {
+        (Some(root), Some(key)) => {
+            let start = Instant::now();
+            match data::archive_view::ArchiveView::open_newest_verified(root, key) {
+                Ok(view) => {
+                    eprintln!(
+                        "file tools: CAS snapshot {} ({} files), root {}, signed by {}, verified in {:.1?}",
+                        view.archive_id(),
+                        view.file_count(),
+                        view.root().to_hex(),
+                        view.signer(),
+                        start.elapsed()
+                    );
+                    for tool in loadngo_inference::cas_tools::cas_tools(view) {
+                        tools.push(tool);
+                    }
+                }
+                Err(error) => eprintln!("file tools: no CAS snapshot ({error:#})"),
+            }
+        }
+        (None, None) => {}
+        _ => eprintln!("file tools: --cas-root and --cas-key go together; CAS tools off"),
+    }
+    tools
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)] // GB shown to one decimal
@@ -73,6 +121,7 @@ pub fn run(
 
     if args.chat {
         let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        let tools = toolbox(args);
         println!(
             "Local Kimi Linear 48B-A3B on {}. The first reply is slower while the \
              expert cache warms.",
@@ -84,6 +133,7 @@ pub fn run(
         let mut last: Option<Vec<f32>> = None;
         return chat::run_with(
             &format,
+            Some(&tools).filter(|t| !t.is_empty()),
             tokenizer,
             max_context,
             gen_tokens,

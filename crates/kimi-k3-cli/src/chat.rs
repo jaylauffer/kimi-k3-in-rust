@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use kimi_k3_core::tokenizer::Tokenizer;
-use loadngo_inference::{Session, StopReason, Utf8Stream};
+use loadngo_inference::{Session, StopReason, Utf8Stream, tools::Toolbox};
 
 const OPEN: u32 = 163_587;
 const CLOSE: u32 = 163_588;
@@ -96,10 +96,16 @@ pub enum ChatFormat {
 
 /// Kimi Linear control tokens, looked up in the checkpoint's own tokenizer.
 pub struct LinearTokens {
+    system: u32,
     user: u32,
     assistant: u32,
     middle: u32,
     end: u32,
+    section_begin: u32,
+    section_end: u32,
+    call_begin: u32,
+    argument_begin: u32,
+    call_end: u32,
     /// The config's `eos_token_id` and, when the tokenizer has it, `[EOS]`.
     eos: [u32; 2],
 }
@@ -118,6 +124,12 @@ impl ChatFormat {
     /// When the tokenizer lacks one of the `<|im_*|>` control tokens as a single id.
     pub fn kimi_linear(tokenizer: &Tokenizer, eos: u32) -> Result<Self, String> {
         Ok(Self::KimiLinear(LinearTokens {
+            system: single(tokenizer, "<|im_system|>")?,
+            section_begin: single(tokenizer, "<|tool_calls_section_begin|>")?,
+            section_end: single(tokenizer, "<|tool_calls_section_end|>")?,
+            call_begin: single(tokenizer, "<|tool_call_begin|>")?,
+            argument_begin: single(tokenizer, "<|tool_call_argument_begin|>")?,
+            call_end: single(tokenizer, "<|tool_call_end|>")?,
             user: single(tokenizer, "<|im_user|>")?,
             assistant: single(tokenizer, "<|im_assistant|>")?,
             middle: single(tokenizer, "<|im_middle|>")?,
@@ -126,13 +138,25 @@ impl ChatFormat {
         }))
     }
 
-    fn prompt(&self, tokenizer: &Tokenizer, text: &str, first: bool) -> Vec<u32> {
+    fn prompt(
+        &self,
+        tokenizer: &Tokenizer,
+        text: &str,
+        first: bool,
+        tools: Option<&Toolbox>,
+    ) -> Vec<u32> {
         match self {
             Self::K3 => prompt(tokenizer, text, first),
             // The template renders role names and content as plain text between control
-            // tokens, so each is its own ordinary segment. No default system message.
+            // tokens, so each is its own ordinary segment. With tools, the conversation
+            // opens with the template's `tool_declare` message and a short system note.
             Self::KimiLinear(t) => {
-                let mut ids = vec![t.user];
+                let mut ids = Vec::new();
+                if let Some(tools) = tools.filter(|tools| first && !tools.is_empty()) {
+                    t.message(&mut ids, tokenizer, "tool_declare", &tools.declaration());
+                    t.message(&mut ids, tokenizer, "system", TOOL_GUIDANCE);
+                }
+                ids.push(t.user);
                 ordinary(&mut ids, tokenizer, "user");
                 ids.push(t.middle);
                 ordinary(&mut ids, tokenizer, text);
@@ -142,6 +166,68 @@ impl ChatFormat {
                 ids
             }
         }
+    }
+
+    /// Tool calls in a finished Kimi Linear reply, as `(id, arguments)` text pairs.
+    fn tool_calls(&self, tokenizer: &Tokenizer, reply: &[u32]) -> Vec<(String, String)> {
+        let Self::KimiLinear(t) = self else {
+            return Vec::new();
+        };
+        let Some(begin) = reply.iter().position(|&x| x == t.section_begin) else {
+            return Vec::new();
+        };
+        let section = &reply[begin + 1..];
+        let section = &section[..section
+            .iter()
+            .position(|&x| x == t.section_end)
+            .unwrap_or(section.len())];
+        let text = |ids: &[u32]| {
+            String::from_utf8_lossy(&tokenizer.decode(ids))
+                .trim()
+                .to_string()
+        };
+        let mut calls = Vec::new();
+        let mut rest = section;
+        while let Some(start) = rest.iter().position(|&x| x == t.call_begin) {
+            rest = &rest[start + 1..];
+            let Some(arg) = rest.iter().position(|&x| x == t.argument_begin) else {
+                break;
+            };
+            let end = rest
+                .iter()
+                .position(|&x| x == t.call_end)
+                .unwrap_or(rest.len());
+            if end < arg {
+                break;
+            }
+            calls.push((text(&rest[..arg]), text(&rest[arg + 1..end])));
+            rest = &rest[end..];
+        }
+        calls
+    }
+
+    /// Tool results as the template's tool messages, then the assistant header.
+    fn tool_results(
+        &self,
+        tokenizer: &Tokenizer,
+        results: &[(String, String, String)],
+    ) -> Vec<u32> {
+        let Self::KimiLinear(t) = self else {
+            return Vec::new();
+        };
+        let mut ids = Vec::new();
+        for (id, name, result) in results {
+            t.message(
+                &mut ids,
+                tokenizer,
+                name,
+                &format!("## Return of {id}\n{result}"),
+            );
+        }
+        ids.push(t.assistant);
+        ordinary(&mut ids, tokenizer, "assistant");
+        ids.push(t.middle);
+        ids
     }
 
     fn stops(&self) -> Vec<u32> {
@@ -162,7 +248,30 @@ impl ChatFormat {
         match self {
             Self::K3 => display.push(tokenizer, token),
             Self::KimiLinear(t) => {
-                if [t.user, t.assistant, t.middle, t.end, t.eos[0], t.eos[1]].contains(&token) {
+                if token == t.section_begin {
+                    return terminal_text(&display.utf8.finish());
+                }
+                if token == t.call_begin {
+                    return format!("{}\n[tool call ", terminal_text(&display.utf8.finish()));
+                }
+                if token == t.argument_begin {
+                    return format!("{} ", terminal_text(&display.utf8.finish()));
+                }
+                if token == t.call_end {
+                    return format!("{}]", terminal_text(&display.utf8.finish()));
+                }
+                if [
+                    t.system,
+                    t.user,
+                    t.assistant,
+                    t.middle,
+                    t.end,
+                    t.eos[0],
+                    t.eos[1],
+                    t.section_end,
+                ]
+                .contains(&token)
+                {
                     terminal_text(&display.utf8.finish())
                 } else {
                     terminal_text(&display.utf8.push(&tokenizer.decode(&[token])))
@@ -170,6 +279,32 @@ impl ChatFormat {
             }
         }
     }
+}
+
+const TOOL_GUIDANCE: &str = "You are Kimi, running locally on Jay's Mac mini. You can read \
+files with tools: fs_list, fs_read, fs_find and fs_grep read the local drive (read-only); \
+cas_list, cas_find, cas_read and cas_grep read the signed loadngo CAS snapshot of the pudding \
+workspace, where every file is verified against its signed root. When a question depends on a \
+file's contents, read it before answering and name the path you read.";
+
+/// Most tool rounds (calls, results, continued reply) after one user message.
+const MAX_TOOL_ROUNDS: usize = 8;
+
+impl LinearTokens {
+    /// `<|im_system|>role<|im_middle|>content<|im_end|>`, each text its own segment.
+    fn message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, role: &str, content: &str) {
+        ids.push(self.system);
+        ordinary(ids, tokenizer, role);
+        ids.push(self.middle);
+        ordinary(ids, tokenizer, content);
+        ids.push(self.end);
+    }
+}
+
+/// The tool name in a Kimi call id such as `functions.fs_read:0`.
+fn tool_name(id: &str) -> &str {
+    let id = id.strip_prefix("functions.").unwrap_or(id);
+    id.split(':').next().unwrap_or(id)
 }
 
 /// Do not let model text inject terminal escape sequences (including OSC).
@@ -242,6 +377,7 @@ pub fn run(
     validate(tokenizer)?;
     run_with(
         &ChatFormat::K3,
+        None,
         tokenizer,
         max_context,
         max_tokens,
@@ -258,6 +394,7 @@ pub fn run(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_with(
     format: &ChatFormat,
+    tools: Option<&Toolbox>,
     tokenizer: &Tokenizer,
     max_context: usize,
     max_tokens: usize,
@@ -338,9 +475,12 @@ pub fn run_with(
                 continue;
             }
             _ => {
-                if let Err(error) =
-                    session.begin_turn(&format.prompt(tokenizer, text, session.tokens().is_empty()))
-                {
+                if let Err(error) = session.begin_turn(&format.prompt(
+                    tokenizer,
+                    text,
+                    session.tokens().is_empty(),
+                    tools,
+                )) {
                     writeln!(output, "{error}").map_err(|e| e.to_string())?;
                     continue;
                 }
@@ -351,42 +491,99 @@ pub fn run_with(
             }
         }
         cancel.store(false, Ordering::Relaxed);
-        generating.store(true, Ordering::Relaxed);
-        let started = Instant::now();
-        let stops = format.stops();
-        let result = session.generate(max_tokens, &stops, cancel, &mut next, |token| {
-            write!(output, "{}", format.push(&mut display, tokenizer, token))
-                .and_then(|()| output.flush())
-                .map_err(|e| e.to_string())
-        });
-        generating.store(false, Ordering::Relaxed);
-        match result {
-            Ok(done) => {
-                if done.reason == StopReason::EndToken {
-                    write!(output, "{}", terminal_text(&display.utf8.finish()))
-                        .map_err(|e| e.to_string())?;
+        for round in 0..=MAX_TOOL_ROUNDS {
+            let reply_start = session.tokens().len();
+            generating.store(true, Ordering::Relaxed);
+            let started = Instant::now();
+            let stops = format.stops();
+            let result = session.generate(max_tokens, &stops, cancel, &mut next, |token| {
+                write!(output, "{}", format.push(&mut display, tokenizer, token))
+                    .and_then(|()| output.flush())
+                    .map_err(|e| e.to_string())
+            });
+            generating.store(false, Ordering::Relaxed);
+            let done = match result {
+                Ok(done) => done,
+                Err(loadngo_inference::Error::Output(error)) => return Err(error),
+                Err(error) => {
+                    writeln!(
+                        output,
+                        "\n{error}; /continue retries, /undo discards this turn."
+                    )
+                    .map_err(|e| e.to_string())?;
+                    break;
                 }
+            };
+            if done.reason == StopReason::EndToken {
+                write!(output, "{}", terminal_text(&display.utf8.finish()))
+                    .map_err(|e| e.to_string())?;
+            }
+            writeln!(
+                output,
+                "\n[{:?}: {} tokens, {:.1}s, context {}/{}]",
+                done.reason,
+                done.tokens,
+                started.elapsed().as_secs_f64(),
+                session.tokens().len(),
+                max_context
+            )
+            .map_err(|e| e.to_string())?;
+            if session.is_pending() {
+                writeln!(output, "Reply unfinished. Use /continue, /undo or /reset.")
+                    .map_err(|e| e.to_string())?;
+                break;
+            }
+            let Some(tools) = tools else { break };
+            let calls = format.tool_calls(tokenizer, &session.tokens()[reply_start..]);
+            if calls.is_empty() {
+                break;
+            }
+            if round == MAX_TOOL_ROUNDS {
                 writeln!(
                     output,
-                    "\n[{:?}: {} tokens, {:.1}s, context {}/{}]",
-                    done.reason,
-                    done.tokens,
-                    started.elapsed().as_secs_f64(),
-                    session.tokens().len(),
-                    max_context
+                    "[tool limit: {MAX_TOOL_ROUNDS} rounds; ask a narrower question]"
                 )
                 .map_err(|e| e.to_string())?;
-                if session.is_pending() {
-                    writeln!(output, "Reply unfinished. Use /continue, /undo or /reset.")
-                        .map_err(|e| e.to_string())?;
-                }
+                break;
             }
-            Err(loadngo_inference::Error::Output(error)) => return Err(error),
-            Err(error) => writeln!(
-                output,
-                "\n{error}; /continue retries, /undo discards this turn."
-            )
-            .map_err(|e| e.to_string())?,
+            let mut results = Vec::new();
+            for (id, arguments) in calls {
+                let name = tool_name(&id).to_string();
+                let text = match tools.call(&name, &arguments) {
+                    Ok(text) => text,
+                    Err(error) => format!("error: {error}"),
+                };
+                writeln!(output, "[tool result {name}: {} bytes]", text.len())
+                    .map_err(|e| e.to_string())?;
+                results.push((id, name, text));
+            }
+            // Fit the results into what is left of the context, keeping room to answer.
+            let mut prompt = format.tool_results(tokenizer, &results);
+            let room = max_context.saturating_sub(session.tokens().len() + max_tokens.min(512));
+            while prompt.len() > room && results.iter().any(|(_, _, t)| t.len() > 200) {
+                for (_, _, text) in results.iter_mut().filter(|(_, _, t)| t.len() > 200) {
+                    let keep = text.len() / 2;
+                    let cut = (0..=keep)
+                        .rev()
+                        .find(|&i| text.is_char_boundary(i))
+                        .unwrap_or(0);
+                    text.truncate(cut);
+                    text.push_str("\n[truncated to fit the context]");
+                }
+                prompt = format.tool_results(tokenizer, &results);
+            }
+            if let Err(error) = session.begin_turn(&prompt) {
+                writeln!(
+                    output,
+                    "{error}: tool results do not fit; /reset to start over"
+                )
+                .map_err(|e| e.to_string())?;
+                break;
+            }
+            display = Display::default();
+            write!(output, "{}", format.opening())
+                .and_then(|()| output.flush())
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -515,6 +712,60 @@ mod tests {
             .map(|id| display.push(&tokenizer, id))
             .collect();
         assert_eq!(text, "\n\nKimi> 🌱");
+    }
+
+    #[test]
+    fn kimi_call_ids_name_their_tool() {
+        assert_eq!(tool_name("functions.fs_read:0"), "fs_read");
+        assert_eq!(tool_name("functions.cas_grep:12"), "cas_grep");
+        assert_eq!(tool_name("fs_list"), "fs_list");
+    }
+
+    // Uses only the downloaded Kimi Linear tokenizer files; no weights are read.
+    #[test]
+    #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files"]
+    fn kimi_linear_tool_calls_parse_from_real_tokens() {
+        let dir = std::env::var("KIMI_LINEAR_CHECKPOINT").expect("set checkpoint directory");
+        let tokenizer = Tokenizer::load(dir).unwrap();
+        let format = ChatFormat::kimi_linear(&tokenizer, 163_586).unwrap();
+        let reply = tokenizer.encode(
+            "Let me look.<|tool_calls_section_begin|><|tool_call_begin|>functions.fs_read:0\
+             <|tool_call_argument_begin|>{\"path\": \"README.md\"}<|tool_call_end|>\
+             <|tool_call_begin|>functions.cas_find:1<|tool_call_argument_begin|>{\"pattern\": \"**/*.rs\"}\
+             <|tool_call_end|><|tool_calls_section_end|><|im_end|>",
+        );
+        let calls = format.tool_calls(&tokenizer, &reply);
+        assert_eq!(
+            calls,
+            [
+                (
+                    "functions.fs_read:0".to_string(),
+                    r#"{"path": "README.md"}"#.to_string()
+                ),
+                (
+                    "functions.cas_find:1".to_string(),
+                    r#"{"pattern": "**/*.rs"}"#.to_string()
+                ),
+            ]
+        );
+        let results = format.tool_results(
+            &tokenizer,
+            &[(
+                "functions.fs_read:0".into(),
+                "fs_read".into(),
+                "hello".into(),
+            )],
+        );
+        assert!(
+            tokenizer
+                .decode_lossy(&results)
+                .contains("## Return of functions.fs_read:0")
+        );
+        assert!(
+            format
+                .tool_calls(&tokenizer, &tokenizer.encode("no calls<|im_end|>"))
+                .is_empty()
+        );
     }
 
     #[test]
