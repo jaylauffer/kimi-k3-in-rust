@@ -109,6 +109,27 @@ pub fn run(
     let start = Instant::now();
     let mut model = LinearModel::load(&args.model_dir, gib(cache_gb)).map_err(|e| e.to_string())?;
     eprintln!("  resident weights loaded in {:.1?}", start.elapsed());
+    if let Some(dir) = &args.mxfp4_experts {
+        if args.experts != quality::ExpertFormat::Bf16 {
+            return Err("--mxfp4-experts already reads 4-bit experts; drop --experts".into());
+        }
+        model.use_mxfp4_experts(dir).map_err(|e| e.to_string())?;
+        let start = Instant::now();
+        let keep = || !cancel.load(Ordering::Relaxed);
+        let read = model.preload_experts(keep).map_err(|e| e.to_string())?;
+        if read > 0 {
+            eprintln!(
+                "  {read} MXFP4 experts from {} resident in {:.1?}",
+                dir.display(),
+                start.elapsed()
+            );
+        } else {
+            eprintln!(
+                "  MXFP4 experts from {} stream through the cache (raise --cache-gb to hold all)",
+                dir.display()
+            );
+        }
+    }
     let device = accel::Device::open(args.accel)?;
     let max_context = if args.max_context_given {
         args.max_context

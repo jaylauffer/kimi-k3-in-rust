@@ -54,13 +54,17 @@ pub trait DenseAccel {
 
     /// Several products known in advance, so a device can prepare the next weight
     /// while it computes the current one. Returns false, with every `y` unspecified, to
-    /// decline them all. The default runs each through [`Self::matmul_bf16`].
-    fn run_bf16(&self, jobs: &mut [Bf16Job<'_>]) -> bool {
+    /// decline them all. The default runs each through [`Self::matmul_bf16`] or
+    /// [`Self::matmul_mxfp4`].
+    fn run_dense(&self, jobs: &mut [DenseJob<'_>]) -> bool {
         jobs.iter_mut().all(|job| {
             let (x, rows, inp) = (job.x, job.rows, job.inp);
-            job.parts
-                .iter_mut()
-                .all(|(w, out, y)| self.matmul_bf16(w, x, y, rows, inp, *out))
+            job.parts.iter_mut().all(|(w, out, y)| match *w {
+                WeightRef::Bf16(w) => self.matmul_bf16(w, x, y, rows, inp, *out),
+                WeightRef::Mxfp4 { packed, scales } => {
+                    self.matmul_mxfp4(packed, scales, x, y, rows, inp, *out)
+                }
+            })
         })
     }
 
@@ -85,13 +89,21 @@ pub trait DenseAccel {
 /// `None` computes every product on the CPU reference kernels.
 pub type Accel<'a> = Option<&'a dyn DenseAccel>;
 
-/// bf16 products that share one input `x` (`[rows][inp]`): each part is a weight
+/// A weight `[out][inp]` as stored: bf16 words, or MXFP4 with `packed`
+/// `[out][inp / 2]` and `scales` `[out][inp / MXFP4_GROUP_SIZE]`.
+#[derive(Clone, Copy, Debug)]
+pub enum WeightRef<'a> {
+    Bf16(&'a [u16]),
+    Mxfp4 { packed: &'a [u8], scales: &'a [u8] },
+}
+
+/// Products that share one input `x` (`[rows][inp]`): each part is a weight
 /// `[out][inp]`, its `out`, and its result `y` (`[rows][out]`).
-pub struct Bf16Job<'a> {
+pub struct DenseJob<'a> {
     pub x: &'a [f32],
     pub rows: usize,
     pub inp: usize,
-    pub parts: Vec<(&'a [u16], usize, &'a mut [f32])>,
+    pub parts: Vec<(WeightRef<'a>, usize, &'a mut [f32])>,
 }
 
 /// A weight matrix read only through a matmul, in the storage format it arrived in.

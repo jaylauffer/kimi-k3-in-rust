@@ -20,7 +20,7 @@
 //! ([`Matrix::mul_rows`]), so the CPU path is the reference for both.
 //!
 //! Products are handed to the optional device ([`Accel`]) a step at a time, every
-//! product whose input is ready at once ([`crate::layer::DenseAccel::run_bf16`]): KDA's six input
+//! product whose input is ready at once ([`crate::layer::DenseAccel::run_dense`]): KDA's six input
 //! projections, both low-rank halves, the shared and routed experts' gate and up, then
 //! their down projections. A device can then prepare one weight while it computes
 //! another (the Neural Engine converts bf16 to fp16 on a helper thread meanwhile).
@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::{
     io::ReadRequest,
-    layer::{Accel, Bf16Job, Matrix},
+    layer::{Accel, DenseJob, Matrix, Mxfp4Matrix, WeightRef},
     ops::{
         kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid,
     },
@@ -338,18 +338,70 @@ fn vector(index: &SafeTensorIndex, name: &str, len: usize) -> Result<Vec<f32>, L
 
 /// A bf16 `[out][inp]` matrix read only through products.
 struct Weight {
-    words: Vec<u16>,
+    data: Stored,
     out: usize,
     inp: usize,
 }
 
+/// A weight's bytes: the checkpoint's bf16 words, or (routed experts from a converted
+/// directory, see [`LinearModel::use_mxfp4_experts`]) MXFP4 codes and scales.
+enum Stored {
+    Bf16(Vec<u16>),
+    Mxfp4 { packed: Vec<u8>, scales: Vec<u8> },
+}
+
 impl Weight {
     const fn new(words: Vec<u16>, out: usize, inp: usize) -> Self {
-        Self { words, out, inp }
+        Self {
+            data: Stored::Bf16(words),
+            out,
+            inp,
+        }
+    }
+
+    fn as_ref(&self) -> WeightRef<'_> {
+        match &self.data {
+            Stored::Bf16(w) => WeightRef::Bf16(w),
+            Stored::Mxfp4 { packed, scales } => WeightRef::Mxfp4 { packed, scales },
+        }
+    }
+
+    /// The bf16 words to overwrite, switching the storage to bf16 if needed.
+    fn words_mut(&mut self) -> &mut Vec<u16> {
+        if !matches!(self.data, Stored::Bf16(_)) {
+            self.data = Stored::Bf16(Vec::new());
+        }
+        match &mut self.data {
+            Stored::Bf16(w) => w,
+            Stored::Mxfp4 { .. } => unreachable!(),
+        }
+    }
+
+    /// The MXFP4 buffers to overwrite, switching the storage to MXFP4 if needed.
+    fn mxfp4_mut(&mut self) -> (&mut Vec<u8>, &mut Vec<u8>) {
+        if !matches!(self.data, Stored::Mxfp4 { .. }) {
+            self.data = Stored::Mxfp4 {
+                packed: Vec::new(),
+                scales: Vec::new(),
+            };
+        }
+        match &mut self.data {
+            Stored::Mxfp4 { packed, scales } => (packed, scales),
+            Stored::Bf16(_) => unreachable!(),
+        }
     }
 
     fn mul_cpu(&self, y: &mut [f32], x: &[f32], rows: usize) {
-        Matrix::Bf16(&self.words).mul_rows(y, x, rows, self.inp, self.out, None);
+        match &self.data {
+            Stored::Bf16(w) => Matrix::Bf16(w).mul_rows(y, x, rows, self.inp, self.out, None),
+            Stored::Mxfp4 { packed, scales } => Mxfp4Matrix {
+                packed,
+                scales,
+                rows: self.out,
+                columns: self.inp,
+            }
+            .mul_rows(y, x, rows, None),
+        }
     }
 }
 
@@ -365,21 +417,21 @@ struct Mul<'a> {
 /// products are gathered never changes the reference path's floats.
 fn products(accel: Accel<'_>, muls: &mut [Mul<'_>]) {
     if let Some(device) = accel {
-        let mut jobs: Vec<Bf16Job<'_>> = muls
+        let mut jobs: Vec<DenseJob<'_>> = muls
             .iter_mut()
             .filter(|m| !m.parts.is_empty())
-            .map(|m| Bf16Job {
+            .map(|m| DenseJob {
                 x: m.x,
                 rows: m.rows,
                 inp: m.parts[0].0.inp,
                 parts: m
                     .parts
                     .iter_mut()
-                    .map(|(w, y)| (&w.words[..], w.out, &mut **y))
+                    .map(|(w, y)| (w.as_ref(), w.out, &mut **y))
                     .collect(),
             })
             .collect();
-        if device.run_bf16(&mut jobs) {
+        if device.run_dense(&mut jobs) {
             return;
         }
     }
@@ -473,11 +525,16 @@ struct Slot {
 /// example rounding each block to MXFP4 and back, which bf16 holds exactly.
 pub type ExpertTransform = Box<dyn Fn(&mut [u16], usize)>;
 
+/// Elements per MXFP4 scale (OCP MX v1.0), the converted experts' block.
+const MXFP4_BLOCK: usize = crate::expert::MXFP4_GROUP_SIZE;
+
 /// Experts read per batch: enough requests in flight to keep the drive busy, while the
 /// read buffers stay a bounded pool (96 buffers, ~450 MB for the 48B model).
 const READ_CHUNK: usize = 32;
 
 struct ExpertStore {
+    /// Bytes the cache may hold; `capacity` is this over one expert's size.
+    budget: usize,
     capacity: usize,
     slots: Vec<Slot>,
     map: HashMap<(usize, usize), usize>,
@@ -492,9 +549,11 @@ struct ExpertStore {
 impl ExpertStore {
     /// Makes every expert in `wanted` for `layer` resident, reading the missing ones in
     /// batches of [`READ_CHUNK`]. Evicts least-recently-used slots not wanted now.
+    #[allow(clippy::too_many_lines)] // one read-and-fill loop, both storage formats
     fn ensure(
         &mut self,
         index: &SafeTensorIndex,
+        mxfp4: Option<&SafeTensorIndex>,
         config: &LinearConfig,
         layer: usize,
         wanted: &[usize],
@@ -515,39 +574,58 @@ impl ExpertStore {
         }
         let (e, inter) = (config.hidden_size, config.moe_intermediate_size);
         for chunk in missing.chunks(READ_CHUNK) {
-            let mut requests = Vec::with_capacity(3 * chunk.len());
+            // Per expert: w1, w3, w2 as bf16, or each as MXFP4 blocks then scales.
+            let per_expert = if mxfp4.is_some() { 6 } else { 3 };
+            let mut requests = Vec::with_capacity(per_expert * chunk.len());
             for &expert in chunk {
-                for (part, shape) in [("w1", [inter, e]), ("w3", [inter, e]), ("w2", [e, inter])] {
+                for (part, [rows, cols]) in
+                    [("w1", [inter, e]), ("w3", [inter, e]), ("w2", [e, inter])]
+                {
                     let name = format!(
                         "model.layers.{layer}.block_sparse_moe.experts.{expert}.{part}.weight"
                     );
-                    let tensor = index
-                        .tensor(&name)
-                        .ok_or_else(|| LinearError::Missing(name.clone()))?;
-                    if tensor.dtype != DType::Bf16 || tensor.shape != shape {
-                        return Err(LinearError::Tensor {
-                            name,
-                            detail: format!(
-                                "is {:?} {:?}, expected Bf16 {shape:?}",
-                                tensor.dtype, tensor.shape
+                    let wanted: Vec<(String, DType, [usize; 2])> = if mxfp4.is_some() {
+                        vec![
+                            (format!("{name}.blocks"), DType::U8, [rows, cols / 2]),
+                            (
+                                format!("{name}.scales"),
+                                DType::U8,
+                                [rows, cols / MXFP4_BLOCK],
                             ),
+                        ]
+                    } else {
+                        vec![(name, DType::Bf16, [rows, cols])]
+                    };
+                    for (name, dtype, shape) in wanted {
+                        let tensor = mxfp4
+                            .unwrap_or(index)
+                            .tensor(&name)
+                            .ok_or_else(|| LinearError::Missing(name.clone()))?;
+                        if tensor.dtype != dtype || tensor.shape != shape {
+                            return Err(LinearError::Tensor {
+                                name,
+                                detail: format!(
+                                    "is {:?} {:?}, expected {dtype:?} {shape:?}",
+                                    tensor.dtype, tensor.shape
+                                ),
+                            });
+                        }
+                        let mut buffer = self.spare.pop().unwrap_or_default();
+                        buffer.resize(tensor.nbytes, 0);
+                        requests.push(ReadRequest {
+                            shard: tensor.shard,
+                            offset: tensor.offset,
+                            buffer,
                         });
                     }
-                    let mut buffer = self.spare.pop().unwrap_or_default();
-                    buffer.resize(tensor.nbytes, 0);
-                    requests.push(ReadRequest {
-                        shard: tensor.shard,
-                        offset: tensor.offset,
-                        buffer,
-                    });
                 }
             }
             let start = Instant::now();
-            let buffers = index.read_batch(requests)?;
+            let mut buffers = mxfp4.unwrap_or(index).read_batch(requests)?;
             self.stats.read_s += start.elapsed().as_secs_f64();
             self.stats.misses += chunk.len() as u64;
             self.stats.bytes_read += buffers.iter().map(|b| b.len() as u64).sum::<u64>();
-            for (&expert, parts) in chunk.iter().zip(buffers.chunks_exact(3)) {
+            for (&expert, parts) in chunk.iter().zip(buffers.chunks_exact_mut(per_expert)) {
                 let at = if self.slots.len() < self.capacity {
                     self.slots.push(Slot {
                         key: (layer, expert),
@@ -575,12 +653,23 @@ impl ExpertStore {
                     victim
                 };
                 let slot = &mut self.slots[at];
-                words_into(&mut slot.w1.words, &parts[0]);
-                words_into(&mut slot.w3.words, &parts[1]);
-                words_into(&mut slot.w2.words, &parts[2]);
-                if let Some(transform) = &self.transform {
-                    for w in [&mut slot.w1, &mut slot.w3, &mut slot.w2] {
-                        transform(&mut w.words, w.inp);
+                let weights = [&mut slot.w1, &mut slot.w3, &mut slot.w2];
+                if mxfp4.is_some() {
+                    // The read buffers become the slot's storage, and its old buffers
+                    // go back to the pool: no copy, nothing freed.
+                    for (w, pair) in weights.into_iter().zip(parts.chunks_exact_mut(2)) {
+                        let (packed, scales) = w.mxfp4_mut();
+                        std::mem::swap(packed, &mut pair[0]);
+                        std::mem::swap(scales, &mut pair[1]);
+                    }
+                } else {
+                    for (w, raw) in weights.into_iter().zip(parts.iter()) {
+                        let inp = w.inp;
+                        let words = w.words_mut();
+                        words_into(words, raw);
+                        if let Some(transform) = &self.transform {
+                            transform(words, inp);
+                        }
                     }
                 }
                 self.map.insert((layer, expert), at);
@@ -600,6 +689,8 @@ impl ExpertStore {
 pub struct LinearModel {
     pub config: LinearConfig,
     index: SafeTensorIndex,
+    /// Converted routed experts, when [`Self::use_mxfp4_experts`] was called.
+    mxfp4: Option<SafeTensorIndex>,
     embed: Vec<u16>,
     lm_head: Weight,
     norm: Vec<f32>,
@@ -765,6 +856,7 @@ impl LinearModel {
         let capacity = (expert_budget_bytes / c.expert_bytes()).max(c.num_experts);
         Ok(Self {
             experts: ExpertStore {
+                budget: expert_budget_bytes,
                 capacity,
                 slots: Vec::new(),
                 map: HashMap::new(),
@@ -775,11 +867,74 @@ impl LinearModel {
             },
             config,
             index,
+            mxfp4: None,
             embed,
             lm_head,
             norm,
             layers,
         })
+    }
+
+    /// Reads routed experts from `directory`, written by `k3 --convert-experts-mxfp4`,
+    /// instead of the checkpoint: MXFP4 codes and scales, about a quarter of the bytes.
+    /// Empties the expert cache and resizes it for MXFP4 experts within the same budget.
+    ///
+    /// # Errors
+    /// When the directory has no safetensors files or lacks the first `MoE` layer's first
+    /// expert.
+    pub fn use_mxfp4_experts(&mut self, directory: impl AsRef<Path>) -> Result<(), LinearError> {
+        let c = &self.config;
+        let index = SafeTensorIndex::open(directory)?;
+        let first = (0..c.num_hidden_layers)
+            .find(|&l| !c.is_dense(l))
+            .unwrap_or(0);
+        let probe = format!("model.layers.{first}.block_sparse_moe.experts.0.w1.weight.blocks");
+        if index.tensor(&probe).is_none() {
+            return Err(LinearError::Missing(probe));
+        }
+        let (e, inter) = (c.hidden_size, c.moe_intermediate_size);
+        let expert = 3 * (e * inter / 2 + e * inter / MXFP4_BLOCK);
+        let store = &mut self.experts;
+        store.capacity = (store.budget / expert).max(c.num_experts);
+        store.slots.clear();
+        store.map.clear();
+        store.transform = None;
+        store.stats.slots = 0;
+        self.mxfp4 = Some(index);
+        Ok(())
+    }
+
+    /// Whether the expert cache can hold every routed expert at once.
+    #[must_use]
+    pub fn experts_fit(&self) -> bool {
+        let c = &self.config;
+        let moe = (0..c.num_hidden_layers).filter(|&l| !c.is_dense(l)).count();
+        self.experts.capacity >= moe * c.num_experts
+    }
+
+    /// Reads every routed expert into the cache now, so no token waits on the drive.
+    /// Only when they all fit ([`Self::experts_fit`]); returns how many were read.
+    ///
+    /// # Errors
+    /// A read or tensor error, or [`LinearError::Cancelled`] from `keep_running`.
+    pub fn preload_experts(
+        &mut self,
+        mut keep_running: impl FnMut() -> bool,
+    ) -> Result<usize, LinearError> {
+        if !self.experts_fit() {
+            return Ok(0);
+        }
+        let c = &self.config;
+        let all: Vec<usize> = (0..c.num_experts).collect();
+        let before = self.experts.stats.misses;
+        for layer in (0..c.num_hidden_layers).filter(|&l| !c.is_dense(l)) {
+            if !keep_running() {
+                return Err(LinearError::Cancelled);
+            }
+            self.experts
+                .ensure(&self.index, self.mxfp4.as_ref(), c, layer, &all)?;
+        }
+        Ok((self.experts.stats.misses - before) as usize)
     }
 
     /// Applies `transform` to every expert from now on and forgets every cached one,
@@ -959,7 +1114,7 @@ impl LinearModel {
                         c,
                         l,
                         t,
-                        &self.index,
+                        (&self.index, self.mxfp4.as_ref()),
                         &mut self.experts,
                         accel,
                     )?;
@@ -1245,7 +1400,7 @@ fn moe(
     c: &LinearConfig,
     layer: usize,
     t: usize,
-    index: &SafeTensorIndex,
+    (index, mxfp4): (&SafeTensorIndex, Option<&SafeTensorIndex>),
     experts: &mut ExpertStore,
     accel: Accel<'_>,
 ) -> Result<(), LinearError> {
@@ -1276,7 +1431,7 @@ fn moe(
             }
         }
     }
-    experts.ensure(index, c, layer, &uniq)?;
+    experts.ensure(index, mxfp4, c, layer, &uniq)?;
 
     // Each expert once, over every (token, slot) that selected it, in slot order.
     let mut at = vec![usize::MAX; c.num_experts];

@@ -167,10 +167,7 @@ Checks:
 - That rewrite made rounding an expert about 3x faster: the 4-bit pass took 125 s
   instead of 390 s.
 
-Not measured yet: speed. It needs the converted checkpoint (about 25 GB of experts, all
-resident) and a pipelined MXFP4 path in `DenseEngine`. Estimate, not measurement: it
-removes the drive reads from prompt processing (23 s of the 58 s pass) and from decode
-cache misses.
+Speed was measured after converting (next section).
 
 Listening test, ready to run (bf16 then MXFP4, the same four questions, two in English
 and two in Mandarin, with `/reset` between them):
@@ -181,6 +178,47 @@ k3 <kimi-linear-dir> --chat --accel ane --no-tools --gen 160 --experts mxfp4 < q
 ```
 
 The Mandarin answers can be played aloud with `say -v Tingting "<text>"`.
+
+### 4-bit experts in use (2026-09-25): converted, resident, measured
+
+Jay decided to convert. `k3 <dir> --convert-experts-mxfp4 <out>` wrote
+`/Volumes/Jarraya/kimi-linear-48b-a3b-instruct-mxfp4-experts/`:
+
+- one safetensors file per `MoE` layer, 25.0 GB in all;
+- read 94.2 GB of bf16 and wrote it in 124 s;
+- `CONVERSION.json` records the source revision, the encoder commit (loadngo
+  `0d3a5203`) and SHA-256 of every file;
+- the original checkpoint is untouched.
+
+An ignored test (`converted_experts_decode_to_the_evaluated_rounding`) confirms:
+
+- all 39,936 tensors are present;
+- 28.3 M sampled weights decode bit-identically to the `--experts mxfp4` rounding the
+  quality above was measured with.
+
+`--mxfp4-experts <out>` (the launcher passes it whenever the directory exists) reads
+the experts from there. They load at launch in about 8 s and all 6,656 stay resident
+in the default 24 GiB cache. The engine expands MXFP4 to fp16 on its helper thread,
+overlapped with the Neural Engine, as it does for bf16.
+
+Measured on the same prompts as the bf16 numbers above, with thermal state 0
+throughout:
+
+| Measure | bf16 experts | MXFP4 experts |
+|---|---|---|
+| Decode, 48 tokens | 1.75 tokens/s | 2.61 tokens/s |
+| Steady state, last 24 tokens | 0.51 s/token | 0.38 s/token |
+| 639-token prompt pass | 58 s | 21.5 s |
+| Kernel time in that pass | 28 s | 11 s |
+| Launcher: launch to ready | ~66 s | 36 s |
+| First one-sentence reply | 21.2 s | 6.0 s |
+| Reply after `/reset` | 17.9 s | 5.5 s |
+
+Notes:
+
+- The decode text was identical to the simulated 4-bit run.
+- Memory: 31.6 GB peak footprint.
+- `KIMI_BF16_EXPERTS=1` makes the launcher use the bf16 experts.
 
 ### What limits it now
 

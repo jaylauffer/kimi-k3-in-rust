@@ -73,8 +73,8 @@ impl Device {
 mod ane {
     use super::DenseAccel;
     use kimi_k3_core::expert::MXFP4_GROUP_SIZE;
-    use kimi_k3_core::layer::Bf16Job;
-    use loadngo_coreml::dense::{DenseEngine, Job, MX_BLOCK};
+    use kimi_k3_core::layer::{DenseJob, WeightRef};
+    use loadngo_coreml::dense::{DenseEngine, Job, MX_BLOCK, Weight};
     use loadngo_inference::compute::ComputePolicy;
     use std::cell::{Cell, RefCell};
 
@@ -132,7 +132,7 @@ mod ane {
             self.accepted(result, || format!("{rows}x{inp}->{out}"))
         }
 
-        fn run_bf16(&self, jobs: &mut [Bf16Job<'_>]) -> bool {
+        fn run_dense(&self, jobs: &mut [DenseJob<'_>]) -> bool {
             let products: usize = jobs.iter().map(|j| j.parts.len()).sum();
             let mut engine_jobs: Vec<Job<'_>> = jobs
                 .iter_mut()
@@ -143,11 +143,19 @@ mod ane {
                     parts: job
                         .parts
                         .iter_mut()
-                        .map(|(w, out, y)| (*w, *out, &mut **y))
+                        .map(|(w, out, y)| {
+                            let w = match *w {
+                                WeightRef::Bf16(w) => Weight::Bf16(w),
+                                WeightRef::Mxfp4 { packed, scales } => {
+                                    Weight::Mxfp4 { packed, scales }
+                                }
+                            };
+                            (w, *out, &mut **y)
+                        })
                         .collect(),
                 })
                 .collect();
-            let result = self.engine.borrow_mut().run_bf16(&mut engine_jobs);
+            let result = self.engine.borrow_mut().run(&mut engine_jobs);
             self.accepted(result, || format!("{products} products of one step"))
         }
 

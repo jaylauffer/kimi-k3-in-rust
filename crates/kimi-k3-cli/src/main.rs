@@ -74,6 +74,7 @@ struct Args {
     experts: quality::ExpertFormat,
     compare: Option<quality::Comparison>,
     convert_experts: Option<PathBuf>,
+    mxfp4_experts: Option<PathBuf>,
 }
 
 impl Args {
@@ -103,6 +104,7 @@ impl Args {
         let mut experts = quality::ExpertFormat::Bf16;
         let mut compare = None;
         let mut convert_experts = None;
+        let mut mxfp4_experts = None;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -138,6 +140,9 @@ impl Args {
                 "--no-tools" => no_tools = true,
                 "--experts" => {
                     experts = quality::ExpertFormat::parse(&next_value(&mut raw, "--experts")?)?;
+                }
+                "--mxfp4-experts" => {
+                    mxfp4_experts = Some(PathBuf::from(next_value(&mut raw, "--mxfp4-experts")?));
                 }
                 "--convert-experts-mxfp4" => {
                     convert_experts = Some(PathBuf::from(next_value(
@@ -210,6 +215,7 @@ impl Args {
             experts,
             compare,
             convert_experts,
+            mxfp4_experts,
         })
     }
 }
@@ -273,6 +279,8 @@ fn print_usage() {
          \x20                      perplexity, top-1 agreement and KL divergence\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
+         \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
+         \x20                      into DIR (4-bit, all resident within --cache-gb)\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
          \x20 --accel cpu|ane      optional device for the bf16 trunk products (default cpu,\n\
