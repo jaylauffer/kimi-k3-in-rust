@@ -24,7 +24,8 @@ const HELP: &str = "Type a message and press Enter. Commands:
   /stats      show context usage
   /help       show these commands
   /quit       exit (or Ctrl-D); Ctrl-C cancels generation
-One line per message. No network, tool execution, or transcript saving.
+One line per message. No network access and no transcript saving. Kimi Linear can
+read local files and the signed CAS snapshot through read-only tools (--no-tools).
 ";
 
 fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
@@ -151,11 +152,11 @@ impl ChatFormat {
             // tokens, so each is its own ordinary segment. With tools, the conversation
             // opens with the template's `tool_declare` message and a short system note.
             Self::KimiLinear(t) => {
-                let mut ids = Vec::new();
-                if let Some(tools) = tools.filter(|tools| first && !tools.is_empty()) {
-                    t.message(&mut ids, tokenizer, "tool_declare", &tools.declaration());
-                    t.message(&mut ids, tokenizer, "system", TOOL_GUIDANCE);
-                }
+                let mut ids = if first {
+                    self.preamble(tokenizer, tools)
+                } else {
+                    Vec::new()
+                };
                 ids.push(t.user);
                 ordinary(&mut ids, tokenizer, "user");
                 ids.push(t.middle);
@@ -166,6 +167,18 @@ impl ChatFormat {
                 ids
             }
         }
+    }
+
+    /// What every conversation opens with before the first user message: with tools,
+    /// the `tool_declare` message and the tool guidance (empty otherwise). The same for
+    /// every conversation, so a session that has consumed it can be reused.
+    pub fn preamble(&self, tokenizer: &Tokenizer, tools: Option<&Toolbox>) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if let (Self::KimiLinear(t), Some(tools)) = (self, tools.filter(|t| !t.is_empty())) {
+            t.message(&mut ids, tokenizer, "tool_declare", &tools.declaration());
+            t.message(&mut ids, tokenizer, "system", TOOL_GUIDANCE);
+        }
+        ids
     }
 
     /// Tool calls in a finished Kimi Linear reply, as `(id, arguments)` text pairs.

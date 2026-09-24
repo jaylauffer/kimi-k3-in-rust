@@ -596,12 +596,15 @@ pub struct LinearModel {
     experts: ExpertStore,
 }
 
+#[derive(Clone)]
 enum State {
     Kda { recurrent: Vec<f32>, conv: Vec<f32> },
     Mla { kv: Vec<f32>, rope: Vec<f32> },
 }
 
 /// Incremental decoding state: every layer's attention memory and the tokens consumed.
+/// Cloning it snapshots a shared prefix (a chat's tool declarations) for reuse.
+#[derive(Clone)]
 pub struct LinearSession {
     states: Vec<State>,
     ids: Vec<u32>,

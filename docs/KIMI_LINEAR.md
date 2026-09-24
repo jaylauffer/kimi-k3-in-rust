@@ -107,6 +107,24 @@ Tried and rejected, with measurements in loadngo `docs/NPU_ACCELERATION.md`:
   slow on memory it has not read recently.
 - **Fewer, larger predictions.** Slower: call count was not the cost.
 
+### Chat opening: tool declarations read once per launch
+
+With file tools on, every conversation opens with the same `tool_declare` message and
+guidance, 819 tokens. Chat used to process them before the first question and again
+after every `/reset`. It now consumes them once, right after loading, and keeps a
+snapshot of the session (a `LinearSession` clone, under 1 GB with the 4096-token
+context). The first question and every `/reset` start from the snapshot.
+
+Measured through `launch-kimi-k3.sh`, piping "What is the capital of Japan?", `/reset`,
+"What is the capital of France?", thermal state nominal:
+
+- the snapshot is ready 66 s after launch;
+- the first reply, "The capital of Japan is Tokyo.", took 21.2 s, against 75 s before;
+- the reply after `/reset`, "The capital of France is Paris.", took 17.9 s.
+
+The 66 s is paid once per launch. Saving the snapshot to disk, keyed by checkpoint,
+accelerator and declaration, would remove it too; that is not built.
+
 ### What limits it now
 
 - **Decoding** is about 0.4 s/token of Neural Engine time, spent streaming ~6 GB of

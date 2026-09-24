@@ -123,6 +123,25 @@ pub fn run(
     if args.chat {
         let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
         let tools = toolbox(args);
+        let tools = Some(&tools).filter(|t| !t.is_empty());
+        // Every conversation opens with the same tool declarations (~800 tokens, about a
+        // minute on a cold expert cache). Consume them once now and keep a snapshot, so
+        // the first question and every /reset start from it instead.
+        let preamble = format.preamble(tokenizer, tools);
+        let mut opening: Option<kimi_k3_core::linear::LinearSession> = None;
+        if !preamble.is_empty() {
+            eprintln!(
+                "reading the tool declarations once ({} tokens; Ctrl-C quits)...",
+                preamble.len()
+            );
+            let start = Instant::now();
+            gate.checkpoint(cancel)?;
+            model
+                .feed(&mut session, &preamble, device.accel(), keep)
+                .map_err(|e| e.to_string())?;
+            opening = Some(session.clone());
+            eprintln!("  ready in {:.1?}", start.elapsed());
+        }
         println!(
             "Local Kimi Linear 48B-A3B on {}. The first reply is slower while the \
              expert cache warms.",
@@ -134,7 +153,7 @@ pub fn run(
         let mut last: Option<Vec<f32>> = None;
         return chat::run_with(
             &format,
-            Some(&tools).filter(|t| !t.is_empty()),
+            tools,
             tokenizer,
             max_context,
             gen_tokens,
@@ -145,9 +164,13 @@ pub fn run(
             |ids| {
                 gate.checkpoint(cancel)?;
                 // Feed only what the session has not consumed; rebuild after /undo,
-                // /reset or a cancelled pass, when the history no longer extends it.
+                // /reset or a cancelled pass, when the history no longer extends it,
+                // from the opening snapshot when the history still starts with it.
                 if session.is_broken() || !ids.starts_with(session.ids()) {
-                    session.reset();
+                    match &opening {
+                        Some(start) if ids.starts_with(start.ids()) => session = start.clone(),
+                        _ => session.reset(),
+                    }
                     last = None;
                 }
                 let new = &ids[session.ids().len()..];
