@@ -1,6 +1,8 @@
-//! Text-only K3 XTML adapter. Format reference: checkpoint `encoding_k3.py` at
-//! f831ab66814297da540d832a5235f8e904f29d06. Model-independent state lives in
-//! loadngo-inference. Preserve generated tokens verbatim, including thinking.
+//! Text-only chat adapters. K3: XTML, format reference checkpoint `encoding_k3.py` at
+//! f831ab66814297da540d832a5235f8e904f29d06. Kimi Linear: the `<|im_*|>` format of
+//! that checkpoint's `chat_template.jinja` at e1df551a447157d4658b573f9a695d57658590e9.
+//! Model-independent state lives in loadngo-inference. Generated tokens are preserved
+//! verbatim, including K3's thinking.
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,6 +88,90 @@ fn validate(tokenizer: &Tokenizer) -> Result<(), String> {
     Ok(())
 }
 
+/// Which chat encoding a checkpoint uses.
+pub enum ChatFormat {
+    K3,
+    KimiLinear(LinearTokens),
+}
+
+/// Kimi Linear control tokens, looked up in the checkpoint's own tokenizer.
+pub struct LinearTokens {
+    user: u32,
+    assistant: u32,
+    middle: u32,
+    end: u32,
+    /// The config's `eos_token_id` and, when the tokenizer has it, `[EOS]`.
+    eos: [u32; 2],
+}
+
+fn single(tokenizer: &Tokenizer, text: &str) -> Result<u32, String> {
+    match tokenizer.encode(text).as_slice() {
+        [id] => Ok(*id),
+        other => Err(format!(
+            "{text} is not one token in this tokenizer ({other:?})"
+        )),
+    }
+}
+
+impl ChatFormat {
+    /// # Errors
+    /// When the tokenizer lacks one of the `<|im_*|>` control tokens as a single id.
+    pub fn kimi_linear(tokenizer: &Tokenizer, eos: u32) -> Result<Self, String> {
+        Ok(Self::KimiLinear(LinearTokens {
+            user: single(tokenizer, "<|im_user|>")?,
+            assistant: single(tokenizer, "<|im_assistant|>")?,
+            middle: single(tokenizer, "<|im_middle|>")?,
+            end: single(tokenizer, "<|im_end|>")?,
+            eos: [eos, single(tokenizer, "[EOS]").unwrap_or(eos)],
+        }))
+    }
+
+    fn prompt(&self, tokenizer: &Tokenizer, text: &str, first: bool) -> Vec<u32> {
+        match self {
+            Self::K3 => prompt(tokenizer, text, first),
+            // The template renders role names and content as plain text between control
+            // tokens, so each is its own ordinary segment. No default system message.
+            Self::KimiLinear(t) => {
+                let mut ids = vec![t.user];
+                ordinary(&mut ids, tokenizer, "user");
+                ids.push(t.middle);
+                ordinary(&mut ids, tokenizer, text);
+                ids.extend([t.end, t.assistant]);
+                ordinary(&mut ids, tokenizer, "assistant");
+                ids.push(t.middle);
+                ids
+            }
+        }
+    }
+
+    fn stops(&self) -> Vec<u32> {
+        match self {
+            Self::K3 => vec![END, EOS],
+            Self::KimiLinear(t) => vec![t.end, t.eos[0], t.eos[1]],
+        }
+    }
+
+    fn opening(&self) -> &'static str {
+        match self {
+            Self::K3 => "[thinking] ",
+            Self::KimiLinear(_) => "Kimi> ",
+        }
+    }
+
+    fn push(&self, display: &mut Display, tokenizer: &Tokenizer, token: u32) -> String {
+        match self {
+            Self::K3 => display.push(tokenizer, token),
+            Self::KimiLinear(t) => {
+                if [t.user, t.assistant, t.middle, t.end, t.eos[0], t.eos[1]].contains(&token) {
+                    terminal_text(&display.utf8.finish())
+                } else {
+                    terminal_text(&display.utf8.push(&tokenizer.decode(&[token])))
+                }
+            }
+        }
+    }
+}
+
 /// Do not let model text inject terminal escape sequences (including OSC).
 fn terminal_text(text: &str) -> String {
     text.chars()
@@ -141,10 +227,37 @@ impl Display {
     }
 }
 
+/// Blocking K3 terminal frontend; see [`run_with`].
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    tokenizer: &Tokenizer,
+    max_context: usize,
+    max_tokens: usize,
+    cancel: &AtomicBool,
+    generating: &AtomicBool,
+    input: impl BufRead,
+    output: impl Write,
+    next: impl FnMut(&[u32]) -> Result<u32, String>,
+) -> Result<(), String> {
+    validate(tokenizer)?;
+    run_with(
+        &ChatFormat::K3,
+        tokenizer,
+        max_context,
+        max_tokens,
+        cancel,
+        generating,
+        input,
+        output,
+        next,
+    )
+}
+
 /// Blocking terminal frontend. No application-local polling/timer/worker loop.
 /// The caller's model and disk cache stay loaded for the lifetime of this call.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn run(
+pub fn run_with(
+    format: &ChatFormat,
     tokenizer: &Tokenizer,
     max_context: usize,
     max_tokens: usize,
@@ -154,14 +267,9 @@ pub fn run(
     mut output: impl Write,
     mut next: impl FnMut(&[u32]) -> Result<u32, String>,
 ) -> Result<(), String> {
-    validate(tokenizer)?;
     let mut session = Session::new(max_context).map_err(|e| e.to_string())?;
     let mut display = Display::default();
-    writeln!(
-        output,
-        "Local Kimi K3 — CPU backend; full recompute, potentially minutes per token.\n{HELP}"
-    )
-    .map_err(|e| e.to_string())?;
+    writeln!(output, "{HELP}").map_err(|e| e.to_string())?;
     loop {
         generating.store(false, Ordering::Relaxed);
         write!(output, "\nYou> ")
@@ -231,13 +339,13 @@ pub fn run(
             }
             _ => {
                 if let Err(error) =
-                    session.begin_turn(&prompt(tokenizer, text, session.tokens().is_empty()))
+                    session.begin_turn(&format.prompt(tokenizer, text, session.tokens().is_empty()))
                 {
                     writeln!(output, "{error}").map_err(|e| e.to_string())?;
                     continue;
                 }
                 display = Display::default();
-                write!(output, "[thinking] ")
+                write!(output, "{}", format.opening())
                     .and_then(|()| output.flush())
                     .map_err(|e| e.to_string())?;
             }
@@ -245,8 +353,9 @@ pub fn run(
         cancel.store(false, Ordering::Relaxed);
         generating.store(true, Ordering::Relaxed);
         let started = Instant::now();
-        let result = session.generate(max_tokens, &[END, EOS], cancel, &mut next, |token| {
-            write!(output, "{}", display.push(tokenizer, token))
+        let stops = format.stops();
+        let result = session.generate(max_tokens, &stops, cancel, &mut next, |token| {
+            write!(output, "{}", format.push(&mut display, tokenizer, token))
                 .and_then(|()| output.flush())
                 .map_err(|e| e.to_string())
         });

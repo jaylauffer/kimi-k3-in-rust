@@ -11,6 +11,7 @@ pub mod config;
 pub mod expert;
 pub mod io;
 pub mod layer;
+pub mod linear;
 pub mod model;
 pub mod ops;
 pub mod safetensors;

@@ -25,6 +25,7 @@ use std::time::Instant;
 
 mod accel;
 mod chat;
+mod linear;
 
 use kimi_k3_core::{
     bind::BoundStorage,
@@ -52,6 +53,7 @@ struct Args {
     pin_layers: usize,
     ring_slots: usize,
     cache_gb: f64,
+    cache_gb_given: bool,
     tok_dir: Option<PathBuf>,
     config_path: Option<PathBuf>,
     layers: Option<usize>,
@@ -71,6 +73,7 @@ impl Args {
         let mut pin_layers = 2_usize;
         let mut ring_slots = 2_usize;
         let mut cache_gb = 4.0_f64;
+        let mut cache_gb_given = false;
         let mut tok_dir = None;
         let mut config_path = None;
         let mut layers = None;
@@ -99,7 +102,10 @@ impl Args {
                 "--gen" => gen_tokens = Some(parse_arg(&mut raw, "--gen")?),
                 "--pin-layers" => pin_layers = parse_arg(&mut raw, "--pin-layers")?,
                 "--ring-slots" => ring_slots = parse_arg(&mut raw, "--ring-slots")?,
-                "--cache-gb" => cache_gb = parse_arg(&mut raw, "--cache-gb")?,
+                "--cache-gb" => {
+                    cache_gb = parse_arg(&mut raw, "--cache-gb")?;
+                    cache_gb_given = true;
+                }
                 "--tok" => tok_dir = Some(PathBuf::from(next_value(&mut raw, "--tok")?)),
                 "--config" => config_path = Some(PathBuf::from(next_value(&mut raw, "--config")?)),
                 "--layers" => layers = Some(parse_arg(&mut raw, "--layers")?),
@@ -142,6 +148,7 @@ impl Args {
             pin_layers,
             ring_slots,
             cache_gb,
+            cache_gb_given,
             tok_dir,
             config_path,
             layers,
@@ -230,11 +237,6 @@ fn run() -> Result<(), String> {
         .config_path
         .clone()
         .unwrap_or_else(|| args.model_dir.join("config.json"));
-    let mut config = K3Config::from_path(&config_path)
-        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
-    if let Some(layers) = args.layers {
-        config.num_hidden_layers = layers.min(config.num_hidden_layers);
-    }
 
     let tok_dir = args
         .tok_dir
@@ -265,6 +267,15 @@ fn run() -> Result<(), String> {
         }
     })
     .map_err(|error| format!("cannot install Ctrl-C handler: {error}"))?;
+
+    if kimi_k3_core::linear::LinearConfig::detect(&config_path) {
+        return linear::run(&args, &tokenizer, prompt.as_deref(), &cancel, &generating);
+    }
+    let mut config = K3Config::from_path(&config_path)
+        .map_err(|error| format!("cannot read {}: {error}", config_path.display()))?;
+    if let Some(layers) = args.layers {
+        config.num_hidden_layers = layers.min(config.num_hidden_layers);
+    }
 
     eprintln!(
         "indexing checkpoint shards under {}...",
@@ -321,6 +332,7 @@ fn run() -> Result<(), String> {
     let mut session = TrunkSession::new(&config, args.max_context);
     let mut session_logits: Option<Vec<f32>> = None;
     if args.chat {
+        println!("Local Kimi K3 -- about a minute per token on this Mac mini with --accel ane.");
         return chat::run(
             &tokenizer,
             args.max_context,
