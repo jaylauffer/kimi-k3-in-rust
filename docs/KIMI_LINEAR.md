@@ -81,3 +81,8 @@ attention, routing and expert reads. Not yet done, in expected order of payoff:
 3. Warm the expert cache in the background, or pin the most-routed experts.
 4. The GPU (Metal) for decode, where memory bandwidth rather than per-call overhead
    limits; 4-bit experts to keep all 256 per layer resident (a numerics decision).
+
+Plans: [loadngo `docs/METAL_COMPUTE_PLAN.md`](https://github.com/jaylauffer/loadngo/blob/dev/docs/METAL_COMPUTE_PLAN.md)
+(GPU decode and MXFP4 experts) and
+[loadngo `docs/LOCAL_MODEL_CAS_TOOLS.md`](https://github.com/jaylauffer/loadngo/blob/dev/docs/LOCAL_MODEL_CAS_TOOLS.md)
+(read-only file access through a signed Archive CAS snapshot, the default capability).
