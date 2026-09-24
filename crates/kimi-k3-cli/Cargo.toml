@@ -21,6 +21,9 @@ kimi-k3-core = { path = "../kimi-k3-core" }
 loadngo-inference = { path = "../../../loadngo/inference", features = ["cas"] }
 # The signed Archive CAS view behind the chat file tools.
 data = { path = "../../../loadngo/data" }
+# Thermal pressure before every forward pass; the proactor waits while paused.
+loadngo-thermal = { path = "../../../loadngo/thermal" }
+loadngo-proactor = { path = "../../../loadngo/proactor" }
 ctrlc = "3.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]

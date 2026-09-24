@@ -26,6 +26,7 @@ use std::time::Instant;
 mod accel;
 mod chat;
 mod linear;
+mod thermal;
 
 use kimi_k3_core::{
     bind::BoundStorage,
@@ -362,6 +363,7 @@ fn run() -> Result<(), String> {
     )
     .map_err(|error| format!("cannot size the expert cache: {error}"))?;
 
+    let mut gate = thermal::Gate::new()?;
     let mut session = TrunkSession::new(&config, args.max_context);
     let mut session_logits: Option<Vec<f32>> = None;
     if args.chat {
@@ -375,6 +377,7 @@ fn run() -> Result<(), String> {
             io::stdin().lock(),
             io::stdout().lock(),
             |ids| {
+                gate.checkpoint(&cancel)?;
                 let started = Instant::now();
                 eprintln!(
                     "forward pass: {} context tokens (Ctrl-C to cancel)...",
@@ -464,6 +467,7 @@ fn run() -> Result<(), String> {
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut generated = 0;
     for step in 0..args.gen_tokens {
+        gate.checkpoint(&cancel)?;
         let mut experts = CachedExperts::new(&mut cache, &index);
         let pass = Instant::now();
         let keep = || !cancel.load(Ordering::Relaxed);

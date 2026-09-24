@@ -12,7 +12,7 @@ use std::time::Instant;
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
 use loadngo_inference::tools::{FsTools, Toolbox};
 
-use crate::{Args, accel, chat};
+use crate::{Args, accel, chat, thermal};
 
 /// Default routed-expert cache when `--cache-gb` is not given: about a quarter of the
 /// 48B model's 94 GB of bf16 experts, leaving room for the ~4 GB trunk on a 64 GB Mac.
@@ -116,6 +116,7 @@ pub fn run(
     } else {
         CHAT_GEN
     };
+    let mut gate = thermal::Gate::new()?;
     let mut session = model.session(max_context);
     let keep = || !cancel.load(Ordering::Relaxed);
 
@@ -142,6 +143,7 @@ pub fn run(
             io::stdin().lock(),
             io::stdout().lock(),
             |ids| {
+                gate.checkpoint(cancel)?;
                 // Feed only what the session has not consumed; rebuild after /undo,
                 // /reset or a cancelled pass, when the history no longer extends it.
                 if session.is_broken() || !ids.starts_with(session.ids()) {
@@ -177,6 +179,7 @@ pub fn run(
     let mut decode_s = 0.0;
     let mut generated = 0;
     for step in 0..gen_tokens {
+        gate.checkpoint(cancel)?;
         let pass = Instant::now();
         let new = &ids[session.ids().len()..];
         let logits = model

@@ -311,6 +311,8 @@ dependencies = [
  "kimi-k3-core",
  "loadngo-coreml",
  "loadngo-inference",
+ "loadngo-proactor 0.1.0",
+ "loadngo-thermal",
  "serde_json",
 ]
 
@@ -395,6 +397,13 @@ dependencies = [
  "socket2",
  "thiserror",
  "windows",
+]
+
+[[package]]
+name = "loadngo-thermal"
+version = "0.1.0"
+dependencies = [
+ "objc2-foundation",
 ]
 
 [[package]]
