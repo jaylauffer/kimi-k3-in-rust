@@ -1,5 +1,12 @@
 # Rust Port
 
+**2026-09-24 update:** [Local interactive chat](CHAT.md) documents the new
+Loadngo-backed conversation path and its explicit performance/acceptance limits.
+The older "base model" interpretation below is incorrect: the downloaded
+checkpoint has a structured chat encoder with preserved thinking history.
+The older download-not-started and CLI-still-open paragraphs are historical;
+the checkpoint and CLI are present locally. Do not treat them as current blockers.
+
 The repository retains the C implementation as the behavioral oracle while a
 clean Rust implementation is built beside it. The first Rust release must not
 silently call into C: portability and memory safety are the point of the port.
@@ -374,10 +381,11 @@ reads use the page cache.
 `k3 <checkpoint-dir> --prompt "The capital of France is" --gen 3 --pin-layers 2
 --ring-slots 2` ran against the real, full 1.4 TB checkpoint on `/Volumes/Jarraya`
 and produced `The capital of France is Paris.",` followed by a lone `+` on the
-next line -- factually correct, and the trailing quote/comma/`+` are exactly
-what a raw, non-instruction-tuned base model continuing training-data-shaped
-text looks like, not a bug (Kimi K3 as released is a base model; no chat
-template is applied here). Indexed 497,220 tensors, tokenized the prompt to 5
+next line. This was a raw completion without the released checkpoint's chat
+format, not a validated assistant reply. The earlier interpretation that this
+proved a base-model release was incorrect: `encoding_k3.py` and the checkpoint
+README explicitly define chat and preserved thinking history. Indexed 497,220
+tensors, tokenized the prompt to 5
 real ids, streamed 91 of the 93 layers fresh through a two-slot ring on every
 one of the 3 forward passes (136 hits, 137 misses total, matching `~3x` the
 91 non-pinned layers), and detokenized the generated ids back to exactly that
@@ -395,10 +403,10 @@ attempt at the same command with `--pin-layers 20` (~23 GB pinned) pushed the
 process to 33 GB RSS + 24 GB compressed on a machine running other real work
 at the time and made it briefly nearly unusable; killed immediately, memory
 recovered instantly, and `--pin-layers 2` (~2.3 GB) was used for the run
-above instead. `--incremental` (not yet ported) is what would make repeated
-generation affordable without needing a large pinned prefix; full recompute's
-cost is fundamentally `O(sequence length)` forward passes each re-touching
-most of the trunk, by design, not a bug to fix here.
+above instead. Incremental state through the ring (not yet ported) would avoid
+repeating prefix compute, but would still re-touch streamed weights for each
+generated token. It does not by itself establish affordable conversational
+latency. Measure that separately; see [CHAT.md](CHAT.md).
 
 ### Tokenizer, done 2026-09-23
 

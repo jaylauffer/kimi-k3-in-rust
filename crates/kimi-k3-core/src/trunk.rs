@@ -33,8 +33,8 @@ use crate::{
     bind::{BindError, BoundStorage, PendingLayer},
     config::K3Config,
     layer::{
-        ExpertFetchError, ExpertSource, KdaState, LayerState, LayerWeights, Matrix, MlaCache,
-        decoder_layer,
+        Accel, ExpertFetchError, ExpertSource, KdaState, LayerState, LayerWeights, Matrix,
+        MlaCache, decoder_layer_with,
     },
     ops::{attn_res, rmsnorm},
     safetensors::SafeTensorIndex,
@@ -247,6 +247,151 @@ impl TrunkRing {
         ids: &[u32],
         experts: &mut dyn ExpertSource,
     ) -> Result<Vec<f32>, TrunkForwardError> {
+        self.forward_controlled(index, config, top, ids, experts, || true)
+    }
+
+    /// Full forward with cooperative cancellation before each layer and output
+    /// row. Returning false stops without publishing partial logits. A running
+    /// kernel or disk read is not preempted; cancellation latency is bounded by
+    /// those operations, not by an entire token's forward pass.
+    ///
+    /// # Errors
+    /// Returns bind/expert errors as in [`Self::forward`], or `Cancelled`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_controlled(
+        &mut self,
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        top: &TopLevelWeights<'_>,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+        keep_running: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>, TrunkForwardError> {
+        self.forward_with(
+            index,
+            config,
+            top,
+            ids,
+            experts,
+            None,
+            Logits::All,
+            keep_running,
+        )
+    }
+
+    /// [`Self::forward_controlled`], with the dense projections of every layer (and the
+    /// LM head) applied to all positions at once through `accel` when given, and only
+    /// the logit rows `rows` selects. `Logits::Last` returns one `[vocab]` row, for the
+    /// last position, which is all generation reads.
+    ///
+    /// With `accel` `None` and [`Logits::All`] it is float-for-float
+    /// [`Self::forward_controlled`]; the returned rows of [`Logits::Last`] match its
+    /// last row exactly.
+    ///
+    /// # Errors
+    /// As [`Self::forward_controlled`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with(
+        &mut self,
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        top: &TopLevelWeights<'_>,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+        accel: Accel<'_>,
+        rows: Logits,
+        keep_running: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>, TrunkForwardError> {
+        let mut states = fresh_states(config, ids.len());
+        self.run(
+            index,
+            config,
+            top,
+            ids,
+            &mut states,
+            0,
+            experts,
+            accel,
+            rows,
+            keep_running,
+        )
+    }
+
+    /// Feeds `ids` after everything `session` has already consumed, streaming each
+    /// layer through the ring once, and returns the logits for the last of them. Only
+    /// the new tokens are computed: KDA recurrent state and the MLA KV cache carry the
+    /// rest. With `accel` `None` the result is float-for-float the last row of
+    /// [`Self::forward`] over the session's whole history.
+    ///
+    /// # Errors
+    /// As [`Self::forward_controlled`], plus [`TrunkForwardError::Capacity`] when the
+    /// session cannot hold `ids` (checked before any work). On any other error,
+    /// including cancellation, the session is left partially updated: it is marked
+    /// broken and every later call fails until [`TrunkSession::reset`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn feed(
+        &mut self,
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        top: &TopLevelWeights<'_>,
+        session: &mut TrunkSession,
+        ids: &[u32],
+        experts: &mut dyn ExpertSource,
+        accel: Accel<'_>,
+        keep_running: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>, TrunkForwardError> {
+        if session.broken {
+            return Err(TrunkForwardError::BrokenSession);
+        }
+        if ids.is_empty() || session.ids.len() + ids.len() > session.capacity {
+            return Err(TrunkForwardError::Capacity {
+                have: session.ids.len(),
+                add: ids.len(),
+                capacity: session.capacity,
+            });
+        }
+        let cached = session.ids.len();
+        let result = self.run(
+            index,
+            config,
+            top,
+            ids,
+            &mut session.states,
+            cached,
+            experts,
+            accel,
+            Logits::Last,
+            keep_running,
+        );
+        match result {
+            Ok(logits) => {
+                session.ids.extend_from_slice(ids);
+                Ok(logits)
+            }
+            Err(error) => {
+                session.broken = true;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run(
+        &mut self,
+        index: &SafeTensorIndex,
+        config: &K3Config,
+        top: &TopLevelWeights<'_>,
+        ids: &[u32],
+        states: &mut [LayerState],
+        cached: usize,
+        experts: &mut dyn ExpertSource,
+        accel: Accel<'_>,
+        rows: Logits,
+        mut keep_running: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>, TrunkForwardError> {
+        if !keep_running() {
+            return Err(TrunkForwardError::Cancelled);
+        }
         let e = config.hidden_size;
         let vocab = config.vocab_size;
         let t = ids.len();
@@ -256,19 +401,12 @@ impl TrunkRing {
             top.embed.row_into(row, id as usize, e);
         }
 
-        let mut states: Vec<LayerState> = (0..config.num_hidden_layers)
-            .map(|layer| {
-                if config.is_mla(layer) {
-                    LayerState::Mla(MlaCache::new(config, t))
-                } else {
-                    LayerState::Kda(KdaState::new(config))
-                }
-            })
-            .collect();
-
         let mut blocks: Vec<Vec<f32>> = Vec::new();
         let last_layer = config.num_hidden_layers - 1;
         for (layer, state) in states.iter_mut().enumerate() {
+            if !keep_running() {
+                return Err(TrunkForwardError::Cancelled);
+            }
             // Prefetch the next layer BEFORE binding this one: `bind`'s returned
             // weights borrow `&mut self` for exactly this iteration, so nothing
             // can call `prefetch` again (also `&mut self`) until that borrow's
@@ -281,7 +419,7 @@ impl TrunkRing {
             let weights = self
                 .bind(index, config, layer)
                 .map_err(TrunkForwardError::Bind)?;
-            decoder_layer(
+            decoder_layer_with(
                 &mut h,
                 &mut blocks,
                 &weights,
@@ -289,30 +427,118 @@ impl TrunkRing {
                 layer,
                 t,
                 state,
-                0,
+                cached,
                 experts,
+                accel,
             )
             .map_err(TrunkForwardError::Expert)?;
         }
 
-        let mut logits = vec![0.0_f32; t * vocab];
+        let first = match rows {
+            Logits::All => 0,
+            Logits::Last => t - 1,
+        };
+        let n = t - first;
         let mut src = vec![0.0_f32; (blocks.len() + 1) * e];
-        let mut normed = vec![0.0_f32; e];
-        for (row, step) in logits.chunks_exact_mut(vocab).zip(0..t) {
+        let mut normed = vec![0.0_f32; n * e];
+        let fold: Option<Vec<f32>> = top
+            .out_res
+            .map(|(norm, proj)| norm.iter().zip(proj).map(|(&n, &p)| n * p).collect());
+        for (row, step) in normed.chunks_exact_mut(e).zip(first..t) {
+            if !keep_running() {
+                return Err(TrunkForwardError::Cancelled);
+            }
             let ht = &mut h[step * e..(step + 1) * e];
-            if let Some((norm, proj)) = top.out_res {
-                let fold: Vec<f32> = norm.iter().zip(proj).map(|(&n, &p)| n * p).collect();
+            if let Some(fold) = &fold {
                 for (b, block) in blocks.iter().enumerate() {
                     src[b * e..(b + 1) * e].copy_from_slice(&block[step * e..(step + 1) * e]);
                 }
                 src[blocks.len() * e..].copy_from_slice(ht);
-                attn_res(ht, &src, &fold, blocks.len() + 1, e, config.rms_norm_eps);
+                attn_res(ht, &src, fold, blocks.len() + 1, e, config.rms_norm_eps);
             }
-            rmsnorm(&mut normed, ht, top.final_norm, config.rms_norm_eps);
-            top.lm_head.mul(row, &normed, e, vocab);
+            rmsnorm(row, ht, top.final_norm, config.rms_norm_eps);
         }
+        if !keep_running() {
+            return Err(TrunkForwardError::Cancelled);
+        }
+        let mut logits = vec![0.0_f32; n * vocab];
+        top.lm_head
+            .mul_rows(&mut logits, &normed, n, e, vocab, accel);
         Ok(logits)
     }
+}
+
+fn fresh_states(config: &K3Config, capacity: usize) -> Vec<LayerState> {
+    (0..config.num_hidden_layers)
+        .map(|layer| {
+            if config.is_mla(layer) {
+                LayerState::Mla(MlaCache::new(config, capacity))
+            } else {
+                LayerState::Kda(KdaState::new(config))
+            }
+        })
+        .collect()
+}
+
+/// Incremental decoding state for [`TrunkRing::feed`]: every layer's attention memory
+/// (KDA recurrent and short-conv state, the MLA KV cache sized for `capacity`
+/// positions) and the exact tokens consumed so far.
+pub struct TrunkSession {
+    states: Vec<LayerState>,
+    ids: Vec<u32>,
+    capacity: usize,
+    broken: bool,
+}
+
+impl TrunkSession {
+    /// A session able to hold `capacity` positions. The MLA caches are allocated now:
+    /// about `capacity * mla_layers * heads * (qk_nope + v + qk_rope/heads) * 4` bytes.
+    #[must_use]
+    pub fn new(config: &K3Config, capacity: usize) -> Self {
+        Self {
+            states: fresh_states(config, capacity),
+            ids: Vec::new(),
+            capacity,
+            broken: false,
+        }
+    }
+
+    /// Tokens consumed, in order.
+    #[must_use]
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    #[must_use]
+    pub const fn is_broken(&self) -> bool {
+        self.broken
+    }
+
+    /// Forgets every consumed token, keeping the allocations. An MLA cache position is
+    /// always written before any position reads it, so only KDA state is cleared.
+    pub fn reset(&mut self) {
+        for state in &mut self.states {
+            if let LayerState::Kda(kda) = state {
+                kda.clear();
+            }
+        }
+        self.ids.clear();
+        self.broken = false;
+    }
+}
+
+/// Which positions' logits [`TrunkRing::forward_with`] computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Logits {
+    /// `[t][vocab]`, every position.
+    All,
+    /// `[vocab]`, the last position only.
+    Last,
 }
 
 /// The tensors [`TrunkRing::forward`] needs outside the layer stack -- loaded
@@ -332,6 +558,15 @@ pub struct TopLevelWeights<'a> {
 /// could not be read, or a streamed expert could not be fetched.
 #[derive(Debug)]
 pub enum TrunkForwardError {
+    Cancelled,
+    /// A [`TrunkSession`] was full, or `feed` was given no tokens.
+    Capacity {
+        have: usize,
+        add: usize,
+        capacity: usize,
+    },
+    /// A [`TrunkSession`] left partially updated by an earlier failure.
+    BrokenSession,
     Bind(BindError),
     Expert(ExpertFetchError),
 }
@@ -339,6 +574,20 @@ pub enum TrunkForwardError {
 impl fmt::Display for TrunkForwardError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Cancelled => write!(formatter, "generation cancelled"),
+            Self::Capacity {
+                have,
+                add,
+                capacity,
+            } => write!(
+                formatter,
+                "session holds {have} tokens; adding {add} needs 1..={} (capacity {capacity})",
+                capacity.saturating_sub(*have)
+            ),
+            Self::BrokenSession => write!(
+                formatter,
+                "the session was left partially updated by an earlier error; reset it"
+            ),
             Self::Bind(error) => write!(formatter, "{error}"),
             Self::Expert(error) => write!(formatter, "{error}"),
         }

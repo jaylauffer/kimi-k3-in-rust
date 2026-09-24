@@ -1,0 +1,26 @@
+[package]
+name = "kimi-k3-ane"
+version = "0.1.0"
+description = "Bounded Apple Neural Engine bring-up probe for the Rust inference engine"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "k3-ane"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+kimi-k3-core = { path = "../kimi-k3-core" }
+loadngo-coreml = { path = "../../../loadngo/coreml" }
+loadngo-inference = { path = "../../../loadngo/inference" }
+loadngo-proactor = { path = "../../../loadngo/proactor" }

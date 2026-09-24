@@ -35,6 +35,16 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: kimi-k3-in-rust
+
+      # This integration must be published after loadngo/inference is available
+      # on dev; see docs/CHAT.md. Keep the documented sibling-checkout layout.
+      - uses: actions/checkout@v4
+        with:
+          repository: jaylauffer/loadngo
+          ref: dev
+          path: loadngo
 
       - name: Toolchain
         run: |
@@ -43,10 +53,13 @@ jobs:
           rustc --version
 
       - name: cargo fmt --check
+        working-directory: kimi-k3-in-rust
         run: cargo fmt --all --check
 
       - name: cargo clippy (all + pedantic, warnings are errors)
+        working-directory: kimi-k3-in-rust
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: cargo test
+        working-directory: kimi-k3-in-rust
         run: cargo test --workspace --locked

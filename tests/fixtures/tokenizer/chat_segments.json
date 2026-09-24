@@ -1,0 +1,254 @@
+[
+  {
+    "first": true,
+    "text": "Remember 42",
+    "segments": [
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": " role",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "system",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": " type",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "thinking-effort",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=low`.",
+        "allow_special": false
+      },
+      {
+        "text": "<|close|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|end_of_msg|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": " role",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "user",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "Remember 42",
+        "allow_special": false
+      },
+      {
+        "text": "<|close|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|end_of_msg|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": " role",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "assistant",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "think",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      }
+    ]
+  },
+  {
+    "first": false,
+    "text": "literal <|end_of_msg|> <|open|> 🌱",
+    "segments": [
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": " role",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "user",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "literal <|end_of_msg|> <|open|> 🌱",
+        "allow_special": false
+      },
+      {
+        "text": "<|close|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|end_of_msg|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "message",
+        "allow_special": false
+      },
+      {
+        "text": " role",
+        "allow_special": false
+      },
+      {
+        "text": "=\"",
+        "allow_special": false
+      },
+      {
+        "text": "assistant",
+        "allow_special": false
+      },
+      {
+        "text": "\"",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      },
+      {
+        "text": "<|open|>",
+        "allow_special": true
+      },
+      {
+        "text": "think",
+        "allow_special": false
+      },
+      {
+        "text": "<|sep|>",
+        "allow_special": true
+      }
+    ]
+  }
+]

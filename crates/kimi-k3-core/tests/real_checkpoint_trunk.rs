@@ -19,7 +19,7 @@ use kimi_k3_core::{
     expert::ExpertRef,
     layer::{Attention, Matrix, Mlp, NoStreamedExperts},
     safetensors::SafeTensorIndex,
-    trunk::{TopLevelWeights, TrunkRing},
+    trunk::{Logits, TopLevelWeights, TrunkRing, TrunkSession},
 };
 
 fn checkpoint_dir() -> PathBuf {
@@ -241,5 +241,103 @@ fn ring_forward_matches_model_forward_with_the_real_streamed_expert_cache() {
     assert!(
         direct_logits.iter().all(|value| value.is_finite()),
         "real routed-expert output must be finite, not NaN/inf from a wiring mistake"
+    );
+}
+
+/// `TrunkRing::feed` must reproduce full recompute exactly on the CPU path: a
+/// three-token prefill and then one token at a time, each step's logits
+/// bit-identical to `forward_with(.., Logits::Last)` over the whole prefix. Five
+/// layers cover a dense layer, `MoE` layers with real streamed experts, KDA and
+/// MLA (whose KV cache is what makes incremental decoding possible at all).
+#[test]
+#[ignore = "needs the real ~1.4 TB checkpoint locally; run explicitly with --ignored"]
+fn ring_feed_matches_full_recompute_token_by_token() {
+    let dir = checkpoint_dir();
+    let mut config = K3Config::from_path(dir.join("config.json")).expect("real config parses");
+    config.num_hidden_layers = 5;
+    assert!(
+        (0..5).any(|layer| config.is_mla(layer)),
+        "needs an MLA layer"
+    );
+    assert!(
+        (0..5).any(|layer| !config.is_mla(layer)),
+        "needs a KDA layer"
+    );
+    let index = SafeTensorIndex::open(&dir).expect("real checkpoint indexes");
+    let mut storage = BoundStorage::new();
+    storage
+        .load_top_level(&index)
+        .expect("top-level tensors bind");
+    let top = storage.top_level().expect("top-level weights");
+    let probe = ExpertRef::resolve(&index, 1, 0).expect("layer 1 expert 0 resolves");
+    let mut cache = ExpertCache::new(
+        config.num_hidden_layers,
+        config.num_experts,
+        config.num_experts_per_token,
+        1 << 30,
+        &probe,
+    )
+    .expect("expert cache sizes");
+
+    let ids = [42_u32, 100, 7, 9, 1234];
+    let mut ring = TrunkRing::open(&index, &config, 0, 2).expect("ring opens");
+    let mut session = TrunkSession::new(&config, 8);
+    let mut fed = 0;
+    for chunk in [&ids[..3], &ids[3..4], &ids[4..]] {
+        let start = Instant::now();
+        let stepped = ring
+            .feed(
+                &index,
+                &config,
+                &top,
+                &mut session,
+                chunk,
+                &mut CachedExperts::new(&mut cache, &index),
+                None,
+                || true,
+            )
+            .expect("feed succeeds");
+        let feed_time = start.elapsed();
+        fed += chunk.len();
+        let start = Instant::now();
+        let full = ring
+            .forward_with(
+                &index,
+                &config,
+                &top,
+                &ids[..fed],
+                &mut CachedExperts::new(&mut cache, &index),
+                None,
+                Logits::Last,
+                || true,
+            )
+            .expect("full forward succeeds");
+        eprintln!(
+            "{fed} tokens: feed {} in {feed_time:?}, full recompute in {:?}",
+            chunk.len(),
+            start.elapsed()
+        );
+        assert_eq!(session.ids(), &ids[..fed]);
+        assert!(
+            stepped == full,
+            "feed diverged from full recompute at {fed} tokens"
+        );
+    }
+    assert!(
+        ring.feed(
+            &index,
+            &config,
+            &top,
+            &mut session,
+            &[1; 4],
+            &mut NoStreamedExperts,
+            None,
+            || true
+        )
+        .is_err()
+    );
+    assert!(
+        !session.is_broken(),
+        "a capacity refusal is checked before any work"
     );
 }

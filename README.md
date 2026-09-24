@@ -1,3 +1,36 @@
+# kimi-k3-in-rust
+
+Rust Kimi K3 inference using Loadngo's proactor for weight I/O and
+`loadngo-inference` for bounded multi-turn conversation state. The C engine
+below remains a parity reference, not the implementation of the Rust CLI.
+
+## Local terminal chat
+
+Use sibling checkouts named `loadngo/` and `kimi-k3-in-rust/`. The Loadngo
+checkout must include `inference/`; see [build and publication notes](docs/CHAT.md).
+
+```sh
+cd kimi-k3-in-rust
+cargo build --locked --release -p kimi-k3-cli
+target/release/k3 /path/to/kimi-k3 --chat
+```
+
+Messages retain exact token history, including K3's thinking channel. Output
+streams as tokens arrive. `/help`, `/continue`, `/undo`, `/reset`, `/stats`,
+`/quit`; Ctrl-C cancels a reply, Ctrl-D exits at the input prompt. Inference is
+entirely local; no cloud fallback or automatic model download.
+
+**Not yet a responsive everyday assistant:** the current CPU backend recomputes
+the context for each token. The prior Mac mini run took 771 seconds for three raw
+completion tokens. A chat interface does not remove this limitation. No Metal
+or Apple Neural Engine acceleration is implemented, and the existing ANE
+scaffold is not an inference backend. See [honest feature limits and tests](docs/CHAT.md).
+
+## Historical upstream C documentation
+
+The following upstream README is retained for provenance. Its hardware numbers,
+features and badges describe the C project, **not measurements of this Rust port**.
+
 <div align="center">
 
 <h1>kimi-k3-in-c</h1>

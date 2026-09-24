@@ -1,0 +1,19 @@
+{
+  "added_tokens_decoder": {
+    "163585": {
+      "content": "[EOS]"
+    },
+    "163586": {
+      "content": "<|end_of_msg|>"
+    },
+    "163587": {
+      "content": "<|open|>"
+    },
+    "163588": {
+      "content": "<|close|>"
+    },
+    "163589": {
+      "content": "<|sep|>"
+    }
+  }
+}

@@ -34,6 +34,45 @@ use crate::{
     },
 };
 
+/// An optional device for the trunk's bf16 products over several rows at once (the
+/// Apple Neural Engine through loadngo's Core ML engine, on macOS). It computes in its
+/// own precision, so a forward through it is not bit-identical to the CPU path, which
+/// remains the reference and every fallback.
+pub trait DenseAccel {
+    /// `y[r][o] = W[o][i] . x[r][i]` for `rows` rows, with `W` bf16 `[out][inp]`,
+    /// `x` `[rows][inp]` and `y` `[rows][out]`. Returns false, with `y` in an unspecified
+    /// state, to decline; the caller then computes the product on the CPU.
+    fn matmul_bf16(
+        &self,
+        w: &[u16],
+        x: &[f32],
+        y: &mut [f32],
+        rows: usize,
+        inp: usize,
+        out: usize,
+    ) -> bool;
+
+    /// The same product for a packed MXFP4 matrix with [`MXFP4_GROUP_SIZE`]-element
+    /// scale groups: `packed` is `[out][inp / 2]`, `scales` `[out][inp / group]`.
+    /// The default declines, keeping experts on the CPU.
+    #[allow(unused_variables)]
+    fn matmul_mxfp4(
+        &self,
+        packed: &[u8],
+        scales: &[u8],
+        x: &[f32],
+        y: &mut [f32],
+        rows: usize,
+        inp: usize,
+        out: usize,
+    ) -> bool {
+        false
+    }
+}
+
+/// `None` computes every product on the CPU reference kernels.
+pub type Accel<'a> = Option<&'a dyn DenseAccel>;
+
 /// A weight matrix read only through a matmul, in the storage format it arrived in.
 #[derive(Clone, Copy, Debug)]
 pub enum Matrix<'a> {
@@ -48,6 +87,33 @@ impl Matrix<'_> {
         match *self {
             Self::F32(w) => matmul(y, x, w, inp, out),
             Self::Bf16(w) => matmul_bf16(y, x, w, inp, out),
+        }
+    }
+
+    /// [`Self::mul`] for `rows` contiguous rows: `x` is `[rows][inp]`, `y` `[rows][out]`.
+    /// A bf16 matrix goes to `accel` when one is given and accepts it; otherwise each
+    /// row is exactly one [`Self::mul`], so the CPU result does not depend on batching.
+    pub fn mul_rows(
+        &self,
+        y: &mut [f32],
+        x: &[f32],
+        rows: usize,
+        inp: usize,
+        out: usize,
+        accel: Accel<'_>,
+    ) {
+        if let (Self::Bf16(w), Some(device)) = (*self, accel) {
+            if device.matmul_bf16(w, x, y, rows, inp, out) {
+                return;
+            }
+        }
+        for r in 0..rows {
+            self.mul(
+                &mut y[r * out..(r + 1) * out],
+                &x[r * inp..(r + 1) * inp],
+                inp,
+                out,
+            );
         }
     }
 
@@ -88,6 +154,23 @@ impl Mxfp4Matrix<'_> {
             self.rows,
             MXFP4_GROUP_SIZE,
         );
+    }
+
+    /// [`Self::mul`] for `n` contiguous rows of `x` (`[n][columns]`) into `y`
+    /// (`[n][rows]`), through `accel` when given and accepted; otherwise one
+    /// [`Self::mul`] per row, so the CPU result does not depend on batching.
+    pub fn mul_rows(&self, y: &mut [f32], x: &[f32], n: usize, accel: Accel<'_>) {
+        if let Some(device) = accel {
+            if device.matmul_mxfp4(self.packed, self.scales, x, y, n, self.columns, self.rows) {
+                return;
+            }
+        }
+        for r in 0..n {
+            self.mul(
+                &mut y[r * self.rows..(r + 1) * self.rows],
+                &x[r * self.columns..(r + 1) * self.columns],
+            );
+        }
     }
 
     fn check(&self, name: &str, rows: usize, columns: usize) -> Result<(), String> {
@@ -357,6 +440,20 @@ pub fn kda_layer(
     t: usize,
     state: &mut KdaState,
 ) {
+    kda_layer_with(out, x, w, c, t, state, None);
+}
+
+/// [`kda_layer`] with each projection applied to all `t` rows at once, through `accel`
+/// when given. With `None` it is float-for-float the same computation.
+pub fn kda_layer_with(
+    out: &mut [f32],
+    x: &[f32],
+    w: &KdaWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    state: &mut KdaState,
+    accel: Accel<'_>,
+) {
     let e = c.hidden_size;
     let heads = c.kda_num_heads;
     let d = c.kda_head_dim;
@@ -371,19 +468,17 @@ pub fn kda_layer(
     let mut al = vec![0.0_f32; t * p];
     let mut bt = vec![0.0_f32; t * heads];
     let mut o = vec![0.0_f32; t * p];
-    let mut gb = vec![0.0_f32; p];
+    let mut gb = vec![0.0_f32; t * p];
     let mut wr = vec![0.0_f32; p];
-    let mut fa = vec![0.0_f32; d];
+    let mut fa = vec![0.0_f32; t * d];
 
-    for step in 0..t {
-        let xt = &x[step * e..(step + 1) * e];
-        w.q.mul(&mut q[step * p..], xt, e, p);
-        w.k.mul(&mut kk[step * p..], xt, e, p);
-        w.v.mul(&mut v[step * p..], xt, e, p);
-        w.b.mul(&mut bt[step * heads..], xt, e, heads);
-        w.f_a.mul(&mut fa, xt, e, d);
-        w.f_b.mul(&mut z[step * p..], &fa, d, p);
-    }
+    let x = &x[..t * e];
+    w.q.mul_rows(&mut q, x, t, e, p, accel);
+    w.k.mul_rows(&mut kk, x, t, e, p, accel);
+    w.v.mul_rows(&mut v, x, t, e, p, accel);
+    w.b.mul_rows(&mut bt, x, t, e, heads, accel);
+    w.f_a.mul_rows(&mut fa, x, t, e, d, accel);
+    w.f_b.mul_rows(&mut z, &fa, t, d, p, accel);
 
     let (qs, rest) = state.conv.split_at_mut(p * hist);
     let (ks, vs) = rest.split_at_mut(p * hist);
@@ -436,18 +531,17 @@ pub fn kda_layer(
         }
     }
 
+    w.g.mul_rows(&mut gb, x, t, e, p, accel);
     for step in 0..t {
-        let xt = &x[step * e..(step + 1) * e];
         let ot = &mut o[step * p..(step + 1) * p];
         for h in 0..heads {
             rmsnorm_in_place(&mut ot[h * d..(h + 1) * d], w.o_norm, c.rms_norm_eps);
         }
-        w.g.mul(&mut gb, xt, e, p);
-        for (oi, &gi) in ot.iter_mut().zip(&gb) {
+        for (oi, &gi) in ot.iter_mut().zip(&gb[step * p..(step + 1) * p]) {
             *oi *= sigmoid(gi);
         }
-        w.o.mul(&mut out[step * e..(step + 1) * e], ot, p, e);
     }
+    w.o.mul_rows(out, &o, t, p, e, accel);
 }
 
 /// Gated MLA (`NoPE`) over `t` new tokens at absolute positions `cached..cached + t`,
@@ -467,13 +561,34 @@ pub fn mla(
     cache: &mut MlaCache,
     cached: usize,
 ) {
+    mla_with(out, x, w, c, t, cache, cached, None);
+}
+
+/// [`mla`] with each projection applied to all `t` rows at once, through `accel` when
+/// given. With `None` it is float-for-float the same computation.
+///
+/// # Panics
+///
+/// As [`mla`].
+pub fn mla_with(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MlaWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    cache: &mut MlaCache,
+    cached: usize,
+    accel: Accel<'_>,
+) {
     let e = c.hidden_size;
     let heads = c.num_attention_heads;
     let qn = c.qk_nope_head_dim;
     let qr = c.qk_rope_head_dim;
     let vh = c.v_head_dim;
     let qh = qn + qr;
-    let kvw = c.kv_lora_rank + qr;
+    let qlr = c.q_lora_rank;
+    let kvr = c.kv_lora_rank;
+    let kvw = kvr + qr;
     let kvd = qn + vh;
     let scale = 1.0_f32 / (qh as f32).sqrt();
     let last = cached + t - 1;
@@ -483,31 +598,36 @@ pub fn mla(
         cache.capacity.saturating_sub(1)
     );
 
+    let x = &x[..t * e];
     let mut q = vec![0.0_f32; t * heads * qh];
-    let mut ct = vec![0.0_f32; kvw];
-    let mut ql = vec![0.0_f32; c.q_lora_rank];
-    let mut acc = vec![0.0_f32; heads * vh];
-    let mut gbuf = vec![0.0_f32; heads * vh];
+    let mut ql = vec![0.0_f32; t * qlr];
+    let mut ct = vec![0.0_f32; t * kvw];
+    let mut ckv = vec![0.0_f32; t * kvr];
+    let mut acc = vec![0.0_f32; t * heads * vh];
     let mut sc = vec![0.0_f32; last + 1];
 
+    w.q_a.mul_rows(&mut ql, x, t, e, qlr, accel);
+    for row in ql.chunks_exact_mut(qlr) {
+        rmsnorm_in_place(row, w.q_a_norm, c.rms_norm_eps);
+    }
+    w.q_b.mul_rows(&mut q, &ql, t, qlr, heads * qh, accel);
+
+    w.kv_a.mul_rows(&mut ct, x, t, e, kvw, accel);
     for step in 0..t {
         let pos = cached + step;
-        let xt = &x[step * e..(step + 1) * e];
-        w.q_a.mul(&mut ql, xt, e, c.q_lora_rank);
-        rmsnorm_in_place(&mut ql, w.q_a_norm, c.rms_norm_eps);
-        w.q_b
-            .mul(&mut q[step * heads * qh..], &ql, c.q_lora_rank, heads * qh);
-
-        w.kv_a.mul(&mut ct, xt, e, kvw);
-        rmsnorm_in_place(&mut ct[..c.kv_lora_rank], w.kv_a_norm, c.rms_norm_eps);
-        cache.rope[pos * qr..(pos + 1) * qr].copy_from_slice(&ct[c.kv_lora_rank..]);
-        w.kv_b.mul(
-            &mut cache.kv[pos * heads * kvd..(pos + 1) * heads * kvd],
-            &ct,
-            c.kv_lora_rank,
-            heads * kvd,
-        );
+        let row = &mut ct[step * kvw..(step + 1) * kvw];
+        rmsnorm_in_place(&mut row[..kvr], w.kv_a_norm, c.rms_norm_eps);
+        cache.rope[pos * qr..(pos + 1) * qr].copy_from_slice(&row[kvr..]);
+        ckv[step * kvr..(step + 1) * kvr].copy_from_slice(&row[..kvr]);
     }
+    w.kv_b.mul_rows(
+        &mut cache.kv[cached * heads * kvd..(cached + t) * heads * kvd],
+        &ckv,
+        t,
+        kvr,
+        heads * kvd,
+        accel,
+    );
 
     for step in 0..t {
         let pos = cached + step;
@@ -535,7 +655,7 @@ pub fn mla(
                 z += f64::from(*score);
             }
 
-            let o = &mut acc[h * vh..(h + 1) * vh];
+            let o = &mut acc[(step * heads + h) * vh..(step * heads + h + 1) * vh];
             o.fill(0.0);
             for (s, &score) in sc[..=pos].iter().enumerate() {
                 let pr = (f64::from(score) / z) as f32;
@@ -545,15 +665,16 @@ pub fn mla(
                 }
             }
         }
-
-        if let Some(g) = w.g {
-            g.mul(&mut gbuf, &x[step * e..(step + 1) * e], e, heads * vh);
-            for (ai, &gi) in acc.iter_mut().zip(&gbuf) {
-                *ai *= 1.0 / (1.0 + (-gi).exp());
-            }
-        }
-        w.o.mul(&mut out[step * e..(step + 1) * e], &acc, heads * vh, e);
     }
+
+    if let Some(g) = w.g {
+        let mut gbuf = vec![0.0_f32; t * heads * vh];
+        g.mul_rows(&mut gbuf, x, t, e, heads * vh, accel);
+        for (ai, &gi) in acc.iter_mut().zip(&gbuf) {
+            *ai *= 1.0 / (1.0 + (-gi).exp());
+        }
+    }
+    w.o.mul_rows(out, &acc, t, heads * vh, e, accel);
 }
 
 /// Stable `LatentMoE`: route on the full width, run the selected experts in latent space,
@@ -576,25 +697,43 @@ pub fn moe(
     layer_idx: usize,
     experts: &mut dyn ExpertSource,
 ) -> Result<(), ExpertFetchError> {
+    moe_with(out, x, w, c, t, layer_idx, experts, None)
+}
+
+/// [`moe`] with the dense projections (latent down/up and the shared expert) applied to
+/// all `t` rows at once, through `accel` when given. Experts stay on the CPU. With
+/// `None` it is float-for-float the same computation.
+///
+/// # Errors
+///
+/// As [`moe`].
+pub fn moe_with(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    layer_idx: usize,
+    experts: &mut dyn ExpertSource,
+    accel: Accel<'_>,
+) -> Result<(), ExpertFetchError> {
     let e = c.hidden_size;
     let l = c.routed_expert_hidden_size;
     let inter = c.moe_intermediate_size;
-    let si = inter * c.num_shared_experts;
     let topk = c.num_experts_per_token;
     let b1 = c.activation_situ_beta;
     let b2 = c.activation_situ_linear_beta;
 
+    let x = &x[..t * e];
     let mut idx = vec![0_usize; topk];
     let mut wt = vec![0.0_f32; topk];
-    let mut z = vec![0.0_f32; l];
-    let mut acc = vec![0.0_f32; l];
+    let mut zz = vec![0.0_f32; t * l];
+    let mut accs = vec![0.0_f32; t * l];
     let mut gu = vec![0.0_f32; 2 * inter];
     let mut act = vec![0.0_f32; inter];
     let mut edn = vec![0.0_f32; l];
-    let mut sgu = vec![0.0_f32; 2 * si];
-    let mut sact = vec![0.0_f32; si];
-    let mut sdn = vec![0.0_f32; e];
 
+    w.down.mul_rows(&mut zz, x, t, e, l, accel);
     for step in 0..t {
         let xt = &x[step * e..(step + 1) * e];
         router(
@@ -610,8 +749,8 @@ pub fn moe(
             c.routed_scaling_factor,
         );
 
-        w.down.mul(&mut z, xt, e, l);
-        acc.fill(0.0);
+        let z = &zz[step * l..(step + 1) * l];
+        let acc = &mut accs[step * l..(step + 1) * l];
         if matches!(w.experts, RoutedExperts::Streamed) {
             experts.prefetch(layer_idx, &idx)?;
         }
@@ -621,8 +760,8 @@ pub fn moe(
                 RoutedExperts::Resident { w1, w3, w2 } => {
                     let e13 = expert * inter * l;
                     let e2 = expert * l * inter;
-                    matmul(gate, &z, &w1[e13..e13 + inter * l], l, inter);
-                    matmul(up, &z, &w3[e13..e13 + inter * l], l, inter);
+                    matmul(gate, z, &w1[e13..e13 + inter * l], l, inter);
+                    matmul(up, z, &w3[e13..e13 + inter * l], l, inter);
                     situ_glu(&mut act, &gu, inter, b1, b2);
                     matmul(&mut edn, &act, &w2[e2..e2 + l * inter], inter, l);
                 }
@@ -633,10 +772,10 @@ pub fn moe(
                         expert,
                         detail,
                     })?;
-                    packed.w1.mul(gate, &z);
-                    packed.w3.mul(up, &z);
+                    packed.w1.mul_rows(gate, z, 1, accel);
+                    packed.w3.mul_rows(up, z, 1, accel);
                     situ_glu(&mut act, &gu, inter, b1, b2);
-                    packed.w2.mul(&mut edn, &act);
+                    packed.w2.mul_rows(&mut edn, &act, 1, accel);
                 }
             }
             for (ai, &di) in acc.iter_mut().zip(&edn) {
@@ -645,21 +784,47 @@ pub fn moe(
         }
 
         if c.latent_moe_use_norm {
-            rmsnorm_in_place(&mut acc, w.latent_norm, c.rms_norm_eps);
-        }
-        let ot = &mut out[step * e..(step + 1) * e];
-        w.up.mul(ot, &acc, l, e);
-
-        let (sgate, sup) = sgu.split_at_mut(si);
-        w.shared_w1.mul(sgate, xt, e, si);
-        w.shared_w3.mul(sup, xt, e, si);
-        situ_glu(&mut sact, &sgu, si, b1, b2);
-        w.shared_w2.mul(&mut sdn, &sact, si, e);
-        for (oi, &di) in ot.iter_mut().zip(&sdn) {
-            *oi += di;
+            rmsnorm_in_place(acc, w.latent_norm, c.rms_norm_eps);
         }
     }
+    moe_tail(out, x, &accs, w, c, t, accel);
     Ok(())
+}
+
+/// The `MoE` tail for `t` rows: up-project the normalized latent aggregates `accs`
+/// (`[t][latent]`) into `out`, then add the unweighted shared expert of `x`.
+fn moe_tail(
+    out: &mut [f32],
+    x: &[f32],
+    accs: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    accel: Accel<'_>,
+) {
+    let e = c.hidden_size;
+    let l = c.routed_expert_hidden_size;
+    let si = c.moe_intermediate_size * c.num_shared_experts;
+    let b1 = c.activation_situ_beta;
+    let b2 = c.activation_situ_linear_beta;
+
+    w.up.mul_rows(out, accs, t, l, e, accel);
+    let mut sgate = vec![0.0_f32; t * si];
+    let mut sup = vec![0.0_f32; t * si];
+    w.shared_w1.mul_rows(&mut sgate, x, t, e, si, accel);
+    w.shared_w3.mul_rows(&mut sup, x, t, e, si, accel);
+    let mut sgu = vec![0.0_f32; 2 * si];
+    let mut sact = vec![0.0_f32; t * si];
+    for step in 0..t {
+        sgu[..si].copy_from_slice(&sgate[step * si..(step + 1) * si]);
+        sgu[si..].copy_from_slice(&sup[step * si..(step + 1) * si]);
+        situ_glu(&mut sact[step * si..(step + 1) * si], &sgu, si, b1, b2);
+    }
+    let mut sdn = vec![0.0_f32; t * e];
+    w.shared_w2.mul_rows(&mut sdn, &sact, t, si, e, accel);
+    for (oi, &di) in out[..t * e].iter_mut().zip(&sdn) {
+        *oi += di;
+    }
 }
 
 /// Bounds the contribution buffer regardless of how long a prefill chunk runs
@@ -694,8 +859,26 @@ pub fn moe_prefill(
     layer_idx: usize,
     experts: &mut dyn ExpertSource,
 ) -> Result<(), ExpertFetchError> {
+    moe_prefill_with(out, x, w, c, t, layer_idx, experts, None)
+}
+
+/// [`moe_prefill`] with dense projections through `accel` when given; see [`moe_with`].
+///
+/// # Errors
+///
+/// As [`moe_prefill`].
+pub fn moe_prefill_with(
+    out: &mut [f32],
+    x: &[f32],
+    w: &MoeWeights<'_>,
+    c: &K3Config,
+    t: usize,
+    layer_idx: usize,
+    experts: &mut dyn ExpertSource,
+    accel: Accel<'_>,
+) -> Result<(), ExpertFetchError> {
     if t <= 1 || !matches!(w.experts, RoutedExperts::Streamed) {
-        return moe(out, x, w, c, t, layer_idx, experts);
+        return moe_with(out, x, w, c, t, layer_idx, experts, accel);
     }
     let e = c.hidden_size;
     let mut start = 0;
@@ -704,9 +887,9 @@ pub fn moe_prefill(
         let chunk_out = &mut out[start * e..(start + n) * e];
         let chunk_x = &x[start * e..(start + n) * e];
         if n == 1 {
-            moe(chunk_out, chunk_x, w, c, 1, layer_idx, experts)?;
+            moe_with(chunk_out, chunk_x, w, c, 1, layer_idx, experts, accel)?;
         } else {
-            moe_prefill_chunk(chunk_out, chunk_x, w, c, n, layer_idx, experts)?;
+            moe_prefill_chunk(chunk_out, chunk_x, w, c, n, layer_idx, experts, accel)?;
         }
         start += n;
     }
@@ -723,17 +906,18 @@ fn moe_prefill_chunk(
     t: usize,
     layer_idx: usize,
     experts: &mut dyn ExpertSource,
+    accel: Accel<'_>,
 ) -> Result<(), ExpertFetchError> {
     let e = c.hidden_size;
     let l = c.routed_expert_hidden_size;
     let inter = c.moe_intermediate_size;
-    let si = inter * c.num_shared_experts;
     let topk = c.num_experts_per_token;
     let b1 = c.activation_situ_beta;
     let b2 = c.activation_situ_linear_beta;
 
     // 1. Route every token and down-project it, and collect the chunk's unique
     // experts, expert-major order for step 2 below.
+    let x = &x[..t * e];
     let mut ridx = vec![0_usize; t * topk];
     let mut rwt = vec![0.0_f32; t * topk];
     let mut zz = vec![0.0_f32; t * l];
@@ -755,7 +939,6 @@ fn moe_prefill_chunk(
             c.moe_renormalize,
             c.routed_scaling_factor,
         );
-        w.down.mul(&mut zz[step * l..(step + 1) * l], xt, e, l);
         for &expert in it.iter() {
             if !seen[expert] {
                 seen[expert] = true;
@@ -763,14 +946,19 @@ fn moe_prefill_chunk(
             }
         }
     }
+    w.down.mul_rows(&mut zz, x, t, e, l, accel);
 
     // 2. Expert-major: fetch each unique expert ONCE and apply it to every
     // (token, slot) that selected it.
     experts.prefetch(layer_idx, &uniq)?;
     let mut contrib = vec![0.0_f32; t * topk * l];
     let mut gu = vec![0.0_f32; 2 * inter];
-    let mut act = vec![0.0_f32; inter];
-    let mut edn = vec![0.0_f32; l];
+    let mut slots = Vec::with_capacity(t);
+    let mut zs = Vec::with_capacity(t * l);
+    let mut gates = vec![0.0_f32; t * inter];
+    let mut ups = vec![0.0_f32; t * inter];
+    let mut acts = vec![0.0_f32; t * inter];
+    let mut edns = vec![0.0_f32; t * l];
     for &expert_id in &uniq {
         let packed = experts.expert(layer_idx, expert_id)?;
         packed.check(l, inter).map_err(|detail| ExpertFetchError {
@@ -778,35 +966,41 @@ fn moe_prefill_chunk(
             expert: expert_id,
             detail,
         })?;
+        // Every (token, slot) that selected this expert, applied as one batch. Each
+        // row is the same per-token arithmetic as before, only grouped.
+        slots.clear();
+        zs.clear();
         for step in 0..t {
             let it = &ridx[step * topk..(step + 1) * topk];
-            let zt = &zz[step * l..(step + 1) * l];
             for (j, &selected) in it.iter().enumerate() {
-                if selected != expert_id {
-                    continue;
+                if selected == expert_id {
+                    slots.push(step * topk + j);
+                    zs.extend_from_slice(&zz[step * l..(step + 1) * l]);
                 }
-                let (gate, up) = gu.split_at_mut(inter);
-                packed.w1.mul(gate, zt);
-                packed.w3.mul(up, zt);
-                situ_glu(&mut act, &gu, inter, b1, b2);
-                packed.w2.mul(&mut edn, &act);
-                let at = (step * topk + j) * l;
-                contrib[at..at + l].copy_from_slice(&edn);
             }
+        }
+        let n = slots.len();
+        packed.w1.mul_rows(&mut gates[..n * inter], &zs, n, accel);
+        packed.w3.mul_rows(&mut ups[..n * inter], &zs, n, accel);
+        for r in 0..n {
+            gu[..inter].copy_from_slice(&gates[r * inter..(r + 1) * inter]);
+            gu[inter..].copy_from_slice(&ups[r * inter..(r + 1) * inter]);
+            situ_glu(&mut acts[r * inter..(r + 1) * inter], &gu, inter, b1, b2);
+        }
+        packed
+            .w2
+            .mul_rows(&mut edns[..n * l], &acts[..n * inter], n, accel);
+        for (r, &slot) in slots.iter().enumerate() {
+            contrib[slot * l..(slot + 1) * l].copy_from_slice(&edns[r * l..(r + 1) * l]);
         }
     }
 
     // 3. Per token, sum contributions in the ORIGINAL top-k order, then the
     // shared-expert tail exactly as `moe` does it, so every float matches.
-    let mut acc = vec![0.0_f32; l];
-    let mut sgu = vec![0.0_f32; 2 * si];
-    let mut sact = vec![0.0_f32; si];
-    let mut sdn = vec![0.0_f32; e];
+    let mut accs = vec![0.0_f32; t * l];
     for step in 0..t {
-        let xt = &x[step * e..(step + 1) * e];
-        let ot = &mut out[step * e..(step + 1) * e];
         let wtt = &rwt[step * topk..(step + 1) * topk];
-        acc.fill(0.0);
+        let acc = &mut accs[step * l..(step + 1) * l];
         for j in 0..topk {
             let wj = wtt[j];
             let cb = &contrib[(step * topk + j) * l..(step * topk + j + 1) * l];
@@ -815,19 +1009,10 @@ fn moe_prefill_chunk(
             }
         }
         if c.latent_moe_use_norm {
-            rmsnorm_in_place(&mut acc, w.latent_norm, c.rms_norm_eps);
-        }
-        w.up.mul(ot, &acc, l, e);
-
-        let (sgate, sup) = sgu.split_at_mut(si);
-        w.shared_w1.mul(sgate, xt, e, si);
-        w.shared_w3.mul(sup, xt, e, si);
-        situ_glu(&mut sact, &sgu, si, b1, b2);
-        w.shared_w2.mul(&mut sdn, &sact, si, e);
-        for (oi, &di) in ot.iter_mut().zip(&sdn) {
-            *oi += di;
+            rmsnorm_in_place(acc, w.latent_norm, c.rms_norm_eps);
         }
     }
+    moe_tail(out, x, &accs, w, c, t, accel);
     Ok(())
 }
 
@@ -837,26 +1022,30 @@ fn dense_mlp(
     weights: (Matrix<'_>, Matrix<'_>, Matrix<'_>),
     c: &K3Config,
     t: usize,
+    accel: Accel<'_>,
 ) {
     let (gate, up, down) = weights;
     let e = c.hidden_size;
     let di = c.intermediate_size;
+    let x = &x[..t * e];
+    let mut g = vec![0.0_f32; t * di];
+    let mut u = vec![0.0_f32; t * di];
+    gate.mul_rows(&mut g, x, t, e, di, accel);
+    up.mul_rows(&mut u, x, t, e, di, accel);
     let mut dgu = vec![0.0_f32; 2 * di];
-    let mut sub = vec![0.0_f32; di];
+    let mut sub = vec![0.0_f32; t * di];
     for step in 0..t {
-        let xt = &x[step * e..(step + 1) * e];
-        let (g, u) = dgu.split_at_mut(di);
-        gate.mul(g, xt, e, di);
-        up.mul(u, xt, e, di);
+        dgu[..di].copy_from_slice(&g[step * di..(step + 1) * di]);
+        dgu[di..].copy_from_slice(&u[step * di..(step + 1) * di]);
         situ_glu(
-            &mut sub,
+            &mut sub[step * di..(step + 1) * di],
             &dgu,
             di,
             c.activation_situ_beta,
             c.activation_situ_linear_beta,
         );
-        down.mul(&mut out[step * e..(step + 1) * e], &sub, di, e);
     }
+    down.mul_rows(out, &sub, t, di, e, accel);
 }
 
 /// Folds an `AttnRes` norm gain and scoring projection into the one vector they act as.
@@ -911,6 +1100,31 @@ pub fn decoder_layer(
     cached: usize,
     experts: &mut dyn ExpertSource,
 ) -> Result<(), ExpertFetchError> {
+    decoder_layer_with(h, blocks, w, c, layer_idx, t, state, cached, experts, None)
+}
+
+/// [`decoder_layer`] with every dense projection applied to all `t` rows at once,
+/// through `accel` when given. With `None` it is float-for-float the same computation.
+///
+/// # Errors
+///
+/// As [`decoder_layer`].
+///
+/// # Panics
+///
+/// As [`decoder_layer`].
+pub fn decoder_layer_with(
+    h: &mut [f32],
+    blocks: &mut Vec<Vec<f32>>,
+    w: &LayerWeights<'_>,
+    c: &K3Config,
+    layer_idx: usize,
+    t: usize,
+    state: &mut LayerState,
+    cached: usize,
+    experts: &mut dyn ExpertSource,
+    accel: Accel<'_>,
+) -> Result<(), ExpertFetchError> {
     let e = c.hidden_size;
     let eps = c.rms_norm_eps;
     let n = t * e;
@@ -940,9 +1154,11 @@ pub fn decoder_layer(
         );
     }
     match (&w.attention, state) {
-        (Attention::Kda(kw), LayerState::Kda(st)) => kda_layer(&mut tmp, &hin, kw, c, t, st),
+        (Attention::Kda(kw), LayerState::Kda(st)) => {
+            kda_layer_with(&mut tmp, &hin, kw, c, t, st, accel);
+        }
         (Attention::Mla(mw), LayerState::Mla(cache)) => {
-            mla(&mut tmp, &hin, mw, c, t, cache, cached);
+            mla_with(&mut tmp, &hin, mw, c, t, cache, cached, accel);
         }
         _ => panic!("layer {layer_idx}: attention state does not match its weights"),
     }
@@ -966,8 +1182,10 @@ pub fn decoder_layer(
         );
     }
     match &w.mlp {
-        Mlp::Moe(mw) => moe_prefill(&mut tmp, &hin, mw, c, t, layer_idx, experts)?,
-        Mlp::Dense { gate, up, down } => dense_mlp(&mut tmp, &hin, (*gate, *up, *down), c, t),
+        Mlp::Moe(mw) => moe_prefill_with(&mut tmp, &hin, mw, c, t, layer_idx, experts, accel)?,
+        Mlp::Dense { gate, up, down } => {
+            dense_mlp(&mut tmp, &hin, (*gate, *up, *down), c, t, accel);
+        }
     }
 
     for (pi, &ti) in pref.iter_mut().zip(&tmp) {

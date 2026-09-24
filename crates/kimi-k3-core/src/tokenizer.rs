@@ -481,6 +481,16 @@ impl Tokenizer {
         out
     }
 
+    /// Encode literal content without interpreting model control markers.
+    /// Chat renderers must use this for user text and tag attribute values;
+    /// otherwise a pasted marker can change the conversation structure.
+    #[must_use]
+    pub fn encode_ordinary(&self, text: &str) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.pretokenize_and_encode(text.as_bytes(), &mut out);
+        out
+    }
+
     /// Decodes token ids back to bytes: an added token's content is emitted
     /// literally, a regular token's byte-level string is mapped back to its
     /// original bytes. Ported from C's `tok_decode`.
