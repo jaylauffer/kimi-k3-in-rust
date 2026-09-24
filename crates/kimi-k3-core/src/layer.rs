@@ -52,6 +52,18 @@ pub trait DenseAccel {
         out: usize,
     ) -> bool;
 
+    /// Several products known in advance, so a device can prepare the next weight
+    /// while it computes the current one. Returns false, with every `y` unspecified, to
+    /// decline them all. The default runs each through [`Self::matmul_bf16`].
+    fn run_bf16(&self, jobs: &mut [Bf16Job<'_>]) -> bool {
+        jobs.iter_mut().all(|job| {
+            let (x, rows, inp) = (job.x, job.rows, job.inp);
+            job.parts
+                .iter_mut()
+                .all(|(w, out, y)| self.matmul_bf16(w, x, y, rows, inp, *out))
+        })
+    }
+
     /// The same product for a packed MXFP4 matrix with [`MXFP4_GROUP_SIZE`]-element
     /// scale groups: `packed` is `[out][inp / 2]`, `scales` `[out][inp / group]`.
     /// The default declines, keeping experts on the CPU.
@@ -72,6 +84,15 @@ pub trait DenseAccel {
 
 /// `None` computes every product on the CPU reference kernels.
 pub type Accel<'a> = Option<&'a dyn DenseAccel>;
+
+/// bf16 products that share one input `x` (`[rows][inp]`): each part is a weight
+/// `[out][inp]`, its `out`, and its result `y` (`[rows][out]`).
+pub struct Bf16Job<'a> {
+    pub x: &'a [f32],
+    pub rows: usize,
+    pub inp: usize,
+    pub parts: Vec<(&'a [u16], usize, &'a mut [f32])>,
+}
 
 /// A weight matrix read only through a matmul, in the storage format it arrived in.
 #[derive(Clone, Copy, Debug)]

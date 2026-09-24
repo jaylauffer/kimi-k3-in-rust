@@ -69,18 +69,62 @@ prompts plus CPU/ANE agreement, not on logit parity.
 
 ## Where the time goes, and what would make it faster
 
-Per decoded token on the ANE path: ~0.37 s in about 980 Core ML predictions (most of
-them small expert matrices, where fixed per-call overhead dominates), ~0.23 s converting
-the resident bf16 weights to fp16 again (6.4 GB per token), and the rest CPU-side
-attention, routing and expert reads. Not yet done, in expected order of payoff:
+### Per-token costs, fixed 2026-09-24
 
-1. Keep resident weights (and cached experts) as prepared fp16 surfaces instead of
-   converting them on every token.
-2. Fewer, larger predictions: one fused gate/up product for all eight selected experts,
-   and a batched down projection.
-3. Warm the expert cache in the background, or pin the most-routed experts.
-4. The GPU (Metal) for decode, where memory bandwidth rather than per-call overhead
-   limits; 4-bit experts to keep all 256 per layer resident (a numerics decision).
+Measured back to back on `--accel ane`, "The capital of France is", with the same output
+text before and after (the CPU path also gave identical tokens). "After" is two runs, the
+second on the committed build; macOS thermal state stayed nominal throughout:
+
+| Measure | Before | After |
+|---|---|---|
+| Decode speed, 48 tokens | 1.31 tokens/s | 1.68-1.75 tokens/s |
+| Steady state, last 24 tokens | 0.70 s/token | 0.51-0.55 s/token |
+| Time converting weights | 11.4 s | 4.1 s |
+| CPU user time | 18.1 s | 13.2 s |
+| 639-token prompt pass | 88 s (91 s on the older build) | 58-59 s |
+| Page faults in that pass | 14.0 million | 6.9-7.2 million |
+| Kernel time in that pass | 49 s | 27-28 s |
+
+What changed:
+
+1. **Conversion overlaps the Neural Engine.** The forward pass hands over every
+   product whose input is ready at once, through `DenseAccel::run_bf16`:
+   - KDA's six input projections;
+   - both low-rank second halves;
+   - the shared and routed experts' gate and up projections, then their down
+     projections.
+
+   loadngo's engine converts the next weight on a helper thread while the current one
+   runs.
+2. **No allocation churn on cache misses.** Read buffers come from a bounded pool, misses
+   are read in batches of 32, and an evicted expert's storage is overwritten in place.
+   This is the rule in loadngo `docs/PROACTOR_ENGINE_ADOPTION.md`, "Allocation churn in
+   hot paths is not acceptable".
+
+Tried and rejected, with measurements in loadngo `docs/NPU_ACCELERATION.md`:
+
+- **fp16 weights prepared once as their own surfaces.** No faster: the Neural Engine is
+  slow on memory it has not read recently.
+- **Fewer, larger predictions.** Slower: call count was not the cost.
+
+### What limits it now
+
+- **Decoding** is about 0.4 s/token of Neural Engine time, spent streaming ~6 GB of
+  weights at 15-25 GB/s, plus about 0.15 s of single-threaded CPU work: attention,
+  routing, and expert reads on cache misses.
+- **Prompt processing** is bound by reading experts. A few hundred tokens route to
+  nearly every expert in every layer, 86 GB for 639 tokens, and the 24 GB cache holds
+  about a quarter of them. That is what makes tool replies slow.
+
+Next, in expected order of payoff:
+
+1. **4-bit (MXFP4) routed experts,** about 25 GB, so all of them stay in memory. This
+   removes the drive from both prompt processing and decoding, and it helps the Neural
+   Engine path as well as Metal. The engine already multiplies MXFP4. It changes the
+   model's numbers, so it waits on a quality report and Jay's decision.
+2. **The GPU (Metal) for decoding,** where memory bandwidth is roughly ten times the
+   Neural Engine's streaming rate.
+3. **Multi-threaded CPU work,** for the router and MLA attention in long prompts.
 
 Plans: [loadngo `docs/METAL_COMPUTE_PLAN.md`](https://github.com/jaylauffer/loadngo/blob/dev/docs/METAL_COMPUTE_PLAN.md)
 (GPU decode and MXFP4 experts) and

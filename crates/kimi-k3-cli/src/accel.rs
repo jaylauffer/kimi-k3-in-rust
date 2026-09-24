@@ -7,6 +7,9 @@
 //! computes in fp16, so its logits differ slightly from `cpu`; any product it refuses
 //! (a value outside fp16's range, a Core ML error) is computed on the CPU instead and
 //! counted. Routing, attention recurrences, norms and activations stay on the CPU.
+//! Products that a layer hands over together (Kimi Linear does, a step at a time) are
+//! pipelined: the next weight converts to fp16 on a helper thread while the Neural
+//! Engine computes the current one.
 
 use kimi_k3_core::layer::Accel;
 #[cfg(target_os = "macos")]
@@ -70,7 +73,8 @@ impl Device {
 mod ane {
     use super::DenseAccel;
     use kimi_k3_core::expert::MXFP4_GROUP_SIZE;
-    use loadngo_coreml::dense::{DenseEngine, MX_BLOCK};
+    use kimi_k3_core::layer::Bf16Job;
+    use loadngo_coreml::dense::{DenseEngine, Job, MX_BLOCK};
     use loadngo_inference::compute::ComputePolicy;
     use std::cell::{Cell, RefCell};
 
@@ -125,7 +129,26 @@ mod ane {
                 .engine
                 .borrow_mut()
                 .matmul_bf16(w, x, y, rows, inp, out);
-            self.accepted(result, rows, inp, out)
+            self.accepted(result, || format!("{rows}x{inp}->{out}"))
+        }
+
+        fn run_bf16(&self, jobs: &mut [Bf16Job<'_>]) -> bool {
+            let products: usize = jobs.iter().map(|j| j.parts.len()).sum();
+            let mut engine_jobs: Vec<Job<'_>> = jobs
+                .iter_mut()
+                .map(|job| Job {
+                    x: job.x,
+                    rows: job.rows,
+                    inputs: job.inp,
+                    parts: job
+                        .parts
+                        .iter_mut()
+                        .map(|(w, out, y)| (*w, *out, &mut **y))
+                        .collect(),
+                })
+                .collect();
+            let result = self.engine.borrow_mut().run_bf16(&mut engine_jobs);
+            self.accepted(result, || format!("{products} products of one step"))
         }
 
         fn matmul_mxfp4(
@@ -142,25 +165,19 @@ mod ane {
                 .engine
                 .borrow_mut()
                 .matmul_mxfp4(packed, scales, x, y, rows, inp, out);
-            self.accepted(result, rows, inp, out)
+            self.accepted(result, || format!("{rows}x{inp}->{out}"))
         }
     }
 
     impl Ane {
-        fn accepted(
-            &self,
-            result: Result<(), String>,
-            rows: usize,
-            inp: usize,
-            out: usize,
-        ) -> bool {
+        fn accepted(&self, result: Result<(), String>, what: impl FnOnce() -> String) -> bool {
             match result {
                 Ok(()) => true,
                 Err(error) => {
                     let declined = self.declined.get() + 1;
                     self.declined.set(declined);
                     if declined <= 3 {
-                        eprintln!("ane: {rows}x{inp}->{out} computed on the CPU instead: {error}");
+                        eprintln!("ane: {} computed on the CPU instead: {error}", what());
                     }
                     false
                 }

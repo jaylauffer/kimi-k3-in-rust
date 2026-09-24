@@ -16,8 +16,14 @@
 //!   bound: `g = -exp(A_log[h]) * softplus(z + dt_bias)` (fla `naive_kda_gate`).
 //!
 //! Shared with K3: the KDA recurrence, fused-SiLU short convolution, L2/RMS norms, the
-//! sigmoid router with a selection-only bias, and every bf16 product through
-//! [`Matrix::mul_rows`], so `--accel ane` applies unchanged.
+//! sigmoid router with a selection-only bias, and the CPU bf16 product
+//! ([`Matrix::mul_rows`]), so the CPU path is the reference for both.
+//!
+//! Products are handed to the optional device ([`Accel`]) a step at a time, every
+//! product whose input is ready at once ([`crate::layer::DenseAccel::run_bf16`]): KDA's six input
+//! projections, both low-rank halves, the shared and routed experts' gate and up, then
+//! their down projections. A device can then prepare one weight while it computes
+//! another (the Neural Engine converts bf16 to fp16 on a helper thread meanwhile).
 //!
 //! Everything except the routed experts (about 2 B parameters) is loaded resident.
 //! Routed experts (26 layers x 256 x 14.2 MB for the 48B model) stream through a
@@ -38,7 +44,7 @@ use serde_json::Value;
 
 use crate::{
     io::ReadRequest,
-    layer::{Accel, Matrix},
+    layer::{Accel, Bf16Job, Matrix},
     ops::{
         kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid,
     },
@@ -276,10 +282,20 @@ impl From<SafeTensorError> for LinearError {
     }
 }
 
+/// Little-endian bytes to bf16 words.
 fn to_words(raw: &[u8]) -> Vec<u16> {
-    raw.chunks_exact(2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .collect()
+    let mut words = Vec::with_capacity(raw.len() / 2);
+    words_into(&mut words, raw);
+    words
+}
+
+/// As [`to_words`] into `words`, reusing its allocation (see [`ExpertStore::spare`]).
+fn words_into(words: &mut Vec<u16>, raw: &[u8]) {
+    words.clear();
+    words.extend(
+        raw.chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]])),
+    );
 }
 
 /// A bf16 `[out][inp]` matrix, read whole.
@@ -320,16 +336,76 @@ fn vector(index: &SafeTensorIndex, name: &str, len: usize) -> Result<Vec<f32>, L
     Ok(out)
 }
 
+/// A bf16 `[out][inp]` matrix read only through products.
+struct Weight {
+    words: Vec<u16>,
+    out: usize,
+    inp: usize,
+}
+
+impl Weight {
+    const fn new(words: Vec<u16>, out: usize, inp: usize) -> Self {
+        Self { words, out, inp }
+    }
+
+    fn mul_cpu(&self, y: &mut [f32], x: &[f32], rows: usize) {
+        Matrix::Bf16(&self.words).mul_rows(y, x, rows, self.inp, self.out, None);
+    }
+}
+
+/// Products sharing an input.
+struct Mul<'a> {
+    x: &'a [f32],
+    rows: usize,
+    parts: Vec<(&'a Weight, &'a mut [f32])>,
+}
+
+/// Runs `muls` on `accel` together, or each product on the CPU when there is none or it
+/// declines. Each product's CPU result depends only on its own weight and input, so how
+/// products are gathered never changes the reference path's floats.
+fn products(accel: Accel<'_>, muls: &mut [Mul<'_>]) {
+    if let Some(device) = accel {
+        let mut jobs: Vec<Bf16Job<'_>> = muls
+            .iter_mut()
+            .filter(|m| !m.parts.is_empty())
+            .map(|m| Bf16Job {
+                x: m.x,
+                rows: m.rows,
+                inp: m.parts[0].0.inp,
+                parts: m
+                    .parts
+                    .iter_mut()
+                    .map(|(w, y)| (&w.words[..], w.out, &mut **y))
+                    .collect(),
+            })
+            .collect();
+        if device.run_bf16(&mut jobs) {
+            return;
+        }
+    }
+    for m in muls.iter_mut() {
+        for (w, y) in &mut m.parts {
+            w.mul_cpu(y, m.x, m.rows);
+        }
+    }
+}
+
+fn silu_mul(g: &mut [f32], u: &[f32]) {
+    for (gi, &ui) in g.iter_mut().zip(u) {
+        *gi = silu(*gi) * ui;
+    }
+}
+
 struct Kda {
-    q: Vec<u16>,
-    k: Vec<u16>,
-    v: Vec<u16>,
-    b: Vec<u16>,
-    f_a: Vec<u16>,
-    f_b: Vec<u16>,
-    g_a: Vec<u16>,
-    g_b: Vec<u16>,
-    o: Vec<u16>,
+    q: Weight,
+    k: Weight,
+    v: Weight,
+    b: Weight,
+    f_a: Weight,
+    f_b: Weight,
+    g_a: Weight,
+    g_b: Weight,
+    o: Weight,
     q_conv: Vec<f32>,
     k_conv: Vec<f32>,
     v_conv: Vec<f32>,
@@ -339,11 +415,11 @@ struct Kda {
 }
 
 struct Mla {
-    q: Vec<u16>,
-    kv_a: Vec<u16>,
+    q: Weight,
+    kv_a: Weight,
     kv_a_norm: Vec<f32>,
-    kv_b: Vec<u16>,
-    o: Vec<u16>,
+    kv_b: Weight,
+    o: Weight,
 }
 
 enum Attn {
@@ -352,9 +428,9 @@ enum Attn {
 }
 
 struct Mlp {
-    gate: Vec<u16>,
-    up: Vec<u16>,
-    down: Vec<u16>,
+    gate: Weight,
+    up: Weight,
+    down: Weight,
     inter: usize,
 }
 
@@ -386,11 +462,15 @@ pub struct ExpertStats {
 
 struct Slot {
     key: (usize, usize),
-    w1: Vec<u16>,
-    w3: Vec<u16>,
-    w2: Vec<u16>,
+    w1: Weight,
+    w3: Weight,
+    w2: Weight,
     used: u64,
 }
+
+/// Experts read per batch: enough requests in flight to keep the drive busy, while the
+/// read buffers stay a bounded pool (96 buffers, ~450 MB for the 48B model).
+const READ_CHUNK: usize = 32;
 
 struct ExpertStore {
     capacity: usize,
@@ -398,11 +478,14 @@ struct ExpertStore {
     map: HashMap<(usize, usize), usize>,
     clock: u64,
     stats: ExpertStats,
+    /// Read buffers kept between batches. Allocating fresh ones for every miss cost
+    /// ~14 million page faults (49 s of kernel time) in a 639-token prompt pass.
+    spare: Vec<Vec<u8>>,
 }
 
 impl ExpertStore {
-    /// Makes every expert in `wanted` for `layer` resident, reading the missing ones as
-    /// one batch. Evicts least-recently-used slots that are not wanted now.
+    /// Makes every expert in `wanted` for `layer` resident, reading the missing ones in
+    /// batches of [`READ_CHUNK`]. Evicts least-recently-used slots not wanted now.
     fn ensure(
         &mut self,
         index: &SafeTensorIndex,
@@ -425,62 +508,73 @@ impl ExpertStore {
             return Ok(());
         }
         let (e, inter) = (config.hidden_size, config.moe_intermediate_size);
-        let mut requests = Vec::with_capacity(3 * missing.len());
-        for &expert in &missing {
-            for (part, shape) in [("w1", [inter, e]), ("w3", [inter, e]), ("w2", [e, inter])] {
-                let name =
-                    format!("model.layers.{layer}.block_sparse_moe.experts.{expert}.{part}.weight");
-                let tensor = index
-                    .tensor(&name)
-                    .ok_or_else(|| LinearError::Missing(name.clone()))?;
-                if tensor.dtype != DType::Bf16 || tensor.shape != shape {
-                    return Err(LinearError::Tensor {
-                        name,
-                        detail: format!(
-                            "is {:?} {:?}, expected Bf16 {shape:?}",
-                            tensor.dtype, tensor.shape
-                        ),
+        for chunk in missing.chunks(READ_CHUNK) {
+            let mut requests = Vec::with_capacity(3 * chunk.len());
+            for &expert in chunk {
+                for (part, shape) in [("w1", [inter, e]), ("w3", [inter, e]), ("w2", [e, inter])] {
+                    let name = format!(
+                        "model.layers.{layer}.block_sparse_moe.experts.{expert}.{part}.weight"
+                    );
+                    let tensor = index
+                        .tensor(&name)
+                        .ok_or_else(|| LinearError::Missing(name.clone()))?;
+                    if tensor.dtype != DType::Bf16 || tensor.shape != shape {
+                        return Err(LinearError::Tensor {
+                            name,
+                            detail: format!(
+                                "is {:?} {:?}, expected Bf16 {shape:?}",
+                                tensor.dtype, tensor.shape
+                            ),
+                        });
+                    }
+                    let mut buffer = self.spare.pop().unwrap_or_default();
+                    buffer.resize(tensor.nbytes, 0);
+                    requests.push(ReadRequest {
+                        shard: tensor.shard,
+                        offset: tensor.offset,
+                        buffer,
                     });
                 }
-                requests.push(ReadRequest {
-                    shard: tensor.shard,
-                    offset: tensor.offset,
-                    buffer: vec![0; tensor.nbytes],
-                });
             }
-        }
-        let start = Instant::now();
-        let buffers = index.read_batch(requests)?;
-        self.stats.read_s += start.elapsed().as_secs_f64();
-        self.stats.misses += missing.len() as u64;
-        self.stats.bytes_read += buffers.iter().map(|b| b.len() as u64).sum::<u64>();
-        for (&expert, parts) in missing.iter().zip(buffers.chunks_exact(3)) {
-            let slot = Slot {
-                key: (layer, expert),
-                w1: to_words(&parts[0]),
-                w3: to_words(&parts[1]),
-                w2: to_words(&parts[2]),
-                used: now,
-            };
-            let at = if self.slots.len() < self.capacity {
-                self.slots.push(slot);
-                self.slots.len() - 1
-            } else {
-                // Oldest slot not stamped `now` (the capacity holds a whole layer, so
-                // one always exists).
-                let victim = self
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.used != now)
-                    .min_by_key(|(_, s)| s.used)
-                    .map(|(i, _)| i)
-                    .expect("capacity holds every expert of one layer");
-                self.map.remove(&self.slots[victim].key);
-                self.slots[victim] = slot;
-                victim
-            };
-            self.map.insert((layer, expert), at);
+            let start = Instant::now();
+            let buffers = index.read_batch(requests)?;
+            self.stats.read_s += start.elapsed().as_secs_f64();
+            self.stats.misses += chunk.len() as u64;
+            self.stats.bytes_read += buffers.iter().map(|b| b.len() as u64).sum::<u64>();
+            for (&expert, parts) in chunk.iter().zip(buffers.chunks_exact(3)) {
+                let at = if self.slots.len() < self.capacity {
+                    self.slots.push(Slot {
+                        key: (layer, expert),
+                        w1: Weight::new(Vec::new(), inter, e),
+                        w3: Weight::new(Vec::new(), inter, e),
+                        w2: Weight::new(Vec::new(), e, inter),
+                        used: now,
+                    });
+                    self.slots.len() - 1
+                } else {
+                    // Oldest slot not stamped `now` (the capacity holds a whole layer, so
+                    // one always exists). Its word buffers are reused in place.
+                    let victim = self
+                        .slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| s.used != now)
+                        .min_by_key(|(_, s)| s.used)
+                        .map(|(i, _)| i)
+                        .expect("capacity holds every expert of one layer");
+                    self.map.remove(&self.slots[victim].key);
+                    let slot = &mut self.slots[victim];
+                    slot.key = (layer, expert);
+                    slot.used = now;
+                    victim
+                };
+                let slot = &mut self.slots[at];
+                words_into(&mut slot.w1.words, &parts[0]);
+                words_into(&mut slot.w3.words, &parts[1]);
+                words_into(&mut slot.w2.words, &parts[2]);
+                self.map.insert((layer, expert), at);
+            }
+            self.spare = buffers;
         }
         self.stats.slots = self.slots.len();
         Ok(())
@@ -496,7 +590,7 @@ pub struct LinearModel {
     pub config: LinearConfig,
     index: SafeTensorIndex,
     embed: Vec<u16>,
-    lm_head: Vec<u16>,
+    lm_head: Weight,
     norm: Vec<f32>,
     layers: Vec<Layer>,
     experts: ExpertStore,
@@ -548,10 +642,6 @@ fn softplus(x: f32) -> f32 {
     if x > 20.0 { x } else { x.exp().ln_1p() }
 }
 
-fn mul(w: &[u16], y: &mut [f32], x: &[f32], rows: usize, inp: usize, out: usize, accel: Accel<'_>) {
-    Matrix::Bf16(w).mul_rows(y, x, rows, inp, out, accel);
-}
-
 impl LinearModel {
     /// Indexes `directory`, reads its config and every non-expert tensor.
     /// `expert_budget_bytes` bounds the routed-expert cache; it is raised to hold at
@@ -573,15 +663,17 @@ impl LinearModel {
         let d = c.kda_head_dim;
         let k = c.short_conv_kernel_size;
         let qh = c.qk_nope_head_dim + c.qk_rope_head_dim;
+        let w = |name: &str, out: usize, inp: usize| -> Result<Weight, LinearError> {
+            Ok(Weight::new(matrix(&index, name, out, inp)?, out, inp))
+        };
         let mut layers = Vec::with_capacity(c.num_hidden_layers);
         for l in 0..c.num_hidden_layers {
             let at = |s: &str| format!("model.layers.{l}.{s}");
             let attn = if c.is_mla(l) {
                 let heads = c.num_attention_heads;
                 Attn::Mla(Box::new(Mla {
-                    q: matrix(&index, &at("self_attn.q_proj.weight"), heads * qh, e)?,
-                    kv_a: matrix(
-                        &index,
+                    q: w(&at("self_attn.q_proj.weight"), heads * qh, e)?,
+                    kv_a: w(
                         &at("self_attn.kv_a_proj_with_mqa.weight"),
                         c.kv_lora_rank + c.qk_rope_head_dim,
                         e,
@@ -591,31 +683,25 @@ impl LinearModel {
                         &at("self_attn.kv_a_layernorm.weight"),
                         c.kv_lora_rank,
                     )?,
-                    kv_b: matrix(
-                        &index,
+                    kv_b: w(
                         &at("self_attn.kv_b_proj.weight"),
                         heads * (c.qk_nope_head_dim + c.v_head_dim),
                         c.kv_lora_rank,
                     )?,
-                    o: matrix(
-                        &index,
-                        &at("self_attn.o_proj.weight"),
-                        e,
-                        heads * c.v_head_dim,
-                    )?,
+                    o: w(&at("self_attn.o_proj.weight"), e, heads * c.v_head_dim)?,
                 }))
             } else {
                 let heads = c.kda_num_heads;
                 Attn::Kda(Box::new(Kda {
-                    q: matrix(&index, &at("self_attn.q_proj.weight"), p, e)?,
-                    k: matrix(&index, &at("self_attn.k_proj.weight"), p, e)?,
-                    v: matrix(&index, &at("self_attn.v_proj.weight"), p, e)?,
-                    b: matrix(&index, &at("self_attn.b_proj.weight"), heads, e)?,
-                    f_a: matrix(&index, &at("self_attn.f_a_proj.weight"), d, e)?,
-                    f_b: matrix(&index, &at("self_attn.f_b_proj.weight"), p, d)?,
-                    g_a: matrix(&index, &at("self_attn.g_a_proj.weight"), d, e)?,
-                    g_b: matrix(&index, &at("self_attn.g_b_proj.weight"), p, d)?,
-                    o: matrix(&index, &at("self_attn.o_proj.weight"), e, p)?,
+                    q: w(&at("self_attn.q_proj.weight"), p, e)?,
+                    k: w(&at("self_attn.k_proj.weight"), p, e)?,
+                    v: w(&at("self_attn.v_proj.weight"), p, e)?,
+                    b: w(&at("self_attn.b_proj.weight"), heads, e)?,
+                    f_a: w(&at("self_attn.f_a_proj.weight"), d, e)?,
+                    f_b: w(&at("self_attn.f_b_proj.weight"), p, d)?,
+                    g_a: w(&at("self_attn.g_a_proj.weight"), d, e)?,
+                    g_b: w(&at("self_attn.g_b_proj.weight"), p, d)?,
+                    o: w(&at("self_attn.o_proj.weight"), e, p)?,
                     q_conv: vector(&index, &at("self_attn.q_conv1d.weight"), p * k)?,
                     k_conv: vector(&index, &at("self_attn.k_conv1d.weight"), p * k)?,
                     v_conv: vector(&index, &at("self_attn.v_conv1d.weight"), p * k)?,
@@ -626,9 +712,9 @@ impl LinearModel {
             };
             let mlp = |prefix: &str, inter: usize| -> Result<Mlp, LinearError> {
                 Ok(Mlp {
-                    gate: matrix(&index, &at(&format!("{prefix}.gate_proj.weight")), inter, e)?,
-                    up: matrix(&index, &at(&format!("{prefix}.up_proj.weight")), inter, e)?,
-                    down: matrix(&index, &at(&format!("{prefix}.down_proj.weight")), e, inter)?,
+                    gate: w(&at(&format!("{prefix}.gate_proj.weight")), inter, e)?,
+                    up: w(&at(&format!("{prefix}.up_proj.weight")), inter, e)?,
+                    down: w(&at(&format!("{prefix}.down_proj.weight")), e, inter)?,
                     inter,
                 })
             };
@@ -660,7 +746,7 @@ impl LinearModel {
             });
         }
         let embed = matrix(&index, "model.embed_tokens.weight", c.vocab_size, e)?;
-        let lm_head = matrix(&index, "lm_head.weight", c.vocab_size, e)?;
+        let lm_head = w("lm_head.weight", c.vocab_size, e)?;
         let norm = vector(&index, "model.norm.weight", e)?;
         let capacity = (expert_budget_bytes / c.expert_bytes()).max(c.num_experts);
         Ok(Self {
@@ -670,6 +756,7 @@ impl LinearModel {
                 map: HashMap::new(),
                 clock: 0,
                 stats: ExpertStats::default(),
+                spare: Vec::new(),
             },
             config,
             index,
@@ -797,7 +884,7 @@ impl LinearModel {
                 rmsnorm(y, x, &layer.post_norm, c.rms_norm_eps);
             }
             match &layer.ffn {
-                Ffn::Dense(m) => mlp(&mut tmp, &hin, m, e, t, accel),
+                Ffn::Dense(m) => mlp(&mut tmp, &hin, m, t, accel),
                 Ffn::Moe { gate, bias, shared } => {
                     moe(
                         &mut tmp,
@@ -822,19 +909,19 @@ impl LinearModel {
         let mut normed = vec![0.0_f32; e];
         rmsnorm(&mut normed, &h[(t - 1) * e..], &self.norm, c.rms_norm_eps);
         let mut logits = vec![0.0_f32; c.vocab_size];
-        mul(
-            &self.lm_head,
-            &mut logits,
-            &normed,
-            1,
-            e,
-            c.vocab_size,
+        products(
             accel,
+            &mut [Mul {
+                x: &normed,
+                rows: 1,
+                parts: vec![(&self.lm_head, &mut logits)],
+            }],
         );
         Ok(logits)
     }
 }
 
+#[allow(clippy::too_many_lines)] // one attention block, read top to bottom
 fn kda(
     out: &mut [f32],
     x: &[f32],
@@ -845,7 +932,6 @@ fn kda(
     conv: &mut [f32],
     accel: Accel<'_>,
 ) {
-    let e = c.hidden_size;
     let heads = c.kda_num_heads;
     let d = c.kda_head_dim;
     let p = heads * d;
@@ -858,12 +944,39 @@ fn kda(
     let mut bt = vec![0.0_f32; t * heads];
     let mut fa = vec![0.0_f32; t * d];
     let mut z = vec![0.0_f32; t * p];
-    mul(&w.q, &mut q, x, t, e, p, accel);
-    mul(&w.k, &mut kk, x, t, e, p, accel);
-    mul(&w.v, &mut v, x, t, e, p, accel);
-    mul(&w.b, &mut bt, x, t, e, heads, accel);
-    mul(&w.f_a, &mut fa, x, t, e, d, accel);
-    mul(&w.f_b, &mut z, &fa, t, d, p, accel);
+    let mut ga = vec![0.0_f32; t * d];
+    let mut gb = vec![0.0_f32; t * p];
+    // Everything read from `x` (the output gate's g_a too), then both low-rank halves.
+    products(
+        accel,
+        &mut [Mul {
+            x,
+            rows: t,
+            parts: vec![
+                (&w.q, &mut q),
+                (&w.k, &mut kk),
+                (&w.v, &mut v),
+                (&w.b, &mut bt),
+                (&w.f_a, &mut fa),
+                (&w.g_a, &mut ga),
+            ],
+        }],
+    );
+    products(
+        accel,
+        &mut [
+            Mul {
+                x: &fa,
+                rows: t,
+                parts: vec![(&w.f_b, &mut z)],
+            },
+            Mul {
+                x: &ga,
+                rows: t,
+                parts: vec![(&w.g_b, &mut gb)],
+            },
+        ],
+    );
 
     let (qs, rest) = conv.split_at_mut(p * hist);
     let (ks, vs) = rest.split_at_mut(p * hist);
@@ -913,10 +1026,6 @@ fn kda(
         }
     }
     // Output: per-head RMSNorm, times sigmoid of the low-rank gate g_b(g_a(x)).
-    let mut ga = vec![0.0_f32; t * d];
-    let mut gb = vec![0.0_f32; t * p];
-    mul(&w.g_a, &mut ga, x, t, e, d, accel);
-    mul(&w.g_b, &mut gb, &ga, t, d, p, accel);
     for step in 0..t {
         let row = &mut o[step * p..(step + 1) * p];
         for hh in 0..heads {
@@ -926,7 +1035,14 @@ fn kda(
             *oi *= sigmoid(gi);
         }
     }
-    mul(&w.o, out, &o, t, p, e, accel);
+    products(
+        accel,
+        &mut [Mul {
+            x: &o,
+            rows: t,
+            parts: vec![(&w.o, out)],
+        }],
+    );
 }
 
 fn mla(
@@ -940,7 +1056,6 @@ fn mla(
     cached: usize,
     accel: Accel<'_>,
 ) {
-    let e = c.hidden_size;
     let heads = c.num_attention_heads;
     let qn = c.qk_nope_head_dim;
     let qr = c.qk_rope_head_dim;
@@ -954,8 +1069,14 @@ fn mla(
     let mut q = vec![0.0_f32; t * heads * qh];
     let mut ct = vec![0.0_f32; t * kvw];
     let mut ckv = vec![0.0_f32; t * kvr];
-    mul(&w.q, &mut q, x, t, e, heads * qh, accel);
-    mul(&w.kv_a, &mut ct, x, t, e, kvw, accel);
+    products(
+        accel,
+        &mut [Mul {
+            x,
+            rows: t,
+            parts: vec![(&w.q, &mut q), (&w.kv_a, &mut ct)],
+        }],
+    );
     for step in 0..t {
         let pos = cached + step;
         let row = &mut ct[step * kvw..(step + 1) * kvw];
@@ -963,14 +1084,16 @@ fn mla(
         rope[pos * qr..(pos + 1) * qr].copy_from_slice(&row[kvr..]);
         ckv[step * kvr..(step + 1) * kvr].copy_from_slice(&row[..kvr]);
     }
-    mul(
-        &w.kv_b,
-        &mut kv[cached * heads * kvd..(cached + t) * heads * kvd],
-        &ckv,
-        t,
-        kvr,
-        heads * kvd,
+    products(
         accel,
+        &mut [Mul {
+            x: &ckv,
+            rows: t,
+            parts: vec![(
+                &w.kv_b,
+                &mut kv[cached * heads * kvd..(cached + t) * heads * kvd],
+            )],
+        }],
     );
 
     let mut acc = vec![0.0_f32; t * heads * vh];
@@ -1008,33 +1131,40 @@ fn mla(
             }
         }
     }
-    mul(&w.o, out, &acc, t, heads * vh, e, accel);
+    products(
+        accel,
+        &mut [Mul {
+            x: &acc,
+            rows: t,
+            parts: vec![(&w.o, out)],
+        }],
+    );
 }
 
 /// `down(SiLU(gate x) * up x)` for `t` rows.
-fn swiglu(
-    out: &mut [f32],
-    x: &[f32],
-    (gate, up, down): (&[u16], &[u16], &[u16]),
-    e: usize,
-    inter: usize,
-    t: usize,
-    accel: Accel<'_>,
-) {
-    let mut g = vec![0.0_f32; t * inter];
-    let mut u = vec![0.0_f32; t * inter];
-    mul(gate, &mut g, x, t, e, inter, accel);
-    mul(up, &mut u, x, t, e, inter, accel);
-    for (gi, &ui) in g.iter_mut().zip(&u) {
-        *gi = silu(*gi) * ui;
-    }
-    mul(down, out, &g, t, inter, e, accel);
+fn mlp(out: &mut [f32], x: &[f32], m: &Mlp, t: usize, accel: Accel<'_>) {
+    let mut g = vec![0.0_f32; t * m.inter];
+    let mut u = vec![0.0_f32; t * m.inter];
+    products(
+        accel,
+        &mut [Mul {
+            x,
+            rows: t,
+            parts: vec![(&m.gate, &mut g), (&m.up, &mut u)],
+        }],
+    );
+    silu_mul(&mut g, &u);
+    products(
+        accel,
+        &mut [Mul {
+            x: &g,
+            rows: t,
+            parts: vec![(&m.down, out)],
+        }],
+    );
 }
 
-fn mlp(out: &mut [f32], x: &[f32], m: &Mlp, e: usize, t: usize, accel: Accel<'_>) {
-    swiglu(out, x, (&m.gate, &m.up, &m.down), e, m.inter, t, accel);
-}
-
+#[allow(clippy::too_many_lines)] // routing, both expert halves, then the mix
 fn moe(
     out: &mut [f32],
     x: &[f32],
@@ -1075,34 +1205,68 @@ fn moe(
     }
     experts.ensure(index, c, layer, &uniq)?;
 
-    // Each expert once, over every (token, slot) that selected it.
-    let mut contrib = vec![0.0_f32; t * topk * e];
-    let mut slots = Vec::with_capacity(t);
-    let mut zs = Vec::with_capacity(t * e);
-    let mut ys = vec![0.0_f32; t * e];
-    for &expert in &uniq {
-        slots.clear();
-        zs.clear();
-        for (slot, &selected) in idx.iter().enumerate() {
-            if selected == expert {
-                slots.push(slot);
-                let step = slot / topk;
-                zs.extend_from_slice(&x[step * e..(step + 1) * e]);
-            }
-        }
-        let n = slots.len();
+    // Each expert once, over every (token, slot) that selected it, in slot order.
+    let mut at = vec![usize::MAX; c.num_experts];
+    for (i, &expert) in uniq.iter().enumerate() {
+        at[expert] = i;
+    }
+    let mut slots = vec![Vec::new(); uniq.len()];
+    for (slot, &selected) in idx.iter().enumerate() {
+        slots[at[selected]].push(slot);
+    }
+    let zs: Vec<Vec<f32>> = slots
+        .iter()
+        .map(|s| {
+            s.iter()
+                .flat_map(|&slot| &x[slot / topk * e..(slot / topk + 1) * e])
+                .copied()
+                .collect()
+        })
+        .collect();
+    let zeros = |width: usize| -> Vec<Vec<f32>> {
+        slots.iter().map(|s| vec![0.0; s.len() * width]).collect()
+    };
+    let (mut g, mut u, mut ys) = (zeros(inter), zeros(inter), zeros(e));
+    let mut sg = vec![0.0_f32; t * shared.inter];
+    let mut su = vec![0.0_f32; t * shared.inter];
+    let mut sdn = vec![0.0_f32; t * e];
+    let mut muls = vec![Mul {
+        x,
+        rows: t,
+        parts: vec![(&shared.gate, &mut sg), (&shared.up, &mut su)],
+    }];
+    for (((z, gi), ui), &expert) in zs.iter().zip(&mut g).zip(&mut u).zip(&uniq) {
         let w = experts.get(layer, expert);
-        swiglu(
-            &mut ys[..n * e],
-            &zs,
-            (&w.w1, &w.w3, &w.w2),
-            e,
-            inter,
-            n,
-            accel,
-        );
-        for (r, &slot) in slots.iter().enumerate() {
-            contrib[slot * e..(slot + 1) * e].copy_from_slice(&ys[r * e..(r + 1) * e]);
+        muls.push(Mul {
+            x: z,
+            rows: z.len() / e,
+            parts: vec![(&w.w1, gi), (&w.w3, ui)],
+        });
+    }
+    products(accel, &mut muls);
+    silu_mul(&mut sg, &su);
+    for (gi, ui) in g.iter_mut().zip(&u) {
+        silu_mul(gi, ui);
+    }
+    let mut muls = vec![Mul {
+        x: &sg,
+        rows: t,
+        parts: vec![(&shared.down, &mut sdn)],
+    }];
+    for ((gi, yi), &expert) in g.iter().zip(&mut ys).zip(&uniq) {
+        let w = experts.get(layer, expert);
+        muls.push(Mul {
+            x: gi,
+            rows: gi.len() / inter,
+            parts: vec![(&w.w2, yi)],
+        });
+    }
+    products(accel, &mut muls);
+
+    let mut contrib = vec![0.0_f32; t * topk * e];
+    for (s, yi) in slots.iter().zip(&ys) {
+        for (r, &slot) in s.iter().enumerate() {
+            contrib[slot * e..(slot + 1) * e].copy_from_slice(&yi[r * e..(r + 1) * e]);
         }
     }
     for step in 0..t {
@@ -1115,8 +1279,6 @@ fn moe(
             }
         }
     }
-    let mut sdn = vec![0.0_f32; t * e];
-    mlp(&mut sdn, x, shared, e, t, accel);
     for (oi, &si) in out[..t * e].iter_mut().zip(&sdn) {
         *oi += si;
     }
@@ -1170,6 +1332,26 @@ mod tests {
         let mut root = config_json();
         root.as_object_mut().unwrap().remove("rms_norm_eps");
         assert!(LinearConfig::from_value(&root).is_err());
+    }
+
+    #[test]
+    fn words_are_little_endian_pairs() {
+        assert_eq!(to_words(&[0x34, 0x12, 0xCD, 0xAB, 0xFF]), [0x1234, 0xABCD]);
+    }
+
+    /// `cargo test --release -p kimi-k3-core --lib -- --ignored --nocapture word_rate`
+    #[test]
+    #[ignore = "timing only"]
+    fn word_rate() {
+        let raw: Vec<u8> = (0..512_u32 << 20).map(|i| (i * 31) as u8).collect();
+        let start = Instant::now();
+        let words = std::hint::black_box(to_words(std::hint::black_box(&raw)));
+        let s = start.elapsed().as_secs_f64();
+        assert_eq!(
+            words[words.len() - 1],
+            u16::from_le_bytes([raw[raw.len() - 2], raw[raw.len() - 1]])
+        );
+        println!("to_words: {:.1} GB/s", raw.len() as f64 / s / 1e9);
     }
 
     #[test]
