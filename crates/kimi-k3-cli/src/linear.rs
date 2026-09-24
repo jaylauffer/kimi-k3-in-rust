@@ -12,7 +12,7 @@ use std::time::Instant;
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
 use loadngo_inference::tools::{FsTools, Toolbox};
 
-use crate::{Args, accel, chat, quality, thermal};
+use crate::{Args, accel, chat, convert, quality, thermal};
 
 /// Default routed-expert cache when `--cache-gb` is not given: about a quarter of the
 /// 48B model's 94 GB of bf16 experts, leaving room for the ~4 GB trunk on a 64 GB Mac.
@@ -92,6 +92,10 @@ pub fn run(
 ) -> Result<(), String> {
     if args.recompute || args.layers.is_some() {
         return Err("--recompute and --layers are K3-only; run --help".into());
+    }
+    if let Some(out) = &args.convert_experts {
+        let mut gate = thermal::Gate::new()?;
+        return convert::run(&args.model_dir, out, &mut gate, cancel);
     }
     let cache_gb = if args.cache_gb_given {
         args.cache_gb

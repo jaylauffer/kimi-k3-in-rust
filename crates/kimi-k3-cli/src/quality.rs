@@ -64,7 +64,7 @@ impl Comparison {
 }
 
 /// Rounds each 32-element block of every `cols`-wide row to MXFP4 and back to bf16.
-fn mxfp4_round_trip(words: &mut [u16], cols: usize) {
+pub(crate) fn mxfp4_round_trip(words: &mut [u16], cols: usize) {
     let mut block = [0.0_f32; BLOCK_SIZE];
     let mut packed = [0_u8; BLOCK_SIZE / 2];
     for row in words.chunks_exact_mut(cols) {

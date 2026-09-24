@@ -25,6 +25,7 @@ use std::time::Instant;
 
 mod accel;
 mod chat;
+mod convert;
 mod linear;
 mod quality;
 mod thermal;
@@ -72,6 +73,7 @@ struct Args {
     no_tools: bool,
     experts: quality::ExpertFormat,
     compare: Option<quality::Comparison>,
+    convert_experts: Option<PathBuf>,
 }
 
 impl Args {
@@ -100,6 +102,7 @@ impl Args {
         let mut no_tools = false;
         let mut experts = quality::ExpertFormat::Bf16;
         let mut compare = None;
+        let mut convert_experts = None;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -135,6 +138,12 @@ impl Args {
                 "--no-tools" => no_tools = true,
                 "--experts" => {
                     experts = quality::ExpertFormat::parse(&next_value(&mut raw, "--experts")?)?;
+                }
+                "--convert-experts-mxfp4" => {
+                    convert_experts = Some(PathBuf::from(next_value(
+                        &mut raw,
+                        "--convert-experts-mxfp4",
+                    )?));
                 }
                 "--compare" => {
                     compare = Some(quality::Comparison::parse(&next_value(
@@ -200,6 +209,7 @@ impl Args {
             no_tools,
             experts,
             compare,
+            convert_experts,
         })
     }
 }
@@ -261,6 +271,8 @@ fn print_usage() {
          \x20 --compare mxfp4|cpu  optional, Kimi Linear, with --prompt-file: score the text\n\
          \x20                      twice (bf16 vs mxfp4 experts, or CPU vs --accel) and print\n\
          \x20                      perplexity, top-1 agreement and KL divergence\n\
+         \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
+         \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
          \x20 --accel cpu|ane      optional device for the bf16 trunk products (default cpu,\n\

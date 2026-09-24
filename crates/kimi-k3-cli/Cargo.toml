@@ -24,6 +24,7 @@ data = { path = "../../../loadngo/data" }
 # Thermal pressure before every forward pass; the proactor waits while paused.
 loadngo-thermal = { path = "../../../loadngo/thermal" }
 loadngo-weights = { path = "../../../loadngo/weights" }
+serde_json = "1.0"
 loadngo-proactor = { path = "../../../loadngo/proactor" }
 ctrlc = "3.5"
 
