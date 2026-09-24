@@ -26,6 +26,7 @@ use std::time::Instant;
 mod accel;
 mod chat;
 mod linear;
+mod quality;
 mod thermal;
 
 use kimi_k3_core::{
@@ -69,6 +70,8 @@ struct Args {
     cas_root: Option<PathBuf>,
     cas_key: Option<PathBuf>,
     no_tools: bool,
+    experts: quality::ExpertFormat,
+    compare: Option<quality::Comparison>,
 }
 
 impl Args {
@@ -95,6 +98,8 @@ impl Args {
         let mut cas_root = None;
         let mut cas_key = None;
         let mut no_tools = false;
+        let mut experts = quality::ExpertFormat::Bf16;
+        let mut compare = None;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -128,6 +133,15 @@ impl Args {
                 "--layers" => layers = Some(parse_arg(&mut raw, "--layers")?),
                 "--recompute" => recompute = true,
                 "--no-tools" => no_tools = true,
+                "--experts" => {
+                    experts = quality::ExpertFormat::parse(&next_value(&mut raw, "--experts")?)?;
+                }
+                "--compare" => {
+                    compare = Some(quality::Comparison::parse(&next_value(
+                        &mut raw,
+                        "--compare",
+                    )?)?);
+                }
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
                 "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
@@ -184,6 +198,8 @@ impl Args {
             cas_root,
             cas_key,
             no_tools,
+            experts,
+            compare,
         })
     }
 }
@@ -240,6 +256,11 @@ fn print_usage() {
          \x20                      root that verifies against --cas-key (a public key)\n\
          \x20 --cas-key PATH       optional: trusted Dilithium public key for --cas-root\n\
          \x20 --no-tools           optional: chat without file tools\n\
+         \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
+         \x20                      as they load, to judge its quality (not faster; default bf16)\n\
+         \x20 --compare mxfp4|cpu  optional, Kimi Linear, with --prompt-file: score the text\n\
+         \x20                      twice (bf16 vs mxfp4 experts, or CPU vs --accel) and print\n\
+         \x20                      perplexity, top-1 agreement and KL divergence\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
          \x20 --accel cpu|ane      optional device for the bf16 trunk products (default cpu,\n\

@@ -125,6 +125,63 @@ Measured through `launch-kimi-k3.sh`, piping "What is the capital of Japan?", `/
 The 66 s is paid once per launch. Saving the snapshot to disk, keyed by checkpoint,
 accelerator and declaration, would remove it too; that is not built.
 
+### 4-bit (MXFP4) routed experts: quality, measured 2026-09-25
+
+No checkpoint has been converted. `--experts mxfp4` rounds each routed expert to OCP MX
+v1.0 MXFP4 as it enters the cache and writes it back as bf16. bf16 holds every MXFP4
+value exactly, so the forward pass computes what a converted checkpoint would.
+
+`--compare mxfp4 --prompt-file F` scores a text twice in one process: bf16 experts,
+then MXFP4 experts. Both runs use `--accel ane`, so the only difference is the experts.
+`--compare cpu` measures the Neural Engine's own fp16 effect against the CPU reference,
+both bf16, as a baseline.
+
+The encoder is `loadngo-weights` `mxfp4::quantize_block`: the spec's shared scale,
+round-to-nearest-even, clamped at +-6. Every run was paced, and macOS thermal state
+was 0 (nominal) before each one.
+
+| Text | Tokens | Perplexity, bf16 -> MXFP4 | Top-1 agreement | Mean KL (nats) | Next token correct |
+|---|---|---|---|---|---|
+| English prose (loadngo README) | 552 | 21.24 -> 21.56 (+1.5%) | 91.5% | 0.020 | 48.3% -> 47.4% |
+| Rust code (loadngo `proactor/src/lib.rs`) | 627 | 4.02 -> 4.10 (+2.0%) | 96.2% | 0.016 | 70.9% -> 70.8% |
+| Chinese (《桃花源记》 + a modern paragraph) | 318 | 2.08 -> 2.11 (+1.5%) | 97.8% | 0.011 | 85.5% -> 85.5% |
+| README start, same 130 tokens as the baseline | 130 | 75.97 -> 77.15 (+1.6%) | 88.4% | 0.030 | 30.2% -> 28.7% |
+| Baseline, CPU vs Neural Engine, both bf16 (README start) | 130 | 78.12 -> 75.97 (-2.8%) | 93.0% | 0.012 | 29.5% -> 30.2% |
+
+What the numbers say:
+
+- **4-bit experts cost about 1.5-2% perplexity.** The chance of predicting the actual
+  next token changed by at most 0.9 points.
+- **The change is larger than the fp16 Neural Engine path already makes.** On the same
+  130 tokens, MXFP4 moved the distributions about 2.5 times as far as fp16 does
+  against the CPU (mean KL 0.030 against 0.012; top-1 agreement 88.4% against 93.0%).
+  Across the longer texts the top choice agrees at 91.5-97.8% of positions.
+- **Caveats.** The Chinese passage is famous and likely memorised, so it is an easy
+  case. Perplexity does not measure answer quality over a long generation. The
+  listening test (below) is not run yet.
+
+Checks:
+
+- Rerunning the Chinese comparison after the encoder was rewritten branchless reproduced
+  every number exactly.
+- That rewrite made rounding an expert about 3x faster: the 4-bit pass took 125 s
+  instead of 390 s.
+
+Not measured yet: speed. It needs the converted checkpoint (about 25 GB of experts, all
+resident) and a pipelined MXFP4 path in `DenseEngine`. Estimate, not measurement: it
+removes the drive reads from prompt processing (23 s of the 58 s pass) and from decode
+cache misses.
+
+Listening test, ready to run (bf16 then MXFP4, the same four questions, two in English
+and two in Mandarin, with `/reset` between them):
+
+```
+k3 <kimi-linear-dir> --chat --accel ane --no-tools --gen 160 --experts bf16  < questions.txt
+k3 <kimi-linear-dir> --chat --accel ane --no-tools --gen 160 --experts mxfp4 < questions.txt
+```
+
+The Mandarin answers can be played aloud with `say -v Tingting "<text>"`.
+
 ### What limits it now
 
 - **Decoding** is about 0.4 s/token of Neural Engine time, spent streaming ~6 GB of

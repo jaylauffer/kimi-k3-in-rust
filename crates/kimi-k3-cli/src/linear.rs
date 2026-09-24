@@ -12,7 +12,7 @@ use std::time::Instant;
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
 use loadngo_inference::tools::{FsTools, Toolbox};
 
-use crate::{Args, accel, chat, thermal};
+use crate::{Args, accel, chat, quality, thermal};
 
 /// Default routed-expert cache when `--cache-gb` is not given: about a quarter of the
 /// 48B model's 94 GB of bf16 experts, leaving room for the ~4 GB trunk on a 64 GB Mac.
@@ -117,6 +117,25 @@ pub fn run(
         CHAT_GEN
     };
     let mut gate = thermal::Gate::new()?;
+    if let Some(comparison) = args.compare {
+        let text = prompt.ok_or("--compare needs --prompt-file (or --prompt)")?;
+        return quality::compare(
+            comparison,
+            &mut model,
+            device.accel(),
+            tokenizer,
+            text,
+            &mut gate,
+            cancel,
+        );
+    }
+    if args.experts != quality::ExpertFormat::Bf16 {
+        eprintln!(
+            "  routed experts rounded to {:?} as they load (quality evaluation)",
+            args.experts
+        );
+        model.set_expert_transform(args.experts.transform());
+    }
     let mut session = model.session(max_context);
     let keep = || !cancel.load(Ordering::Relaxed);
 

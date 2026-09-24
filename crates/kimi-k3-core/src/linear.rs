@@ -468,6 +468,11 @@ struct Slot {
     used: u64,
 }
 
+/// Rewrites an expert matrix's bf16 words as it enters the cache (`words` is
+/// `[rows][cols]`), for evaluating another storage format with this checkpoint: for
+/// example rounding each block to MXFP4 and back, which bf16 holds exactly.
+pub type ExpertTransform = Box<dyn Fn(&mut [u16], usize)>;
+
 /// Experts read per batch: enough requests in flight to keep the drive busy, while the
 /// read buffers stay a bounded pool (96 buffers, ~450 MB for the 48B model).
 const READ_CHUNK: usize = 32;
@@ -478,6 +483,7 @@ struct ExpertStore {
     map: HashMap<(usize, usize), usize>,
     clock: u64,
     stats: ExpertStats,
+    transform: Option<ExpertTransform>,
     /// Read buffers kept between batches. Allocating fresh ones for every miss cost
     /// ~14 million page faults (49 s of kernel time) in a 639-token prompt pass.
     spare: Vec<Vec<u8>>,
@@ -572,6 +578,11 @@ impl ExpertStore {
                 words_into(&mut slot.w1.words, &parts[0]);
                 words_into(&mut slot.w3.words, &parts[1]);
                 words_into(&mut slot.w2.words, &parts[2]);
+                if let Some(transform) = &self.transform {
+                    for w in [&mut slot.w1, &mut slot.w3, &mut slot.w2] {
+                        transform(&mut w.words, w.inp);
+                    }
+                }
                 self.map.insert((layer, expert), at);
             }
             self.spare = buffers;
@@ -759,6 +770,7 @@ impl LinearModel {
                 map: HashMap::new(),
                 clock: 0,
                 stats: ExpertStats::default(),
+                transform: None,
                 spare: Vec::new(),
             },
             config,
@@ -768,6 +780,19 @@ impl LinearModel {
             norm,
             layers,
         })
+    }
+
+    /// Applies `transform` to every expert from now on and forgets every cached one,
+    /// so no expert read before the change is used after it. The slots' memory stays
+    /// allocated and is overwritten as they are reused, not freed and faulted in again.
+    pub fn set_expert_transform(&mut self, transform: Option<ExpertTransform>) {
+        let store = &mut self.experts;
+        store.transform = transform;
+        store.map.clear();
+        for slot in &mut store.slots {
+            // No live key, so evicting it later cannot unmap a fresh copy elsewhere.
+            slot.key = (usize::MAX, usize::MAX);
+        }
     }
 
     #[must_use]
@@ -834,8 +859,45 @@ impl LinearModel {
                 capacity: session.capacity,
             });
         }
-        let result = self.run(session, ids, accel, &mut keep_running);
+        let result = self.run(session, ids, accel, false, &mut keep_running);
         match result {
+            Ok(logits) => {
+                session.ids.extend_from_slice(ids);
+                Ok(logits)
+            }
+            Err(error) => {
+                session.broken = true;
+                Err(error)
+            }
+        }
+    }
+
+    /// As [`Self::feed`], returning the logits after every one of `ids` (`[ids][vocab]`),
+    /// for scoring a text: row `i` predicts the token after `ids[i]`.
+    ///
+    /// # Errors
+    /// As [`Self::feed`].
+    pub fn score(
+        &mut self,
+        session: &mut LinearSession,
+        ids: &[u32],
+        accel: Accel<'_>,
+        mut keep_running: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>, LinearError> {
+        if session.broken {
+            return Err(LinearError::BrokenSession);
+        }
+        if ids.is_empty()
+            || session.ids.len() + ids.len() > session.capacity
+            || ids.iter().any(|&id| id as usize >= self.config.vocab_size)
+        {
+            return Err(LinearError::Capacity {
+                have: session.ids.len(),
+                add: ids.len(),
+                capacity: session.capacity,
+            });
+        }
+        match self.run(session, ids, accel, true, &mut keep_running) {
             Ok(logits) => {
                 session.ids.extend_from_slice(ids);
                 Ok(logits)
@@ -852,6 +914,7 @@ impl LinearModel {
         session: &mut LinearSession,
         ids: &[u32],
         accel: Accel<'_>,
+        all_logits: bool,
         keep_running: &mut dyn FnMut() -> bool,
     ) -> Result<Vec<f32>, LinearError> {
         let c = &self.config;
@@ -909,14 +972,21 @@ impl LinearModel {
         if !keep_running() {
             return Err(LinearError::Cancelled);
         }
-        let mut normed = vec![0.0_f32; e];
-        rmsnorm(&mut normed, &h[(t - 1) * e..], &self.norm, c.rms_norm_eps);
-        let mut logits = vec![0.0_f32; c.vocab_size];
+        let first = if all_logits { 0 } else { t - 1 };
+        let rows = t - first;
+        let mut normed = vec![0.0_f32; rows * e];
+        for (y, x) in normed
+            .chunks_exact_mut(e)
+            .zip(h[first * e..].chunks_exact(e))
+        {
+            rmsnorm(y, x, &self.norm, c.rms_norm_eps);
+        }
+        let mut logits = vec![0.0_f32; rows * c.vocab_size];
         products(
             accel,
             &mut [Mul {
                 x: &normed,
-                rows: 1,
+                rows,
                 parts: vec![(&self.lm_head, &mut logits)],
             }],
         );
