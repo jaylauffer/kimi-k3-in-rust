@@ -158,7 +158,7 @@ What the numbers say:
   Across the longer texts the top choice agrees at 91.5-97.8% of positions.
 - **Caveats.** The Chinese passage is famous and likely memorised, so it is an easy
   case. Perplexity does not measure answer quality over a long generation. The
-  listening test (below) is not run yet.
+  listening test (below) found no visible loss, but it is small.
 
 Checks:
 
@@ -178,6 +178,19 @@ k3 <kimi-linear-dir> --chat --accel ane --no-tools --gen 160 --experts mxfp4 < q
 ```
 
 The Mandarin answers can be played aloud with `say -v Tingting "<text>"`.
+
+Run 2026-09-25 with `~/pudding/kimi-listening-test.sh` (transcripts in
+`~/pudding/kimi-listening-test/`):
+
+- All eight answers are correct. Both Rust functions are right; both Beijing answers
+  are accurate; both explanations of AI are sound.
+- The 4-bit answers were shorter in two cases: the Rust answer has no usage example,
+  and the AI explanation gives no everyday examples. Nothing in them is wrong.
+- Jay listened to the Mandarin answers read aloud: "To the best of my ability it
+  sounded okay." He understands some spoken Mandarin and says he is not a reliable
+  judge, so this is not a conclusive check of Mandarin quality.
+- Reply times were 17-35 s with 4-bit experts and 40-108 s with bf16 (the bf16 run
+  started with a cold cache). Both are too slow for conversation.
 
 ### 4-bit experts in use (2026-09-25): converted, resident, measured
 
