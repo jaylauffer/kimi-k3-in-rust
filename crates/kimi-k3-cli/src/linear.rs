@@ -17,6 +17,11 @@ use crate::{Args, accel, chat};
 /// 48B model's 94 GB of bf16 experts, leaving room for the ~4 GB trunk on a 64 GB Mac.
 const DEFAULT_CACHE_GB: f64 = 24.0;
 
+/// Chat defaults when `--gen`/`--max-context` are not given. K3's 64/512 made replies
+/// stop mid-sentence here; this model's context state is ~0.23 MB per token.
+const CHAT_GEN: usize = 1024;
+const CHAT_CONTEXT: usize = 4096;
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn gib(value: f64) -> usize {
     (value * 1024.0 * 1024.0 * 1024.0) as usize
@@ -53,7 +58,17 @@ pub fn run(
     let mut model = LinearModel::load(&args.model_dir, gib(cache_gb)).map_err(|e| e.to_string())?;
     eprintln!("  resident weights loaded in {:.1?}", start.elapsed());
     let device = accel::Device::open(args.accel)?;
-    let mut session = model.session(args.max_context);
+    let max_context = if args.max_context_given {
+        args.max_context
+    } else {
+        CHAT_CONTEXT
+    };
+    let gen_tokens = if args.gen_given || !args.chat {
+        args.gen_tokens
+    } else {
+        CHAT_GEN
+    };
+    let mut session = model.session(max_context);
     let keep = || !cancel.load(Ordering::Relaxed);
 
     if args.chat {
@@ -70,8 +85,8 @@ pub fn run(
         return chat::run_with(
             &format,
             tokenizer,
-            args.max_context,
-            args.gen_tokens,
+            max_context,
+            gen_tokens,
             cancel,
             generating,
             io::stdin().lock(),
@@ -100,14 +115,10 @@ pub fn run(
 
     let prompt = prompt.ok_or("one-shot mode needs --prompt")?;
     let mut ids = tokenizer.encode(prompt);
-    if ids.is_empty() || ids.len() + args.gen_tokens > args.max_context {
+    if ids.is_empty() || ids.len() + gen_tokens > max_context {
         return Err("prompt is empty, or prompt plus --gen exceeds --max-context".into());
     }
-    eprintln!(
-        "prompt: {} tokens, generating {}...",
-        ids.len(),
-        args.gen_tokens
-    );
+    eprintln!("prompt: {} tokens, generating {}...", ids.len(), gen_tokens);
     generating.store(true, Ordering::Relaxed);
     let mut decoder = loadngo_inference::Utf8Stream::default();
     print!("{}", tokenizer.decode_lossy(&ids));
@@ -115,7 +126,7 @@ pub fn run(
     let started = Instant::now();
     let mut decode_s = 0.0;
     let mut generated = 0;
-    for step in 0..args.gen_tokens {
+    for step in 0..gen_tokens {
         let pass = Instant::now();
         let new = &ids[session.ids().len()..];
         let logits = model

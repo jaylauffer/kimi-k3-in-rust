@@ -45,11 +45,13 @@ fn main() {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)] // one per CLI flag, and whether it was given
 struct Args {
     model_dir: PathBuf,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
     gen_tokens: usize,
+    gen_given: bool,
     pin_layers: usize,
     ring_slots: usize,
     cache_gb: f64,
@@ -59,6 +61,7 @@ struct Args {
     layers: Option<usize>,
     chat: bool,
     max_context: usize,
+    max_context_given: bool,
     accel: accel::AccelKind,
     recompute: bool,
 }
@@ -79,6 +82,7 @@ impl Args {
         let mut layers = None;
         let mut chat = false;
         let mut max_context = 512;
+        let mut max_context_given = false;
         let mut accel = accel::AccelKind::Cpu;
         let mut recompute = false;
 
@@ -95,7 +99,10 @@ impl Args {
                 }
                 "--prompt" => prompt = Some(next_value(&mut raw, "--prompt")?),
                 "--chat" => chat = true,
-                "--max-context" => max_context = parse_arg(&mut raw, "--max-context")?,
+                "--max-context" => {
+                    max_context = parse_arg(&mut raw, "--max-context")?;
+                    max_context_given = true;
+                }
                 "--prompt-file" => {
                     prompt_file = Some(PathBuf::from(next_value(&mut raw, "--prompt-file")?));
                 }
@@ -129,6 +136,7 @@ impl Args {
         if chat && (prompt.is_some() || prompt_file.is_some() || layers.is_some()) {
             return Err("--chat cannot be combined with --prompt, --prompt-file or diagnostic --layers; run --help".into());
         }
+        let gen_given = gen_tokens.is_some();
         let gen_tokens = gen_tokens.unwrap_or(if chat { 64 } else { 8 });
         if gen_tokens == 0 || max_context == 0 || ring_slots == 0 || layers == Some(0) {
             return Err(
@@ -145,6 +153,7 @@ impl Args {
             prompt,
             prompt_file,
             gen_tokens,
+            gen_given,
             pin_layers,
             ring_slots,
             cache_gb,
@@ -154,6 +163,7 @@ impl Args {
             layers,
             chat,
             max_context,
+            max_context_given,
             accel,
             recompute,
         })
