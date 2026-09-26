@@ -30,6 +30,7 @@ mod linear;
 mod quality;
 mod system_one;
 mod thermal;
+mod voice;
 
 use kimi_k3_core::{
     bind::BoundStorage,
@@ -78,6 +79,8 @@ struct Args {
     mxfp4_experts: Option<PathBuf>,
     system_one: Option<PathBuf>,
     temperature: f32,
+    voice: bool,
+    locale: String,
 }
 
 impl Args {
@@ -110,6 +113,8 @@ impl Args {
         let mut mxfp4_experts = None;
         let mut system_one = None;
         let mut temperature = 1.0_f32;
+        let mut voice = false;
+        let mut locale = String::from("en-US");
 
         if env::args().len() <= 1 {
             print_usage();
@@ -165,6 +170,8 @@ impl Args {
                     system_one = Some(PathBuf::from(next_value(&mut raw, "--system-one")?));
                 }
                 "--temperature" => temperature = parse_arg(&mut raw, "--temperature")?,
+                "--voice" => voice = true,
+                "--locale" => locale = next_value(&mut raw, "--locale")?,
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
                 "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
@@ -227,6 +234,8 @@ impl Args {
             mxfp4_experts,
             system_one,
             temperature,
+            voice,
+            locale,
         })
     }
 }
@@ -294,6 +303,10 @@ fn print_usage() {
          \x20                      \"choice\" | \"score\", ...}}}}}}, TypeSafe's shape) with a probability per\n\
          \x20                      option, never free text; prints the answers as JSON\n\
          \x20 --temperature T      optional, with --system-one: calibration temperature (default 1)\n\
+         \x20 --voice              optional, chat (macOS): talk to Kimi. On-device speech\n\
+         \x20                      recognition listens; say \"Kimi, ...\" to ask something, and\n\
+         \x20                      the reply is also spoken. Nothing leaves the machine.\n\
+         \x20 --locale L           optional, with --voice: speech locale (default en-US)\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\

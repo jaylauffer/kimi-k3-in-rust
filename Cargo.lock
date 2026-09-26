@@ -313,6 +313,7 @@ dependencies = [
  "loadngo-inference",
  "loadngo-metal-compute",
  "loadngo-proactor 0.1.0",
+ "loadngo-speech",
  "loadngo-thermal",
  "loadngo-weights",
  "serde_json",
@@ -412,6 +413,16 @@ dependencies = [
  "socket2",
  "thiserror",
  "windows",
+]
+
+[[package]]
+name = "loadngo-speech"
+version = "0.1.0"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
+ "thiserror",
 ]
 
 [[package]]

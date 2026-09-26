@@ -193,7 +193,10 @@ pub fn run(
     let keep = || !cancel.load(Ordering::Relaxed);
 
     if args.chat {
-        let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        let mut format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        if args.voice {
+            format = format.with_note(VOICE_NOTE);
+        }
         let tools = toolbox(args);
         let tools = Some(&tools).filter(|t| !t.is_empty());
         // Every conversation opens with the same tool declarations (~800 tokens, about a
@@ -224,6 +227,7 @@ pub fn run(
             }
         );
         let mut last: Option<Vec<f32>> = None;
+        let (input, output) = chat_io(args)?;
         return chat::run_with(
             &format,
             tools,
@@ -232,8 +236,8 @@ pub fn run(
             gen_tokens,
             cancel,
             generating,
-            io::stdin().lock(),
-            io::stdout().lock(),
+            input,
+            output,
             |ids| {
                 gate.checkpoint(cancel)?;
                 // Feed only what the session has not consumed; rebuild after /undo,
@@ -319,4 +323,32 @@ pub fn run(
         eprintln!("{summary}");
     }
     Ok(())
+}
+
+/// How to answer when replies are spoken aloud (`--voice`).
+const VOICE_NOTE: &str = "Your replies are spoken aloud by a text-to-speech voice, and Jay is \
+listening, not reading. Answer in one to three short, plain sentences. No lists, headings, code \
+or markdown unless he asks for them.";
+
+/// The chat's input and output.
+type ChatIo = (Box<dyn io::BufRead>, Box<dyn io::Write>);
+
+/// The chat's input and output: the terminal, or speech with `--voice`.
+fn chat_io(args: &Args) -> Result<ChatIo, String> {
+    if !args.voice {
+        return Ok((Box::new(io::stdin().lock()), Box::new(io::stdout().lock())));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let (input, output) = crate::voice::VoiceInput::start(&args.locale, io::stdout())?;
+        eprintln!(
+            "voice: on-device recognition ({}); say \"Kimi, ...\" to talk to her",
+            args.locale
+        );
+        Ok((Box::new(input), Box::new(output)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("--voice needs macOS (on-device speech recognition)".into())
+    }
 }

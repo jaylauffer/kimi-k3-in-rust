@@ -109,6 +109,8 @@ pub struct LinearTokens {
     call_end: u32,
     /// The config's `eos_token_id` and, when the tokenizer has it, `[EOS]`.
     eos: [u32; 2],
+    /// An extra system note for every conversation (for example how to answer aloud).
+    note: Option<String>,
 }
 
 fn single(tokenizer: &Tokenizer, text: &str) -> Result<u32, String> {
@@ -136,7 +138,17 @@ impl ChatFormat {
             middle: single(tokenizer, "<|im_middle|>")?,
             end: single(tokenizer, "<|im_end|>")?,
             eos: [eos, single(tokenizer, "[EOS]").unwrap_or(eos)],
+            note: None,
         }))
+    }
+
+    /// Adds a system note that opens every conversation (Kimi Linear only).
+    #[must_use]
+    pub fn with_note(mut self, note: &str) -> Self {
+        if let Self::KimiLinear(t) = &mut self {
+            t.note = Some(note.to_string());
+        }
+        self
     }
 
     fn prompt(
@@ -174,9 +186,15 @@ impl ChatFormat {
     /// every conversation, so a session that has consumed it can be reused.
     pub fn preamble(&self, tokenizer: &Tokenizer, tools: Option<&Toolbox>) -> Vec<u32> {
         let mut ids = Vec::new();
-        if let (Self::KimiLinear(t), Some(tools)) = (self, tools.filter(|t| !t.is_empty())) {
+        let Self::KimiLinear(t) = self else {
+            return ids;
+        };
+        if let Some(tools) = tools.filter(|t| !t.is_empty()) {
             t.message(&mut ids, tokenizer, "tool_declare", &tools.declaration());
             t.message(&mut ids, tokenizer, "system", TOOL_GUIDANCE);
+        }
+        if let Some(note) = &t.note {
+            t.message(&mut ids, tokenizer, "system", note);
         }
         ids
     }
@@ -343,7 +361,9 @@ const TOOL_GUIDANCE: &str = "You are Kimi, running locally on Jay's Mac mini. Yo
 files with tools: fs_list, fs_read, fs_find and fs_grep read the local drive (read-only); \
 cas_list, cas_find, cas_read and cas_grep read the signed loadngo CAS snapshot of the pudding \
 workspace, where every file is verified against its signed root. When a question depends on a \
-file's contents, read it before answering and name the path you read.";
+file's contents, read it before answering and name the path you read. Answer everything else \
+from your own knowledge: you have no internet access, but you know a great deal, and the tools \
+are only for files.";
 
 /// Most tool rounds (calls, results, continued reply) after one user message.
 const MAX_TOOL_ROUNDS: usize = 8;

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>com.loadngo.kimi</string>
+  <key>CFBundleName</key><string>Kimi</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Kimi understands what you say to her with on-device speech recognition. Nothing leaves this Mac.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Kimi listens for her name so you can talk to her. Audio stays on this Mac.</string>
+</dict>
+</plist>
