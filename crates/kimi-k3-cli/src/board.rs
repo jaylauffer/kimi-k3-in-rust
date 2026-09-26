@@ -7,6 +7,7 @@
 //! is Jay's, and the other sections are only read. Each addition rewrites the file
 //! atomically (a temporary file renamed over it).
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use loadngo_inference::tools::Tool;
@@ -169,7 +170,7 @@ impl Tool for Sections {
         let mut out = String::new();
         for (heading, from, to) in sections(&text) {
             let n = rows(&lines, from, to).len();
-            out.push_str(&format!("{heading}: {n} rows\n"));
+            let _ = writeln!(out, "{heading}: {n} rows");
         }
         out.push_str("Rows are newest first. You may add rows to Active claims and Handoffs.");
         Ok(out)
@@ -195,9 +196,13 @@ impl Tool for Read {
             .get("section")
             .and_then(Value::as_str)
             .ok_or("`section` is required")?;
-        let start = args.get("start").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let count =
-            (args.get("count").and_then(Value::as_u64).unwrap_or(6) as usize).clamp(1, MAX_ROWS);
+        let number = |key: &str, default: usize| {
+            args.get(key)
+                .and_then(Value::as_u64)
+                .map_or(default, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        };
+        let start = number("start", 0);
+        let count = number("count", 6).clamp(1, MAX_ROWS);
         let text = self.0.text()?;
         let all = sections(&text);
         let (heading, from, to) = find(&all, name)?;
@@ -264,7 +269,7 @@ impl Tool for AddRow {
         }
         let mut row = format!("| {} | Kimi |", self.0.today);
         for c in &cells {
-            row.push_str(&format!(" {} |", cell(c)?));
+            let _ = write!(row, " {} |", cell(c)?);
         }
         let text = self.0.text()?;
         let updated = with_row(&text, section, &row)?;
