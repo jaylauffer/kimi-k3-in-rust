@@ -55,6 +55,16 @@ fn toolbox(args: &Args) -> Toolbox {
         "file tools: local drive, read-only, relative to {}",
         base.display()
     );
+    if let Some(path) = crate::board::board_in(&base) {
+        let today = date("+%F").unwrap_or_else(|| "undated".into());
+        eprintln!(
+            "board tools: {} (read by section; rows added to Active claims and Handoffs, signed Kimi)",
+            path.display()
+        );
+        for tool in crate::board::Board::new(path, today).into_tools() {
+            tools.push(tool);
+        }
+    }
     for tool in FsTools::new(base, home.as_deref()).into_tools() {
         tools.push(tool);
     }
@@ -379,8 +389,13 @@ memory_search; drop wrong or outdated notes with memory_forget.";
 
 /// Today's local date, for example "Saturday, 27 September 2026", read once at launch.
 fn today() -> Option<String> {
+    date("+%A, %-d %B %Y")
+}
+
+/// The local date in `date`'s `format`.
+fn date(format: &str) -> Option<String> {
     let out = std::process::Command::new("date")
-        .arg("+%A, %-d %B %Y")
+        .arg(format)
         .output()
         .ok()?;
     let text = String::from_utf8(out.stdout).ok()?;

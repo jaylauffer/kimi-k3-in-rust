@@ -24,6 +24,7 @@ use std::sync::{
 use std::time::Instant;
 
 mod accel;
+mod board;
 mod chat;
 mod convert;
 mod linear;
