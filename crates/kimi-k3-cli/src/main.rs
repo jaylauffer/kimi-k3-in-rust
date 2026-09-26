@@ -274,8 +274,9 @@ fn print_usage() {
          \x20 --no-tools           optional: chat without file tools\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
          \x20                      as they load, to judge its quality (not faster; default bf16)\n\
-         \x20 --compare mxfp4|cpu  optional, Kimi Linear, with --prompt-file: score the text\n\
-         \x20                      twice (bf16 vs mxfp4 experts, or CPU vs --accel) and print\n\
+         \x20 --compare mxfp4|cpu|decode  optional, Kimi Linear, with --prompt-file: score the\n\
+         \x20                      text twice (bf16 vs mxfp4 experts, CPU vs --accel, or CPU vs\n\
+         \x20                      --accel one position at a time as chat decodes) and print\n\
          \x20                      perplexity, top-1 agreement and KL divergence\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
@@ -283,9 +284,12 @@ fn print_usage() {
          \x20                      into DIR (4-bit, all resident within --cache-gb)\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
-         \x20 --accel cpu|ane      optional device for the bf16 trunk products (default cpu,\n\
+         \x20 --accel cpu|ane|gpu  optional device for the bf16 trunk products (default cpu,\n\
          \x20                      the bit-exact reference). ane: Apple Neural Engine via\n\
          \x20                      Core ML, fp16, macOS 15+, for trunk and expert products.\n\
+         \x20                      gpu (Kimi Linear): weights move into GPU memory once and\n\
+         \x20                      each generated token's products run there (Metal, fp32);\n\
+         \x20                      prompts still go to the Neural Engine.\n\
          \n\
          Not yet ported from the C engine: --spec/--draft-trunk (speculative decode), --save-state/--load-state\n\
          (conversation persistence), the named memory-preset ladder, --ultra-low-memory,\n\

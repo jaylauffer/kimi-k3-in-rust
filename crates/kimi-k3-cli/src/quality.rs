@@ -10,7 +10,10 @@
 //! reports how the second run's next-token distributions differ from the first's:
 //! `mxfp4` compares bf16 experts with MXFP4 experts on the `--accel` device; `cpu`
 //! compares the CPU reference with the `--accel` device, both bf16, which measures how
-//! far the device's own fp16 arithmetic already moves them.
+//! far the device's own fp16 arithmetic already moves them. `decode` compares the CPU
+//! reference with the device the way chat runs it, feeding the text one position at a
+//! time (the GPU's path; a whole-text pass goes to the Neural Engine), with whatever
+//! experts are loaded.
 
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -51,6 +54,8 @@ pub enum Comparison {
     Mxfp4,
     /// The CPU reference, then the `--accel` device, both with bf16 experts.
     Cpu,
+    /// The CPU reference, then the `--accel` device, one position at a time.
+    Decode,
 }
 
 impl Comparison {
@@ -58,7 +63,10 @@ impl Comparison {
         match value {
             "mxfp4" => Ok(Self::Mxfp4),
             "cpu" => Ok(Self::Cpu),
-            other => Err(format!("--compare must be mxfp4 or cpu, not {other}")),
+            "decode" => Ok(Self::Decode),
+            other => Err(format!(
+                "--compare must be mxfp4, cpu or decode, not {other}"
+            )),
         }
     }
 }
@@ -158,7 +166,7 @@ pub fn compare(
             ["bf16 experts", "mxfp4 experts"],
             [(device, None), (device, ExpertFormat::Mxfp4.transform())],
         ),
-        Comparison::Cpu => (["cpu", "device"], [(None, None), (device, None)]),
+        Comparison::Cpu | Comparison::Decode => (["cpu", "device"], [(None, None), (device, None)]),
     };
     let keep = || !cancel.load(std::sync::atomic::Ordering::Relaxed);
     let mut logits = Vec::with_capacity(2);
@@ -167,16 +175,33 @@ pub fn compare(
         gate.checkpoint(cancel)?;
         let start = Instant::now();
         let mut session = model.session(ids.len());
-        logits.push(
-            model
-                .score(&mut session, &ids, accel, keep)
-                .map_err(|e| e.to_string())?,
-        );
-        eprintln!(
-            "  {name}: {} tokens scored in {:.1?}",
-            ids.len(),
-            start.elapsed()
-        );
+        if comparison == Comparison::Decode {
+            let mut all = Vec::with_capacity(ids.len() * model.config.vocab_size);
+            for id in &ids {
+                let step = model
+                    .feed(&mut session, std::slice::from_ref(id), accel, keep)
+                    .map_err(|e| e.to_string())?;
+                all.extend_from_slice(&step);
+            }
+            logits.push(all);
+            let seconds = start.elapsed().as_secs_f64();
+            eprintln!(
+                "  {name}: {} positions one at a time in {seconds:.1} s ({:.2} tokens/s)",
+                ids.len(),
+                ids.len() as f64 / seconds
+            );
+        } else {
+            logits.push(
+                model
+                    .score(&mut session, &ids, accel, keep)
+                    .map_err(|e| e.to_string())?,
+            );
+            eprintln!(
+                "  {name}: {} tokens scored in {:.1?}",
+                ids.len(),
+                start.elapsed()
+            );
+        }
     }
     model.set_expert_transform(None);
     let vocab = model.config.vocab_size;

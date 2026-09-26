@@ -233,24 +233,54 @@ Notes:
 - Memory: 31.6 GB peak footprint.
 - `KIMI_BF16_EXPERTS=1` makes the launcher use the bf16 experts.
 
+### On the GPU (2026-09-26): `--accel gpu`, now the launcher default
+
+`--accel gpu` moves the bf16 trunk, the LM head and the resident MXFP4 experts into
+memory the GPU and CPU share, once at launch (28.3 GB in about 5.5 s,
+`LinearModel::share_weights`). Every product then runs on the GPU with loadngo's Metal
+kernels (`loadngo-metal-compute`), in fp32 from the stored values, and each step's
+products become one command buffer. A prompt's bf16 products share each weight read
+across eight positions. Weights that are not in GPU memory (K3, streamed bf16 experts)
+go to the Neural Engine. Attention, KDA, routing and norms stay on the CPU.
+
+Measured on this Mac mini with the 4-bit experts, with thermal state nominal throughout:
+
+| | `--accel ane` | `--accel gpu` |
+|---|---|---|
+| Decode, short context | 2.61 tokens/s | 14-20 tokens/s (0.05 s/token at ~100 tokens) |
+| One-sentence chat reply | 6.0 s first, 5.5 s after `/reset` | 8.3 s first, 3.4 s after |
+| 70-token prompt | 5.8 s | 4.6 s |
+| Tool preamble at launch (819 tokens) | 29 s | 30 s |
+| Launch to ready | 36 s | about 43 s (includes the 5.5 s move) |
+| Memory footprint | 31.6 GB peak | 30 GB steady, 41 GB peak while loading |
+
+**Correctness.** `--compare decode` and `--compare cpu` scored the same 121 tokens as
+above. The first feeds the text one position at a time, as chat does; the second
+scores it in one pass. Both matched the CPU reference with 100% top-1 agreement, a KL
+divergence that rounds to 0.00000, and identical perplexity. The Neural Engine's fp16
+path sits at KL 0.012 on this kind of text.
+
 ### What limits it now
 
-- **Decoding** is about 0.4 s/token of Neural Engine time, spent streaming ~6 GB of
-  weights at 15-25 GB/s, plus about 0.15 s of single-threaded CPU work: attention,
-  routing, and expert reads on cache misses.
-- **Prompt processing** is bound by reading experts. A few hundred tokens route to
-  nearly every expert in every layer, 86 GB for 639 tokens, and the 24 GB cache holds
-  about a quarter of them. That is what makes tool replies slow.
+- **Prompt processing is CPU-bound.** A `sample` during the preamble put about 54% of
+  the main thread in single-threaded model code (MLA attention, which is quadratic in
+  the prompt and in f64; the router; the KDA recurrence). Only about 19% was spent
+  waiting on the GPU.
+- **Decoding** is about 19 ms of GPU work per token. Most of the rest is CPU attention
+  and routing, plus a few hundred microseconds per GPU submission. Decoding will slow
+  down as the conversation grows, because CPU attention cost grows with context length.
+- **The first reply** after launch is slower than later ones (8.3 s against 3.4 s).
+  This is not yet explained.
 
 Next, in expected order of payoff:
 
-1. **4-bit (MXFP4) routed experts,** about 25 GB, so all of them stay in memory. This
-   removes the drive from both prompt processing and decoding, and it helps the Neural
-   Engine path as well as Metal. The engine already multiplies MXFP4. It changes the
-   model's numbers, so it waits on a quality report and Jay's decision.
-2. **The GPU (Metal) for decoding,** where memory bandwidth is roughly ten times the
-   Neural Engine's streaming rate.
-3. **Multi-threaded CPU work,** for the router and MLA attention in long prompts.
+1. **Attention, KDA and the router on the GPU** (the rest of METAL_COMPUTE_PLAN M1), or
+   at least off the single CPU thread. This speeds up prompts, the launch preamble and
+   long conversations.
+2. **A multi-position MXFP4 kernel that stages its inputs in threadgroup memory.** The
+   first attempt was slower than one product per position.
+3. **Reading experts straight into GPU memory** at launch, which removes the 41 GB
+   loading peak and the copy.
 
 Plans: [loadngo `docs/METAL_COMPUTE_PLAN.md`](https://github.com/jaylauffer/loadngo/blob/dev/docs/METAL_COMPUTE_PLAN.md)
 (GPU decode and MXFP4 experts) and

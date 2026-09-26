@@ -44,7 +44,7 @@ use serde_json::Value;
 
 use crate::{
     io::ReadRequest,
-    layer::{Accel, DenseJob, Matrix, Mxfp4Matrix, WeightRef},
+    layer::{Accel, DenseAccel, DenseJob, Matrix, Mxfp4Matrix, Shared, WeightRef},
     ops::{
         kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid,
     },
@@ -344,10 +344,13 @@ struct Weight {
 }
 
 /// A weight's bytes: the checkpoint's bf16 words, or (routed experts from a converted
-/// directory, see [`LinearModel::use_mxfp4_experts`]) MXFP4 codes and scales.
+/// directory, see [`LinearModel::use_mxfp4_experts`]) MXFP4 codes and scales; on the
+/// heap, or moved into a device's memory by [`LinearModel::share_weights`].
 enum Stored {
     Bf16(Vec<u16>),
     Mxfp4 { packed: Vec<u8>, scales: Vec<u8> },
+    SharedBf16(Shared),
+    SharedMxfp4 { packed: Shared, scales: Shared },
 }
 
 impl Weight {
@@ -363,6 +366,31 @@ impl Weight {
         match &self.data {
             Stored::Bf16(w) => WeightRef::Bf16(w),
             Stored::Mxfp4 { packed, scales } => WeightRef::Mxfp4 { packed, scales },
+            Stored::SharedBf16(w) => WeightRef::Bf16(w.words()),
+            Stored::SharedMxfp4 { packed, scales } => WeightRef::Mxfp4 {
+                packed: packed.bytes(),
+                scales: scales.bytes(),
+            },
+        }
+    }
+
+    /// Moves the weight into `device`'s memory; returns the bytes moved (0 when the
+    /// device keeps it where it is).
+    fn share(&mut self, device: &dyn DenseAccel) -> usize {
+        let shared = match &self.data {
+            Stored::Bf16(w) => device.share_words(w).map(Stored::SharedBf16),
+            Stored::Mxfp4 { packed, scales } => device
+                .share_bytes(packed)
+                .zip(device.share_bytes(scales))
+                .map(|(packed, scales)| Stored::SharedMxfp4 { packed, scales }),
+            Stored::SharedBf16(_) | Stored::SharedMxfp4 { .. } => None,
+        };
+        let Some(shared) = shared else { return 0 };
+        self.data = shared;
+        match &self.data {
+            Stored::SharedBf16(w) => w.bytes().len(),
+            Stored::SharedMxfp4 { packed, scales } => packed.bytes().len() + scales.bytes().len(),
+            _ => 0,
         }
     }
 
@@ -373,7 +401,7 @@ impl Weight {
         }
         match &mut self.data {
             Stored::Bf16(w) => w,
-            Stored::Mxfp4 { .. } => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
@@ -387,14 +415,14 @@ impl Weight {
         }
         match &mut self.data {
             Stored::Mxfp4 { packed, scales } => (packed, scales),
-            Stored::Bf16(_) => unreachable!(),
+            _ => unreachable!(),
         }
     }
 
     fn mul_cpu(&self, y: &mut [f32], x: &[f32], rows: usize) {
-        match &self.data {
-            Stored::Bf16(w) => Matrix::Bf16(w).mul_rows(y, x, rows, self.inp, self.out, None),
-            Stored::Mxfp4 { packed, scales } => Mxfp4Matrix {
+        match self.as_ref() {
+            WeightRef::Bf16(w) => Matrix::Bf16(w).mul_rows(y, x, rows, self.inp, self.out, None),
+            WeightRef::Mxfp4 { packed, scales } => Mxfp4Matrix {
                 packed,
                 scales,
                 rows: self.out,
@@ -940,7 +968,11 @@ impl LinearModel {
     /// Applies `transform` to every expert from now on and forgets every cached one,
     /// so no expert read before the change is used after it. The slots' memory stays
     /// allocated and is overwritten as they are reused, not freed and faulted in again.
+    /// Setting no transform when none is set changes nothing and keeps the cache.
     pub fn set_expert_transform(&mut self, transform: Option<ExpertTransform>) {
+        if transform.is_none() && self.experts.transform.is_none() {
+            return;
+        }
         let store = &mut self.experts;
         store.transform = transform;
         store.map.clear();
@@ -948,6 +980,56 @@ impl LinearModel {
             // No live key, so evicting it later cannot unmap a fresh copy elsewhere.
             slot.key = (usize::MAX, usize::MAX);
         }
+    }
+
+    /// Moves every resident weight a device can compute from in place into its memory,
+    /// freeing the heap copy: the trunk, the LM head and, when they all fit (so none is
+    /// ever evicted), the routed experts. The CPU path reads the same bytes afterwards.
+    /// Returns the bytes moved.
+    pub fn share_weights(&mut self, device: &dyn DenseAccel) -> usize {
+        let mut moved = self.lm_head.share(device);
+        for layer in &mut self.layers {
+            let attn: Vec<&mut Weight> = match &mut layer.attn {
+                Attn::Kda(w) => {
+                    let Kda {
+                        q,
+                        k,
+                        v,
+                        b,
+                        f_a,
+                        f_b,
+                        g_a,
+                        g_b,
+                        o,
+                        ..
+                    } = &mut **w;
+                    vec![q, k, v, b, f_a, f_b, g_a, g_b, o]
+                }
+                Attn::Mla(w) => {
+                    let Mla {
+                        q, kv_a, kv_b, o, ..
+                    } = &mut **w;
+                    vec![q, kv_a, kv_b, o]
+                }
+            };
+            moved += attn.into_iter().map(|w| w.share(device)).sum::<usize>();
+            let mlp = match &mut layer.ffn {
+                Ffn::Dense(m) | Ffn::Moe { shared: m, .. } => m,
+            };
+            for w in [&mut mlp.gate, &mut mlp.up, &mut mlp.down] {
+                moved += w.share(device);
+            }
+        }
+        if self.experts_fit() {
+            for slot in &mut self.experts.slots {
+                for w in [&mut slot.w1, &mut slot.w3, &mut slot.w2] {
+                    moved += w.share(device);
+                }
+            }
+            // The read pool is not needed again.
+            self.experts.spare = Vec::new();
+        }
+        moved
     }
 
     #[must_use]

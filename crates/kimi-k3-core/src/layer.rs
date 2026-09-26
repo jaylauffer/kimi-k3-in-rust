@@ -34,6 +34,18 @@ use crate::{
     },
 };
 
+/// Weight memory a device computes from in place and the CPU can still read: a weight
+/// moved there ([`DenseAccel::share_words`]) costs no copy per product, and the CPU
+/// reference and every fallback read the same bytes.
+pub trait SharedWeight: Send + Sync {
+    fn bytes(&self) -> &[u8];
+    /// The bytes as little-endian 16-bit words.
+    fn words(&self) -> &[u16];
+}
+
+/// A weight's shared memory, owned jointly by the model and the device.
+pub type Shared = std::sync::Arc<dyn SharedWeight>;
+
 /// An optional device for the trunk's bf16 products over several rows at once (the
 /// Apple Neural Engine through loadngo's Core ML engine, on macOS). It computes in its
 /// own precision, so a forward through it is not bit-identical to the CPU path, which
@@ -83,6 +95,19 @@ pub trait DenseAccel {
         out: usize,
     ) -> bool {
         false
+    }
+
+    /// Copies bf16 `words` into memory the device computes from in place, or `None` (the
+    /// default) to leave the weight where it is.
+    #[allow(unused_variables)]
+    fn share_words(&self, words: &[u16]) -> Option<Shared> {
+        None
+    }
+
+    /// As [`Self::share_words`] for raw bytes (MXFP4 codes and scales).
+    #[allow(unused_variables)]
+    fn share_bytes(&self, bytes: &[u8]) -> Option<Shared> {
+        None
     }
 }
 

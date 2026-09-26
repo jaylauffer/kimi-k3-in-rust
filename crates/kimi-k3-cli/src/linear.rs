@@ -131,6 +131,22 @@ pub fn run(
         }
     }
     let device = accel::Device::open(args.accel)?;
+    if args.accel == accel::AccelKind::Gpu {
+        let start = Instant::now();
+        let accel = device.accel().ok_or("the GPU device did not open")?;
+        let moved = model.share_weights(accel);
+        #[allow(clippy::cast_precision_loss)] // shown to one decimal of a GB
+        let gb = moved as f64 / 1e9;
+        eprintln!(
+            "  {gb:.1} GB of weights moved into GPU memory in {:.1?}{}",
+            start.elapsed(),
+            if model.experts_fit() {
+                ""
+            } else {
+                " (routed experts stream from the cache and run on the Neural Engine)"
+            }
+        );
+    }
     let max_context = if args.max_context_given {
         args.max_context
     } else {
@@ -191,6 +207,7 @@ pub fn run(
              expert cache warms.",
             match args.accel {
                 accel::AccelKind::Ane => "the Apple Neural Engine",
+                accel::AccelKind::Gpu => "the GPU (prompts on the Apple Neural Engine)",
                 accel::AccelKind::Cpu => "the CPU",
             }
         );
