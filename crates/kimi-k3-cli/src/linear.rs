@@ -58,6 +58,15 @@ fn toolbox(args: &Args) -> Toolbox {
     for tool in FsTools::new(base, home.as_deref()).into_tools() {
         tools.push(tool);
     }
+    if let Some(memory) = memory_store(args) {
+        eprintln!(
+            "memory: {} (memory_save, memory_search, memory_list, memory_forget)",
+            memory.path().display()
+        );
+        for tool in memory.into_tools() {
+            tools.push(tool);
+        }
+    }
     if args.no_web {
         eprintln!("web tools: off (--no-web)");
     } else {
@@ -204,6 +213,9 @@ pub fn run(
 
     if args.chat {
         let mut format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        if let Some(memory) = memory_store(args) {
+            format = format.with_note(&memory_note(&memory));
+        }
         if let Some(today) = today() {
             // Without it she searched for "... 2024" news in 2026.
             format = format.with_note(&format!("Today is {today}."));
@@ -337,6 +349,32 @@ pub fn run(
         eprintln!("{summary}");
     }
     Ok(())
+}
+
+/// Kimi's memory file, unless tools or memory are off.
+fn memory_store(args: &Args) -> Option<loadngo_inference::memory_tools::MemoryStore> {
+    if args.no_tools || args.no_memory {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(loadngo_inference::memory_tools::MemoryStore::new(
+        std::path::Path::new(&home).join(".loadngo/kimi/memory.jsonl"),
+    ))
+}
+
+/// What opens each conversation about her memory: the newest notes that fit in 4 KB.
+fn memory_note(memory: &loadngo_inference::memory_tools::MemoryStore) -> String {
+    let intro = "You have a memory that lasts across sessions. Save facts, decisions and \
+the state of ongoing work with memory_save when they will matter later; look things up with \
+memory_search; drop wrong or outdated notes with memory_forget.";
+    match memory.recall(4096) {
+        Ok(notes) if !notes.is_empty() => format!(
+            "{intro} Your most recent notes:\n{}",
+            loadngo_inference::memory_tools::format_notes(&notes)
+        ),
+        Ok(_) => format!("{intro} You have no notes yet."),
+        Err(e) => format!("{intro} (Your notes could not be read: {e}.)"),
+    }
 }
 
 /// Today's local date, for example "Saturday, 27 September 2026", read once at launch.

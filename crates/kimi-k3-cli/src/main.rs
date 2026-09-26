@@ -74,6 +74,7 @@ struct Args {
     cas_key: Option<PathBuf>,
     no_tools: bool,
     no_web: bool,
+    no_memory: bool,
     experts: quality::ExpertFormat,
     compare: Option<quality::Comparison>,
     convert_experts: Option<PathBuf>,
@@ -109,6 +110,7 @@ impl Args {
         let mut cas_key = None;
         let mut no_tools = false;
         let mut no_web = false;
+        let mut no_memory = false;
         let mut experts = quality::ExpertFormat::Bf16;
         let mut compare = None;
         let mut convert_experts = None;
@@ -151,6 +153,7 @@ impl Args {
                 "--recompute" => recompute = true,
                 "--no-tools" => no_tools = true,
                 "--no-web" => no_web = true,
+                "--no-memory" => no_memory = true,
                 "--experts" => {
                     experts = quality::ExpertFormat::parse(&next_value(&mut raw, "--experts")?)?;
                 }
@@ -232,6 +235,7 @@ impl Args {
             cas_key,
             no_tools,
             no_web,
+            no_memory,
             experts,
             compare,
             convert_experts,
@@ -298,6 +302,8 @@ fn print_usage() {
          \x20 --no-tools           optional: chat without file tools\n\
          \x20 --no-web             optional: chat without web_search/web_fetch (the only tools\n\
          \x20                      that send anything off this machine)\n\
+         \x20 --no-memory          optional: chat without her memory (notes she keeps across\n\
+         \x20                      sessions in ~/.loadngo/kimi/memory.jsonl)\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
          \x20                      as they load, to judge its quality (not faster; default bf16)\n\
          \x20 --compare mxfp4|cpu|decode  optional, Kimi Linear, with --prompt-file: score the\n\
