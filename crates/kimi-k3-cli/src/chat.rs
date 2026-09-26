@@ -181,6 +181,51 @@ impl ChatFormat {
         ids
     }
 
+    /// A Kimi Linear system message, then the start of a user message holding `head`;
+    /// [`Self::close_user_message`] finishes it and opens the assistant's reply. The split
+    /// lets a caller read one long text once and reuse the session for several endings.
+    ///
+    /// # Errors
+    /// For the K3 format, which has no system role here.
+    pub fn open_user_message(
+        &self,
+        tokenizer: &Tokenizer,
+        system: &str,
+        head: &str,
+    ) -> Result<Vec<u32>, String> {
+        let Self::KimiLinear(t) = self else {
+            return Err("only the Kimi Linear format splits user messages".into());
+        };
+        let mut ids = Vec::new();
+        t.message(&mut ids, tokenizer, "system", system);
+        ids.push(t.user);
+        ordinary(&mut ids, tokenizer, "user");
+        ids.push(t.middle);
+        ordinary(&mut ids, tokenizer, head);
+        Ok(ids)
+    }
+
+    /// The rest of a user message begun by [`Self::open_user_message`], then the opening
+    /// of the assistant's reply.
+    ///
+    /// # Errors
+    /// For the K3 format.
+    pub fn close_user_message(
+        &self,
+        tokenizer: &Tokenizer,
+        tail: &str,
+    ) -> Result<Vec<u32>, String> {
+        let Self::KimiLinear(t) = self else {
+            return Err("only the Kimi Linear format splits user messages".into());
+        };
+        let mut ids = Vec::new();
+        ordinary(&mut ids, tokenizer, tail);
+        ids.extend([t.end, t.assistant]);
+        ordinary(&mut ids, tokenizer, "assistant");
+        ids.push(t.middle);
+        Ok(ids)
+    }
+
     /// Tool calls in a finished Kimi Linear reply, as `(id, arguments)` text pairs.
     fn tool_calls(&self, tokenizer: &Tokenizer, reply: &[u32]) -> Vec<(String, String)> {
         let Self::KimiLinear(t) = self else {

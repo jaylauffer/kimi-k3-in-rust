@@ -28,6 +28,7 @@ mod chat;
 mod convert;
 mod linear;
 mod quality;
+mod system_one;
 mod thermal;
 
 use kimi_k3_core::{
@@ -75,6 +76,8 @@ struct Args {
     compare: Option<quality::Comparison>,
     convert_experts: Option<PathBuf>,
     mxfp4_experts: Option<PathBuf>,
+    system_one: Option<PathBuf>,
+    temperature: f32,
 }
 
 impl Args {
@@ -105,6 +108,8 @@ impl Args {
         let mut compare = None;
         let mut convert_experts = None;
         let mut mxfp4_experts = None;
+        let mut system_one = None;
+        let mut temperature = 1.0_f32;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -156,6 +161,10 @@ impl Args {
                         "--compare",
                     )?)?);
                 }
+                "--system-one" => {
+                    system_one = Some(PathBuf::from(next_value(&mut raw, "--system-one")?));
+                }
+                "--temperature" => temperature = parse_arg(&mut raw, "--temperature")?,
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
                 "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
@@ -216,6 +225,8 @@ impl Args {
             compare,
             convert_experts,
             mxfp4_experts,
+            system_one,
+            temperature,
         })
     }
 }
@@ -278,6 +289,11 @@ fn print_usage() {
          \x20                      text twice (bf16 vs mxfp4 experts, CPU vs --accel, or CPU vs\n\
          \x20                      --accel one position at a time as chat decodes) and print\n\
          \x20                      perplexity, top-1 agreement and KL divergence\n\
+         \x20 --system-one FILE    optional, Kimi Linear: answer the typed questions in a JSON\n\
+         \x20                      request ({{\"state\": ..., \"questions\": {{id: {{\"type\": \"noul\" |\n\
+         \x20                      \"choice\" | \"score\", ...}}}}}}, TypeSafe's shape) with a probability per\n\
+         \x20                      option, never free text; prints the answers as JSON\n\
+         \x20 --temperature T      optional, with --system-one: calibration temperature (default 1)\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
