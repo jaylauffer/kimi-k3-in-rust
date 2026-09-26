@@ -1045,14 +1045,12 @@ impl LinearModel {
         let states = (0..c.num_hidden_layers)
             .map(|l| {
                 if c.is_mla(l) {
+                    // The KV cache grows as positions arrive (`run`), so a session holds
+                    // memory for what it has read, not for its whole capacity, and
+                    // snapshotting it copies only that.
                     State::Mla {
-                        kv: vec![
-                            0.0;
-                            capacity
-                                * c.num_attention_heads
-                                * (c.qk_nope_head_dim + c.v_head_dim)
-                        ],
-                        rope: vec![0.0; capacity * c.qk_rope_head_dim],
+                        kv: Vec::new(),
+                        rope: Vec::new(),
                     }
                 } else {
                     State::Kda {
@@ -1176,6 +1174,12 @@ impl LinearModel {
                     kda(&mut tmp, &hin, w, c, t, recurrent, conv, accel);
                 }
                 (Attn::Mla(w), State::Mla { kv, rope }) => {
+                    let rows = cached + t;
+                    let kvd = c.qk_nope_head_dim + c.v_head_dim;
+                    if kv.len() < rows * c.num_attention_heads * kvd {
+                        kv.resize(rows * c.num_attention_heads * kvd, 0.0);
+                        rope.resize(rows * c.qk_rope_head_dim, 0.0);
+                    }
                     mla(&mut tmp, &hin, w, c, t, kv, rope, cached, accel);
                 }
                 _ => unreachable!("session states follow the layer map"),

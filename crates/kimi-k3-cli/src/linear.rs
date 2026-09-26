@@ -21,7 +21,9 @@ const DEFAULT_CACHE_GB: f64 = 24.0;
 /// Chat defaults when `--gen`/`--max-context` are not given. K3's 64/512 made replies
 /// stop mid-sentence here; this model's context state is ~0.23 MB per token.
 const CHAT_GEN: usize = 1024;
-const CHAT_CONTEXT: usize = 4096;
+/// Kimi Linear reads long documents (the agent board alone is ~15k tokens). Only its 7
+/// MLA layers grow with context (~0.23 MB per token in all), and only as it is used.
+const CHAT_CONTEXT: usize = 32_768;
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn gib(value: f64) -> usize {
