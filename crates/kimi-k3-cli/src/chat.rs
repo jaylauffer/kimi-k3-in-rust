@@ -24,8 +24,9 @@ const HELP: &str = "Type a message and press Enter. Commands:
   /stats      show context usage
   /help       show these commands
   /quit       exit (or Ctrl-D); Ctrl-C cancels generation
-One line per message. No network access and no transcript saving. Kimi Linear can
-read local files and the signed CAS snapshot through read-only tools (--no-tools).
+One line per message. No transcript saving. Kimi Linear can read local files and the
+signed CAS snapshot through read-only tools (--no-tools), and search and read public web
+pages (--no-web turns that off; it is the only thing that leaves this machine).
 ";
 
 fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
@@ -142,11 +143,15 @@ impl ChatFormat {
         }))
     }
 
-    /// Adds a system note that opens every conversation (Kimi Linear only).
+    /// Adds a system note that opens every conversation (Kimi Linear only); notes added
+    /// later follow earlier ones.
     #[must_use]
     pub fn with_note(mut self, note: &str) -> Self {
         if let Self::KimiLinear(t) = &mut self {
-            t.note = Some(note.to_string());
+            t.note = Some(match t.note.take() {
+                Some(earlier) => format!("{earlier}\n{note}"),
+                None => note.to_string(),
+            });
         }
         self
     }
@@ -361,9 +366,10 @@ const TOOL_GUIDANCE: &str = "You are Kimi, running locally on Jay's Mac mini. Yo
 files with tools: fs_list, fs_read, fs_find and fs_grep read the local drive (read-only); \
 cas_list, cas_find, cas_read and cas_grep read the signed loadngo CAS snapshot of the pudding \
 workspace, where every file is verified against its signed root. When a question depends on a \
-file's contents, read it before answering and name the path you read. Answer everything else \
-from your own knowledge: you have no internet access, but you know a great deal, and the tools \
-are only for files.";
+file's contents, read it before answering and name the path you read. web_search searches the \
+public web and web_fetch reads a page: use them for current events, prices, schedules and \
+anything recent or that you are unsure of, and say which site the answer came from. Answer \
+everything else from your own knowledge.";
 
 /// Most tool rounds (calls, results, continued reply) after one user message.
 const MAX_TOOL_ROUNDS: usize = 8;

@@ -56,6 +56,14 @@ fn toolbox(args: &Args) -> Toolbox {
     for tool in FsTools::new(base, home.as_deref()).into_tools() {
         tools.push(tool);
     }
+    if args.no_web {
+        eprintln!("web tools: off (--no-web)");
+    } else {
+        eprintln!("web tools: web_search (DuckDuckGo) and web_fetch; queries leave this machine");
+        for tool in loadngo_inference::web_tools::WebTools::new().into_tools() {
+            tools.push(tool);
+        }
+    }
     match (&args.cas_root, &args.cas_key) {
         (Some(root), Some(key)) => {
             let start = Instant::now();
@@ -194,6 +202,10 @@ pub fn run(
 
     if args.chat {
         let mut format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        if let Some(today) = today() {
+            // Without it she searched for "... 2024" news in 2026.
+            format = format.with_note(&format!("Today is {today}."));
+        }
         if args.voice {
             format = format.with_note(VOICE_NOTE);
         }
@@ -323,6 +335,17 @@ pub fn run(
         eprintln!("{summary}");
     }
     Ok(())
+}
+
+/// Today's local date, for example "Saturday, 27 September 2026", read once at launch.
+fn today() -> Option<String> {
+    let out = std::process::Command::new("date")
+        .arg("+%A, %-d %B %Y")
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let text = text.trim();
+    (out.status.success() && !text.is_empty()).then(|| text.to_string())
 }
 
 /// How to answer when replies are spoken aloud (`--voice`).

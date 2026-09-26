@@ -18,7 +18,7 @@ workspace = true
 kimi-k3-core = { path = "../kimi-k3-core" }
 # Framework owns reusable conversation/generation mechanics. See docs/CHAT.md
 # for the sibling-checkout layout and coordinated publication requirements.
-loadngo-inference = { path = "../../../loadngo/inference", features = ["cas"] }
+loadngo-inference = { path = "../../../loadngo/inference", features = ["cas", "web"] }
 # The signed Archive CAS view behind the chat file tools.
 data = { path = "../../../loadngo/data" }
 # Thermal pressure before every forward pass; the proactor waits while paused.

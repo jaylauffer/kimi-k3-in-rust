@@ -73,6 +73,7 @@ struct Args {
     cas_root: Option<PathBuf>,
     cas_key: Option<PathBuf>,
     no_tools: bool,
+    no_web: bool,
     experts: quality::ExpertFormat,
     compare: Option<quality::Comparison>,
     convert_experts: Option<PathBuf>,
@@ -107,6 +108,7 @@ impl Args {
         let mut cas_root = None;
         let mut cas_key = None;
         let mut no_tools = false;
+        let mut no_web = false;
         let mut experts = quality::ExpertFormat::Bf16;
         let mut compare = None;
         let mut convert_experts = None;
@@ -148,6 +150,7 @@ impl Args {
                 "--layers" => layers = Some(parse_arg(&mut raw, "--layers")?),
                 "--recompute" => recompute = true,
                 "--no-tools" => no_tools = true,
+                "--no-web" => no_web = true,
                 "--experts" => {
                     experts = quality::ExpertFormat::parse(&next_value(&mut raw, "--experts")?)?;
                 }
@@ -228,6 +231,7 @@ impl Args {
             cas_root,
             cas_key,
             no_tools,
+            no_web,
             experts,
             compare,
             convert_experts,
@@ -292,6 +296,8 @@ fn print_usage() {
          \x20                      root that verifies against --cas-key (a public key)\n\
          \x20 --cas-key PATH       optional: trusted Dilithium public key for --cas-root\n\
          \x20 --no-tools           optional: chat without file tools\n\
+         \x20 --no-web             optional: chat without web_search/web_fetch (the only tools\n\
+         \x20                      that send anything off this machine)\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
          \x20                      as they load, to judge its quality (not faster; default bf16)\n\
          \x20 --compare mxfp4|cpu|decode  optional, Kimi Linear, with --prompt-file: score the\n\
