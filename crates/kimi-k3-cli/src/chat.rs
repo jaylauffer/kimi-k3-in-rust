@@ -369,10 +369,44 @@ workspace, where every file is verified against its signed root. When a question
 file's contents, read it before answering and name the path you read. web_search searches the \
 public web and web_fetch reads a page: use them for current events, prices, schedules and \
 anything recent or that you are unsure of, and say which site the answer came from. Answer \
-everything else from your own knowledge.";
+everything else from your own knowledge. Never repeat a tool call with the same arguments: its \
+result will not change. When a search finds nothing, say so plainly.";
 
 /// Most tool rounds (calls, results, continued reply) after one user message.
 const MAX_TOOL_ROUNDS: usize = 8;
+
+/// A reply is ending in a loop once its last tokens are at least this many copies of one
+/// block ...
+const MIN_REPEAT_COPIES: usize = 4;
+/// ... covering at least this many tokens ...
+const MIN_REPEAT_TOKENS: usize = 64;
+/// ... of a block at most this long.
+const MAX_REPEAT_PERIOD: usize = 200;
+
+/// The block length when `reply` ends in [`MIN_REPEAT_COPIES`] or more identical copies of
+/// one block, together at least [`MIN_REPEAT_TOKENS`] long. Greedy decoding never leaves
+/// such a loop once it is in one, so the reply is ended there.
+fn repeating_period(reply: &[u32]) -> Option<usize> {
+    (1..=MAX_REPEAT_PERIOD).find(|&period| {
+        let span = period * MIN_REPEAT_COPIES.max(MIN_REPEAT_TOKENS.div_ceil(period));
+        span <= reply.len() && {
+            let tail = &reply[reply.len() - span..];
+            tail[period..] == tail[..span - period]
+        }
+    })
+}
+
+/// A tool call's identity: its name and its arguments as JSON, so key order and spacing
+/// do not make a repeated call look new.
+fn call_key(name: &str, arguments: &str) -> (String, serde_json::Value) {
+    let arguments = serde_json::from_str(arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(arguments.trim().to_string()));
+    (name.to_string(), arguments)
+}
+
+const REPEATED_CALL: &str = "Not run: you already made this exact call in this turn, and its \
+result is above. It would return the same thing. Do not call it again. Answer Jay with what you \
+have, or tell him plainly what you could not find.";
 
 impl LinearTokens {
     /// `<|im_system|>role<|im_middle|>content<|im_end|>`, each text its own segment.
@@ -490,6 +524,8 @@ pub fn run_with(
 ) -> Result<(), String> {
     let mut session = Session::new(max_context).map_err(|e| e.to_string())?;
     let mut display = Display::default();
+    // The reply being generated, for the repetition check; reused across replies.
+    let mut reply = Vec::with_capacity(max_tokens.min(max_context));
     writeln!(output, "{HELP}").map_err(|e| e.to_string())?;
     loop {
         generating.store(false, Ordering::Relaxed);
@@ -575,16 +611,36 @@ pub fn run_with(
             }
         }
         cancel.store(false, Ordering::Relaxed);
+        let mut earlier_calls = Vec::new();
+        let mut repeated_rounds = 0;
         for round in 0..=MAX_TOOL_ROUNDS {
             let reply_start = session.tokens().len();
             generating.store(true, Ordering::Relaxed);
             let started = Instant::now();
             let stops = format.stops();
-            let result = session.generate(max_tokens, &stops, cancel, &mut next, |token| {
-                write!(output, "{}", format.push(&mut display, tokenizer, token))
-                    .and_then(|()| output.flush())
-                    .map_err(|e| e.to_string())
-            });
+            // Once the reply is looping, the next "token" is the end of the message: the
+            // turn closes normally instead of running to the token limit.
+            let looping = std::cell::Cell::new(None);
+            reply.clear();
+            let result = session.generate(
+                max_tokens,
+                &stops,
+                cancel,
+                |context| match looping.get() {
+                    Some(_) => Ok(stops[0]),
+                    None => next(context),
+                },
+                |token| {
+                    write!(output, "{}", format.push(&mut display, tokenizer, token))
+                        .and_then(|()| output.flush())
+                        .map_err(|e| e.to_string())?;
+                    reply.push(token);
+                    if looping.get().is_none() {
+                        looping.set(repeating_period(&reply));
+                    }
+                    Ok(())
+                },
+            );
             generating.store(false, Ordering::Relaxed);
             let done = match result {
                 Ok(done) => done,
@@ -617,10 +673,34 @@ pub fn run_with(
                     .map_err(|e| e.to_string())?;
                 break;
             }
+            if let Some(period) = looping.get() {
+                writeln!(
+                    output,
+                    "[stopped: the reply was repeating a {period}-token block; \
+                     /undo removes this turn]"
+                )
+                .map_err(|e| e.to_string())?;
+                break;
+            }
             let Some(tools) = tools else { break };
             let calls = format.tool_calls(tokenizer, &session.tokens()[reply_start..]);
             if calls.is_empty() {
                 break;
+            }
+            let keys: Vec<_> = calls
+                .iter()
+                .map(|(id, arguments)| call_key(tool_name(id), arguments))
+                .collect();
+            if keys.iter().all(|key| earlier_calls.contains(key)) {
+                repeated_rounds += 1;
+                if repeated_rounds == 2 {
+                    writeln!(
+                        output,
+                        "[stopped: Kimi repeated the same tool call; ask differently or /reset]"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    break;
+                }
             }
             if round == MAX_TOOL_ROUNDS {
                 writeln!(
@@ -631,8 +711,14 @@ pub fn run_with(
                 break;
             }
             let mut results = Vec::new();
-            for (id, arguments) in calls {
+            for ((id, arguments), key) in calls.into_iter().zip(keys) {
                 let name = tool_name(&id).to_string();
+                if earlier_calls.contains(&key) {
+                    writeln!(output, "[tool call repeated: {name}; not run again]")
+                        .map_err(|e| e.to_string())?;
+                    results.push((id, name, REPEATED_CALL.to_string()));
+                    continue;
+                }
                 let text = match tools.call(&name, &arguments) {
                     Ok(text) => text,
                     Err(error) => format!("error: {error}"),
@@ -640,6 +726,7 @@ pub fn run_with(
                 writeln!(output, "[tool result {name}: {} bytes]", text.len())
                     .map_err(|e| e.to_string())?;
                 results.push((id, name, text));
+                earlier_calls.push(key);
             }
             // Fit the results into what is left of the context, keeping room to answer.
             let mut prompt = format.tool_results(tokenizer, &results);
@@ -796,6 +883,159 @@ mod tests {
             .map(|id| display.push(&tokenizer, id))
             .collect();
         assert_eq!(text, "\n\nKimi> 🌱");
+    }
+
+    #[test]
+    fn repeating_period_finds_loops_but_not_ordinary_repetition() {
+        let block: Vec<u32> = (100..130).collect(); // 30 tokens
+        let copies = |n: usize| -> Vec<u32> {
+            let mut reply = vec![1, 2, 3];
+            for _ in 0..n {
+                reply.extend(&block);
+            }
+            reply
+        };
+        assert_eq!(repeating_period(&copies(4)), Some(30));
+        assert_eq!(
+            repeating_period(&copies(3)),
+            None,
+            "three copies can be a list"
+        );
+        assert_eq!(repeating_period(&vec![7; 64]), Some(1));
+        assert_eq!(
+            repeating_period(&vec![7; 63]),
+            None,
+            "a short run is left alone"
+        );
+        let two: Vec<u32> = [5, 6].repeat(32);
+        assert_eq!(repeating_period(&two), Some(2));
+        let text: Vec<u32> = (0..1000).collect();
+        assert_eq!(repeating_period(&text), None);
+        let mut broken = copies(4);
+        broken.push(999);
+        assert_eq!(repeating_period(&broken), None, "only the tail counts");
+    }
+
+    #[test]
+    fn a_looping_reply_is_ended_and_the_conversation_goes_on() {
+        let tokenizer = tiny_tokenizer();
+        let mut calls = 0;
+        let mut out = Vec::new();
+        run(
+            &tokenizer,
+            2048,
+            500,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Hi\nAgain\n/quit\n"[..],
+            &mut out,
+            |context| {
+                calls += 1;
+                if calls <= MIN_REPEAT_TOKENS {
+                    return Ok(u32::from(b'a'));
+                }
+                // The looping reply was closed with the end token, not left pending.
+                let a = u32::from(b'a');
+                let run = context
+                    .windows(MIN_REPEAT_TOKENS)
+                    .position(|w| w.iter().all(|&t| t == a))
+                    .unwrap();
+                let after = run + context[run..].iter().position(|&t| t != a).unwrap();
+                assert_eq!(context[after], END);
+                Ok(END)
+            },
+        )
+        .unwrap();
+        assert_eq!(calls, MIN_REPEAT_TOKENS + 1, "no model call after the loop");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("[stopped: the reply was repeating a 1-token block"));
+        assert!(!text.contains("Reply unfinished"));
+    }
+
+    #[test]
+    fn a_tool_call_is_the_same_whatever_its_json_spacing_or_key_order() {
+        assert_eq!(
+            call_key("cas_find", r#"{"pattern": "**/*.conf", "limit": 5}"#),
+            call_key("cas_find", r#" {"limit":5,"pattern":"**/*.conf"}"#)
+        );
+        assert_ne!(
+            call_key("cas_find", r#"{"pattern": "**/*.conf"}"#),
+            call_key("cas_find", r#"{"pattern": "**/*gcp*"}"#)
+        );
+        assert_ne!(
+            call_key("cas_find", r#"{"pattern": "x"}"#),
+            call_key("fs_find", r#"{"pattern": "x"}"#)
+        );
+    }
+
+    struct Counting(std::rc::Rc<std::cell::Cell<usize>>);
+
+    impl loadngo_inference::tools::Tool for Counting {
+        fn name(&self) -> &'static str {
+            "cas_find"
+        }
+        fn description(&self) -> &'static str {
+            "test"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn call(&self, _: &serde_json::Value) -> Result<String, String> {
+            self.0.set(self.0.get() + 1);
+            Ok("no matches".into())
+        }
+    }
+
+    // Uses only the downloaded Kimi Linear tokenizer files; no weights are read. The
+    // scripted "model" makes the same call every round, as Kimi did on 2026-09-27.
+    #[test]
+    #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files"]
+    fn a_repeated_tool_call_is_not_run_again_and_a_second_repeat_ends_the_turn() {
+        let dir = std::env::var("KIMI_LINEAR_CHECKPOINT").expect("set checkpoint directory");
+        let tokenizer = Tokenizer::load(dir).unwrap();
+        let format = ChatFormat::kimi_linear(&tokenizer, 163_586).unwrap();
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut tools = Toolbox::default();
+        tools.push(Box::new(Counting(ran.clone())));
+        let reply = |n: usize| {
+            tokenizer.encode(&format!(
+                "Let me look.<|tool_calls_section_begin|><|tool_call_begin|>functions.cas_find:{n}\
+                 <|tool_call_argument_begin|>{{\"pattern\": \"**/*.conf\"}}<|tool_call_end|>\
+                 <|tool_calls_section_end|><|im_end|>"
+            ))
+        };
+        let (mut round, mut at, mut saw_note) = (0, 0, false);
+        let mut out = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Find wg-gcp.conf\n/quit\n"[..],
+            &mut out,
+            |context| {
+                if at == 0 && round == 2 {
+                    saw_note = tokenizer.decode_lossy(context).contains(REPEATED_CALL);
+                }
+                let tokens = reply(round);
+                let token = tokens[at];
+                at += 1;
+                if at == tokens.len() {
+                    (round, at) = (round + 1, 0);
+                }
+                Ok(token)
+            },
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(ran.get(), 1, "the repeat was not run: {text}");
+        assert_eq!(round, 3, "the third identical call ended the turn: {text}");
+        assert!(text.contains("[tool call repeated: cas_find; not run again]"));
+        assert!(text.contains("[stopped: Kimi repeated the same tool call"));
+        assert!(saw_note, "the model was told why its call was not run");
     }
 
     #[test]

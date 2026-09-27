@@ -125,6 +125,39 @@ Measured through `launch-kimi-k3.sh`, piping "What is the capital of Japan?", `/
 The 66 s is paid once per launch. Saving the snapshot to disk, keyed by checkpoint,
 accelerator and declaration, would remove it too; that is not built.
 
+### Loop guards (2026-09-27)
+
+Chat decodes greedily, so once Kimi starts repeating herself nothing breaks the cycle.
+It happened twice before these guards:
+
+- On 2026-09-24 she listed tools that don't exist in a cycle until Ctrl-C.
+- On 2026-09-27 she made the same `cas_find **/*.conf` call three times, each after
+  the same paragraph, until the 8-round tool limit stopped her.
+
+`chat.rs` now has two guards, both per user message:
+
+- **Repeated tool calls.** A call with the same tool name and the same arguments as an
+  earlier call in the turn is not run again. She gets a note in place of the result:
+  the answer would not change, so answer with what she has or say what she could not
+  find. If a whole round is repeats a second time, the turn ends with
+  `[stopped: Kimi repeated the same tool call ...]`. Arguments are compared as JSON,
+  so key order and spacing don't matter.
+- **Repeating text.** When a reply's last tokens are 4 or more identical copies of one
+  block, totalling at least 64 tokens, with the block at most 200 tokens long, the
+  reply is closed with the end-of-message token. It is not left pending, and the
+  terminal shows `[stopped: the reply was repeating a N-token block ...]`. Three copies,
+  or a short run, are left alone, since lists and tables repeat legitimately.
+
+The tool guidance also tells her never to repeat a call and to say plainly when a
+search finds nothing. Tests:
+
+- `repeating_period_finds_loops_but_not_ordinary_repetition`;
+- `a_looping_reply_is_ended_and_the_conversation_goes_on`;
+- `a_tool_call_is_the_same_whatever_its_json_spacing_or_key_order`;
+- `a_repeated_tool_call_is_not_run_again_and_a_second_repeat_ends_the_turn`. This one is
+  ignored by default because it needs the real tokenizer. It replays the 09-27 call and
+  fails with the dedup disabled.
+
 ### 4-bit (MXFP4) routed experts: quality, measured 2026-09-25
 
 No checkpoint has been converted. `--experts mxfp4` rounds each routed expert to OCP MX
