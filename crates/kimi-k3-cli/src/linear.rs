@@ -37,8 +37,8 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
 }
 
-/// Read-only file tools for chat: the local drive, plus a signed CAS snapshot when
-/// `--cas-root` and `--cas-key` are given and it verifies. Reported on stderr.
+/// Read-only file tools for chat: the local drive, and every Archive CAS archive on the
+/// attached drives. Reported on stderr.
 fn toolbox(args: &Args) -> Toolbox {
     let mut tools = Toolbox::default();
     if args.no_tools {
@@ -85,28 +85,29 @@ fn toolbox(args: &Args) -> Toolbox {
             tools.push(tool);
         }
     }
-    match (&args.cas_root, &args.cas_key) {
-        (Some(root), Some(key)) => {
-            let start = Instant::now();
-            match data::archive_view::ArchiveView::open_newest_verified(root, key) {
-                Ok(view) => {
-                    eprintln!(
-                        "file tools: CAS snapshot {} ({} files), root {}, signed by {}, verified in {:.1?}",
-                        view.archive_id(),
-                        view.file_count(),
-                        view.root().to_hex(),
-                        view.signer(),
-                        start.elapsed()
-                    );
-                    for tool in loadngo_inference::cas_tools::cas_tools(view) {
-                        tools.push(tool);
-                    }
-                }
-                Err(error) => eprintln!("file tools: no CAS snapshot ({error:#})"),
-            }
-        }
-        (None, None) => {}
-        _ => eprintln!("file tools: --cas-root and --cas-key go together; CAS tools off"),
+    // Every Archive CAS archive on the attached drives, found the way the Archive CAS
+    // browser finds them; `--cas-root` adds a root discovery would miss, and `--cas-key`
+    // is the key signatures are checked against.
+    let key = args.cas_key.as_deref().and_then(|path| {
+        data::archive_cas_sign::read_public_key(path)
+            .map_err(|error| eprintln!("file tools: CAS key {}: {error:#}", path.display()))
+            .ok()
+    });
+    let archives =
+        loadngo_inference::cas_tools::Archives::new(args.cas_root.iter().cloned().collect(), key);
+    let roots = archives.roots();
+    eprintln!(
+        "archive tools: {} Archive CAS {} attached ({}); cas_archives lists every archive",
+        roots.len(),
+        if roots.len() == 1 { "root" } else { "roots" },
+        roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for tool in loadngo_inference::cas_tools::cas_tools(archives) {
+        tools.push(tool);
     }
     tools
 }

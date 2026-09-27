@@ -297,9 +297,10 @@ fn print_usage() {
          generation at a safe layer/output boundary; Ctrl-D exits at the prompt.\n\
          \x20 --fs-base DIR        optional: Kimi Linear chat reads local files (read-only)\n\
          \x20                      with relative paths starting here (default: current dir)\n\
-         \x20 --cas-root DIR       optional: also offer the newest snapshot in this Archive CAS\n\
-         \x20                      root that verifies against --cas-key (a public key)\n\
-         \x20 --cas-key PATH       optional: trusted Dilithium public key for --cas-root\n\
+         \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
+         \x20                      on attached drives (cas_archives lists every archive)\n\
+         \x20 --cas-key PATH       optional: trusted Dilithium public key; archives it signed\n\
+         \x20                      are marked signed, all others unsigned\n\
          \x20 --no-tools           optional: chat without file tools\n\
          \x20 --no-web             optional: chat without web_search/web_fetch (the only tools\n\
          \x20                      that send anything off this machine)\n\
