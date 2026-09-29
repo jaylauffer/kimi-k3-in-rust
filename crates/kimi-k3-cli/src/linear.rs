@@ -37,8 +37,7 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
 }
 
-/// Read-only file tools for chat: the local drive, and every Archive CAS archive on the
-/// attached drives. Reported on stderr.
+/// Local reads, claimed Rust edits, and read-only Archive CAS access for chat.
 fn toolbox(args: &Args) -> Toolbox {
     let mut tools = Toolbox::default();
     if args.no_tools {
@@ -64,6 +63,18 @@ fn toolbox(args: &Args) -> Toolbox {
         for tool in crate::board::Board::new(path, today).into_tools() {
             tools.push(tool);
         }
+    }
+    match crate::rust_tools::tools(&base) {
+        Ok(editors) => {
+            eprintln!(
+                "Rust editing: claimed .rs files under {} (rust_read, rust_write, rust_edit)",
+                base.display()
+            );
+            for tool in editors {
+                tools.push(tool);
+            }
+        }
+        Err(error) => eprintln!("Rust editing unavailable: {error}"),
     }
     for tool in FsTools::new(base, home.as_deref()).into_tools() {
         tools.push(tool);
