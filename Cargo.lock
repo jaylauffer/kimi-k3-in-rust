@@ -572,6 +572,7 @@ name = "loadngo-metal-compute"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "libc",
  "loadngo-proactor 0.1.0",
  "loadngo-weights",
  "objc2",

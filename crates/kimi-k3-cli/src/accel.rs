@@ -359,8 +359,12 @@ mod gpu {
 
     impl Gpu {
         pub fn new() -> Result<Self, String> {
+            let mut metal = Metal::new().map_err(|e| e.to_string())?;
+            // Weights locked in memory: a compressed expert, decompressed mid-token, cost
+            // seconds per token under memory pressure (METAL_COMPUTE_PLAN).
+            metal.set_wire_residents(true);
             Ok(Self {
-                metal: Metal::new().map_err(|e| e.to_string())?,
+                metal,
                 proactor: new_platform_proactor().map_err(|e| e.to_string())?,
                 residents: RefCell::new(HashMap::new()),
                 staging: RefCell::new(None),
@@ -379,42 +383,9 @@ mod gpu {
 
         #[allow(clippy::cast_precision_loss)] // byte counts and rates shown to one decimal
         pub fn summary(&self) -> String {
+            // Milliseconds per call, from a total in seconds over `n` calls.
+            let each = |total: f64, n: u64| if n == 0 { 0.0 } else { total / n as f64 * 1e3 };
             let s = self.stats.get();
-            let attention_each = |v: f64| {
-                if s.attention == 0 {
-                    0.0
-                } else {
-                    v / s.attention as f64 * 1e3
-                }
-            };
-            let mla_each = |v: f64| {
-                if s.mla_blocks == 0 {
-                    0.0
-                } else {
-                    v / s.mla_blocks as f64 * 1e3
-                }
-            };
-            let expert_each = |v: f64| {
-                if s.expert_layers == 0 {
-                    0.0
-                } else {
-                    v / s.expert_layers as f64 * 1e3
-                }
-            };
-            let kda_each = |v: f64| {
-                if s.kda_blocks == 0 {
-                    0.0
-                } else {
-                    v / s.kda_blocks as f64 * 1e3
-                }
-            };
-            let recurrence_each = |v: f64| {
-                if s.recurrence == 0 {
-                    0.0
-                } else {
-                    v / s.recurrence as f64 * 1e3
-                }
-            };
             let per = |v: f64| {
                 if s.steps == 0 {
                     0.0
@@ -423,7 +394,8 @@ mod gpu {
                 }
             };
             format!(
-                "gpu ({}): {:.1} GB of weights in GPU memory; {} steps, {} products, \
+                "gpu ({}): {:.1} GB of weights in GPU memory ({:.1} GB locked, {} arenas could \
+                 not be locked); {} steps, {} products, \
                  {:.1} GB read at {:.0} GB/s; per step {:.2} ms GPU, {:.2} ms wall \
                  ({:.2} ms encoding {:.0} dispatches, {:.2} ms to completion); \
                  {} steps to the ANE (weights not in GPU memory), {} GPU failures; \
@@ -436,6 +408,8 @@ mod gpu {
                  {:.2} ms GPU, {:.2} ms wall each, {} run step by step after a GPU failure | {}",
                 self.metal.name(),
                 s.shared_bytes as f64 / 1e9,
+                self.metal.wired_bytes() as f64 / 1e9,
+                self.metal.wire_failures(),
                 s.steps,
                 s.products,
                 s.weight_bytes as f64 / 1e9,
@@ -456,24 +430,24 @@ mod gpu {
                 s.to_ane,
                 s.failed,
                 s.attention,
-                attention_each(s.attention_gpu_s),
-                attention_each(s.attention_wall_s),
+                each(s.attention_gpu_s, s.attention),
+                each(s.attention_wall_s, s.attention),
                 s.attention_failed,
                 s.recurrence,
-                recurrence_each(s.recurrence_gpu_s),
-                recurrence_each(s.recurrence_wall_s),
+                each(s.recurrence_gpu_s, s.recurrence),
+                each(s.recurrence_wall_s, s.recurrence),
                 s.recurrence_failed,
                 s.kda_blocks,
-                kda_each(s.kda_block_gpu_s),
-                kda_each(s.kda_block_wall_s),
+                each(s.kda_block_gpu_s, s.kda_blocks),
+                each(s.kda_block_wall_s, s.kda_blocks),
                 s.kda_block_failed,
                 s.expert_layers,
-                expert_each(s.expert_gpu_s),
-                expert_each(s.expert_wall_s),
+                each(s.expert_gpu_s, s.expert_layers),
+                each(s.expert_wall_s, s.expert_layers),
                 s.expert_failed,
                 s.mla_blocks,
-                mla_each(s.mla_block_gpu_s),
-                mla_each(s.mla_block_wall_s),
+                each(s.mla_block_gpu_s, s.mla_blocks),
+                each(s.mla_block_wall_s, s.mla_blocks),
                 s.mla_block_failed,
                 self.ane.summary()
             )
@@ -913,10 +887,10 @@ mod gpu {
                 .iter()
                 .map(|x| {
                     [
-                        take(x.rows * x.w1.inp),
-                        take(x.rows * x.w1.out),
-                        take(x.rows * x.w3.out),
-                        take(x.rows * x.w2.out),
+                        take(x.rows.len() * x.w1.inp),
+                        take(x.rows.len() * x.w1.out),
+                        take(x.rows.len() * x.w3.out),
+                        take(x.rows.len() * x.w2.out),
                     ]
                 })
                 .collect();
@@ -927,8 +901,13 @@ mod gpu {
             let mut work = self.take_work(total)?;
             let floats = work.as_f32_mut();
             floats[sx..sx + job.shared_x.len()].copy_from_slice(job.shared_x);
+            // Each expert's rows, gathered from the layer's input.
             for (x, at) in job.experts.iter().zip(&layout) {
-                floats[at[0]..at[0] + x.x.len()].copy_from_slice(x.x);
+                let inp = x.w1.inp;
+                for (r, &row) in x.rows.iter().enumerate() {
+                    floats[at[0] + r * inp..at[0] + (r + 1) * inp]
+                        .copy_from_slice(&x.x[row * inp..(row + 1) * inp]);
+                }
             }
             let mut batch = self
                 .metal
@@ -949,13 +928,13 @@ mod gpu {
                         &resident(w)?,
                         (WORK, at[0] * 4, w.inp * 4),
                         (WORK, out * 4, w.out * 4),
-                        (x.rows, w.inp, w.out),
+                        (x.rows.len(), w.inp, w.out),
                     )?;
                 }
             }
             batch.barrier();
             for (x, at) in job.experts.iter().zip(&layout) {
-                let n = x.rows * x.w1.out;
+                let n = x.rows.len() * x.w1.out;
                 batch
                     .silu_mul(region(at[1], n), region(at[2], n), n)
                     .map_err(|e| e.to_string())?;
@@ -967,7 +946,7 @@ mod gpu {
                     &resident(x.w2)?,
                     (WORK, at[1] * 4, x.w2.inp * 4),
                     (WORK, at[3] * 4, x.w2.out * 4),
-                    (x.rows, x.w2.inp, x.w2.out),
+                    (x.rows.len(), x.w2.inp, x.w2.out),
                 )?;
             }
             let done = self.submit(batch)?;

@@ -150,18 +150,40 @@ pub fn run(
     let start = Instant::now();
     let mut model = LinearModel::load(&args.model_dir, gib(cache_gb)).map_err(|e| e.to_string())?;
     eprintln!("  resident weights loaded in {:.1?}", start.elapsed());
+    let device = accel::Device::open(args.accel)?;
+    let gpu = if args.accel == accel::AccelKind::Gpu {
+        Some(device.accel().ok_or("the GPU device did not open")?)
+    } else {
+        None
+    };
     if let Some(dir) = &args.mxfp4_experts {
         if args.experts != quality::ExpertFormat::Bf16 {
             return Err("--mxfp4-experts already reads 4-bit experts; drop --experts".into());
         }
         model.use_mxfp4_experts(dir).map_err(|e| e.to_string())?;
+    }
+    if let Some(accel) = gpu {
+        // The trunk first, before the experts are read: the heap never holds both.
+        let start = Instant::now();
+        let moved = model.share_weights(accel);
+        #[allow(clippy::cast_precision_loss)] // shown to one decimal of a GB
+        let gb = moved as f64 / 1e9;
+        eprintln!(
+            "  {gb:.1} GB of resident weights moved into GPU memory in {:.1?}",
+            start.elapsed()
+        );
+    }
+    if let Some(dir) = &args.mxfp4_experts {
         let start = Instant::now();
         let keep = || !cancel.load(Ordering::Relaxed);
-        let read = model.preload_experts(keep).map_err(|e| e.to_string())?;
+        let read = model
+            .preload_experts(keep, gpu)
+            .map_err(|e| e.to_string())?;
         if read > 0 {
             eprintln!(
-                "  {read} MXFP4 experts from {} resident in {:.1?}",
+                "  {read} MXFP4 experts from {} resident{} in {:.1?}",
                 dir.display(),
+                if gpu.is_some() { " in GPU memory" } else { "" },
                 start.elapsed()
             );
         } else {
@@ -171,22 +193,8 @@ pub fn run(
             );
         }
     }
-    let device = accel::Device::open(args.accel)?;
-    if args.accel == accel::AccelKind::Gpu {
-        let start = Instant::now();
-        let accel = device.accel().ok_or("the GPU device did not open")?;
-        let moved = model.share_weights(accel);
-        #[allow(clippy::cast_precision_loss)] // shown to one decimal of a GB
-        let gb = moved as f64 / 1e9;
-        eprintln!(
-            "  {gb:.1} GB of weights moved into GPU memory in {:.1?}{}",
-            start.elapsed(),
-            if model.experts_fit() {
-                ""
-            } else {
-                " (routed experts stream from the cache and run on the Neural Engine)"
-            }
-        );
+    if gpu.is_some() && !model.experts_fit() {
+        eprintln!("  routed experts stream from the cache and run on the Neural Engine");
     }
     let max_context = if args.max_context_given {
         args.max_context

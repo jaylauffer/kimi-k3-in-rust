@@ -307,9 +307,12 @@ now reads in 59.2 s, and a new token at that context takes 0.06 s. CPU and GPU s
 on 453 tokens: top-1 100%, KL 0.00000. Then whole KDA and MLA blocks and each layer's routed experts became single GPU
 submissions, about 82 round trips per token instead of 187. Short-context decoding is
 now 0.031 s/token (about 32 tokens/s, was 0.050), the long prompt 51 s, and decoding at
-~3.9k context 0.040 s/token. It still agrees with the CPU exactly on 453 tokens. The first tokens after a long prompt can
-stall for seconds under memory pressure (41 GB peak on a 64 GB Mac); see loadngo
-`docs/METAL_COMPUTE_PLAN.md`, "Fewer round trips". The text below predates these changes.
+~3.9k context 0.040 s/token. It still agrees with the CPU exactly on 453 tokens. Then the stalls after long prompts were fixed: the
+GPU weight memory is locked (it had been left mostly compressed), experts move into GPU
+memory layer by layer as they load (launch ~9 s faster, peak 37 GB), and the MoE layer
+reuses one scratch buffer instead of allocating per layer. The first token after the
+3,895-token prompt takes 0.24–0.30 s (was 1.5–5.9 s), and the prompt itself 44–47 s.
+See loadngo `docs/METAL_COMPUTE_PLAN.md`, "Memory". The text below predates these changes.
 
 - **Prompt processing is CPU-bound.** A `sample` during the preamble put about 54% of
   the main thread in single-threaded model code (MLA attention, which is quadratic in

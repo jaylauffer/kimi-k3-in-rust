@@ -389,6 +389,12 @@ impl Weight {
     /// Moves the weight into `device`'s memory; returns the bytes moved (0 when the
     /// device keeps it where it is).
     fn share(&mut self, device: &dyn DenseAccel) -> usize {
+        self.share_recycling(device, &mut Vec::new())
+    }
+
+    /// [`Self::share`], handing a moved MXFP4 weight's heap buffers to `spare` for reuse
+    /// instead of freeing them.
+    fn share_recycling(&mut self, device: &dyn DenseAccel, spare: &mut Vec<Vec<u8>>) -> usize {
         let shared = match &self.data {
             Stored::Bf16(w) => device.share_words(w).map(Stored::SharedBf16),
             Stored::Mxfp4 { packed, scales } => device
@@ -398,7 +404,10 @@ impl Weight {
             Stored::SharedBf16(_) | Stored::SharedMxfp4 { .. } => None,
         };
         let Some(shared) = shared else { return 0 };
-        self.data = shared;
+        if let Stored::Mxfp4 { packed, scales } = std::mem::replace(&mut self.data, shared) {
+            spare.push(packed);
+            spare.push(scales);
+        }
         match &self.data {
             Stored::SharedBf16(w) => w.bytes().len(),
             Stored::SharedMxfp4 { packed, scales } => packed.bytes().len() + scales.bytes().len(),
@@ -739,6 +748,7 @@ pub struct LinearModel {
     norm: Vec<f32>,
     layers: Vec<Layer>,
     experts: ExpertStore,
+    moe_scratch: MoeScratch,
 }
 
 #[derive(Clone)]
@@ -932,6 +942,7 @@ impl LinearModel {
             lm_head,
             norm,
             layers,
+            moe_scratch: MoeScratch::default(),
         })
     }
 
@@ -975,11 +986,18 @@ impl LinearModel {
     /// Reads every routed expert into the cache now, so no token waits on the drive.
     /// Only when they all fit ([`Self::experts_fit`]); returns how many were read.
     ///
+    /// With a `device`, each layer's experts move into its memory as soon as they are
+    /// read, and their heap buffers are reused to read the next layer: the heap never
+    /// holds more than one layer. Reading them all first and moving them afterwards held
+    /// two copies at once, and the memory pressure left most of the device's copy
+    /// compressed, to be decompressed during the first tokens.
+    ///
     /// # Errors
     /// A read or tensor error, or [`LinearError::Cancelled`] from `keep_running`.
     pub fn preload_experts(
         &mut self,
         mut keep_running: impl FnMut() -> bool,
+        device: Option<&dyn DenseAccel>,
     ) -> Result<usize, LinearError> {
         if !self.experts_fit() {
             return Ok(0);
@@ -993,6 +1011,18 @@ impl LinearModel {
             }
             self.experts
                 .ensure(&self.index, self.mxfp4.as_ref(), c, layer, &all)?;
+            if let Some(device) = device {
+                let store = &mut self.experts;
+                for slot in store.slots.iter_mut().filter(|s| s.key.0 == layer) {
+                    for w in [&mut slot.w1, &mut slot.w3, &mut slot.w2] {
+                        w.share_recycling(device, &mut store.spare);
+                    }
+                }
+            }
+        }
+        if device.is_some() {
+            // Every expert is in the device's memory; the read pool is not needed again.
+            self.experts.spare = Vec::new();
         }
         Ok((self.experts.stats.misses - before) as usize)
     }
@@ -1251,7 +1281,7 @@ impl LinearModel {
                         l,
                         t,
                         (&self.index, self.mxfp4.as_ref()),
-                        &mut self.experts,
+                        (&mut self.experts, &mut self.moe_scratch),
                         accel,
                     )?;
                 }
@@ -1686,6 +1716,26 @@ fn mlp(out: &mut [f32], x: &[f32], m: &Mlp, t: usize, accel: Accel<'_>) {
     );
 }
 
+/// A mixture-of-experts layer's large per-position arrays, reused across layers and
+/// passes: allocating and freeing them per layer cost ~1.4 million page faults (about
+/// 22 GB touched) in one 3,895-token prompt.
+#[derive(Default)]
+struct MoeScratch {
+    logits: Vec<f32>,
+    sg: Vec<f32>,
+    su: Vec<f32>,
+    sdn: Vec<f32>,
+    /// Every routed expert's output rows, expert after expert.
+    ys: Vec<f32>,
+}
+
+/// `v` as `n` zeros, reusing its allocation.
+fn zeroed(v: &mut Vec<f32>, n: usize) -> &mut [f32] {
+    v.clear();
+    v.resize(n, 0.0);
+    v
+}
+
 #[allow(clippy::too_many_lines)] // routing, both expert halves, then the mix
 fn moe(
     out: &mut [f32],
@@ -1695,33 +1745,40 @@ fn moe(
     layer: usize,
     t: usize,
     (index, mxfp4): (&SafeTensorIndex, Option<&SafeTensorIndex>),
-    experts: &mut ExpertStore,
+    (experts, scratch): (&mut ExpertStore, &mut MoeScratch),
     accel: Accel<'_>,
 ) -> Result<(), LinearError> {
     let e = c.hidden_size;
     let inter = c.moe_intermediate_size;
     let topk = c.num_experts_per_token;
+    let MoeScratch {
+        logits,
+        sg,
+        su,
+        sdn,
+        ys,
+    } = scratch;
     let mut idx = vec![0_usize; t * topk];
     let mut wt = vec![0.0_f32; t * topk];
     let mut seen = vec![false; c.num_experts];
     let mut uniq = Vec::new();
-    let mut sg = vec![0.0_f32; t * shared.inter];
-    let mut su = vec![0.0_f32; t * shared.inter];
+    let sg = zeroed(sg, t * shared.inter);
+    let su = zeroed(su, t * shared.inter);
     // With a device, the router's logits come from it, in the same batch as the shared
     // expert's gate and up (all three read `x`); the selection itself stays here. On the
     // CPU the reference router accumulates in f64.
     let routed_on_device = accel.is_some_and(DenseAccel::routes);
     if routed_on_device {
-        let mut logits = vec![0.0_f32; t * c.num_experts];
+        let logits = zeroed(logits, t * c.num_experts);
         products(
             accel,
             &mut [Mul {
                 x,
                 rows: t,
                 parts: vec![
-                    (router_w, &mut logits),
-                    (&shared.gate, &mut sg),
-                    (&shared.up, &mut su),
+                    (router_w, &mut *logits),
+                    (&shared.gate, &mut *sg),
+                    (&shared.up, &mut *su),
                 ],
             }],
         );
@@ -1761,42 +1818,51 @@ fn moe(
     }
     experts.ensure(index, mxfp4, c, layer, &uniq)?;
 
-    // Each expert once, over every (token, slot) that selected it, in slot order.
+    // Each expert once, over every (token, slot) that selected it, in slot order: the
+    // rows of `x` it reads, and where its output rows start in `ys`.
     let mut at = vec![usize::MAX; c.num_experts];
     for (i, &expert) in uniq.iter().enumerate() {
         at[expert] = i;
     }
-    let mut slots = vec![Vec::new(); uniq.len()];
+    let mut tokens = vec![Vec::new(); uniq.len()];
+    let mut pos = vec![0_usize; t * topk];
     for (slot, &selected) in idx.iter().enumerate() {
-        slots[at[selected]].push(slot);
+        tokens[at[selected]].push(slot / topk);
     }
-    let zs: Vec<Vec<f32>> = slots
-        .iter()
-        .map(|s| {
-            s.iter()
-                .flat_map(|&slot| &x[slot / topk * e..(slot / topk + 1) * e])
-                .copied()
-                .collect()
-        })
-        .collect();
-    let zeros = |width: usize| -> Vec<Vec<f32>> {
-        slots.iter().map(|s| vec![0.0; s.len() * width]).collect()
-    };
-    let mut ys = zeros(e);
-    let mut sdn = vec![0.0_f32; t * e];
+    let mut starts = Vec::with_capacity(uniq.len());
+    let mut next = 0;
+    for rows in &tokens {
+        starts.push(next);
+        next += rows.len() * e;
+    }
+    let mut rank = vec![0_usize; uniq.len()];
+    for (slot, &selected) in idx.iter().enumerate() {
+        let i = at[selected];
+        pos[slot] = starts[i] + rank[i] * e;
+        rank[i] += 1;
+    }
+    let ys = zeroed(ys, t * topk * e);
+    let sdn = zeroed(sdn, t * e);
+    let mut outputs: Vec<&mut [f32]> = Vec::with_capacity(uniq.len());
+    let mut rest = &mut ys[..];
+    for rows in &tokens {
+        let (head, tail) = rest.split_at_mut(rows.len() * e);
+        outputs.push(head);
+        rest = tail;
+    }
     // With the router on the device, the shared expert's gate and up are done: the rest
     // (every routed expert, the shared down projection) can go as one submission.
     let fused = routed_on_device && {
-        silu_mul(&mut sg, &su);
-        let jobs = zs
+        silu_mul(sg, su);
+        let jobs = tokens
             .iter()
-            .zip(&mut ys)
+            .zip(outputs.iter_mut())
             .zip(&uniq)
-            .map(|((z, y), &expert)| {
+            .map(|((rows, y), &expert)| {
                 let w = experts.get(layer, expert);
                 ExpertJob {
-                    x: z,
-                    rows: z.len() / e,
+                    x,
+                    rows,
                     w1: w.w1.shape(),
                     w3: w.w3.shape(),
                     w2: w.w2.shape(),
@@ -1808,23 +1874,23 @@ fn moe(
             device_accel.experts(&mut ExpertsJob {
                 experts: jobs,
                 shared: shared.down.shape(),
-                shared_x: &sg,
-                shared_y: &mut sdn,
+                shared_x: sg,
+                shared_y: sdn,
                 rows: t,
             })
         })
     };
     if !fused {
         routed_experts(
-            (&mut ys, &mut sdn),
-            (&zs, &uniq),
-            (&mut sg, &mut su),
+            (&mut outputs, &mut *sdn),
+            (&tokens, &uniq),
+            (&mut *sg, &mut *su),
             (x, shared, t, e, inter),
             (experts, layer, routed_on_device),
             accel,
         );
     }
-    mix(out, (&slots, &ys, &wt, &sdn), t, topk, e);
+    mix(out, (&pos, ys, &wt, sdn), t, topk, e);
     Ok(())
 }
 
@@ -1832,13 +1898,22 @@ fn moe(
 /// unless the router already did them), then the down projections.
 #[allow(clippy::type_complexity)]
 fn routed_experts(
-    (ys, sdn): (&mut [Vec<f32>], &mut [f32]),
-    (zs, uniq): (&[Vec<f32>], &[usize]),
+    (ys, sdn): (&mut [&mut [f32]], &mut [f32]),
+    (tokens, uniq): (&[Vec<usize>], &[usize]),
     (sg, su): (&mut [f32], &mut [f32]),
     (x, shared, t, e, inter): (&[f32], &Mlp, usize, usize, usize),
     (experts, layer, shared_done): (&ExpertStore, usize, bool),
     accel: Accel<'_>,
 ) {
+    let zs: Vec<Vec<f32>> = tokens
+        .iter()
+        .map(|rows| {
+            rows.iter()
+                .flat_map(|&r| &x[r * e..(r + 1) * e])
+                .copied()
+                .collect()
+        })
+        .collect();
     let zeros = || -> Vec<Vec<f32>> { zs.iter().map(|z| vec![0.0; z.len() / e * inter]).collect() };
     let (mut g, mut u) = (zeros(), zeros());
     let mut muls = Vec::new();
@@ -1874,33 +1949,28 @@ fn routed_experts(
         muls.push(Mul {
             x: gi,
             rows: gi.len() / inter,
-            parts: vec![(&w.w2, yi)],
+            parts: vec![(&w.w2, &mut **yi)],
         });
     }
     products(accel, &mut muls);
 }
 
-/// `out = sum over each position's slots of weight * expert output, + shared`.
+/// `out = sum over each position's slots, in order, of weight * expert output (its row
+/// at `pos[slot]` in `ys`), + shared`.
 #[allow(clippy::type_complexity)]
 fn mix(
     out: &mut [f32],
-    (slots, ys, wt, sdn): (&[Vec<usize>], &[Vec<f32>], &[f32], &[f32]),
+    (pos, ys, wt, sdn): (&[usize], &[f32], &[f32], &[f32]),
     t: usize,
     topk: usize,
     e: usize,
 ) {
-    let mut contrib = vec![0.0_f32; t * topk * e];
-    for (s, yi) in slots.iter().zip(ys) {
-        for (r, &slot) in s.iter().enumerate() {
-            contrib[slot * e..(slot + 1) * e].copy_from_slice(&yi[r * e..(r + 1) * e]);
-        }
-    }
     for step in 0..t {
         let row = &mut out[step * e..(step + 1) * e];
         row.fill(0.0);
         for j in 0..topk {
             let slot = step * topk + j;
-            for (oi, &ci) in row.iter_mut().zip(&contrib[slot * e..(slot + 1) * e]) {
+            for (oi, &ci) in row.iter_mut().zip(&ys[pos[slot]..pos[slot] + e]) {
                 *oi += wt[slot] * ci;
             }
         }

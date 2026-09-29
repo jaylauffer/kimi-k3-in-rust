@@ -255,11 +255,13 @@ pub struct MlaBlockJob<'a> {
     pub device: &'a mut DeviceCache,
 }
 
-/// One routed expert over the rows that selected it:
-/// `y = w2 (silu(w1 x) * (w3 x))`, `x` `[rows][w1.inp]`, `y` `[rows][w2.out]`.
+/// One routed expert over the positions that selected it:
+/// `y[i] = w2 (silu(w1 x[rows[i]]) * (w3 x[rows[i]]))`, with `x` the layer's whole input
+/// `[positions][w1.inp]` and `y` `[rows.len()][w2.out]`.
 pub struct ExpertJob<'a> {
     pub x: &'a [f32],
-    pub rows: usize,
+    /// The rows of `x` this expert reads, in order.
+    pub rows: &'a [usize],
     pub w1: WeightShape<'a>,
     pub w3: WeightShape<'a>,
     pub w2: WeightShape<'a>,
