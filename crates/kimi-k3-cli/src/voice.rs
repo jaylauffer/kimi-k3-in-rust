@@ -8,7 +8,7 @@
 //! the finished reply when the loop asks for the next message, then listens), and
 //! [`VoiceOutput`] passes the loop's output through while keeping the reply text.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Names the recognizer may hear for "Kimi".
@@ -78,8 +78,9 @@ pub use apple::VoiceInput;
 
 #[cfg(target_os = "macos")]
 mod apple {
-    use super::{BufRead, Mutex, PoisonError, Read, addressed, io, spoken_reply};
+    use super::{Mutex, PoisonError, addressed, io, spoken_reply};
     use loadngo_speech::{Listener, Speaker};
+    use std::io::{BufRead, Read};
     use std::sync::Arc;
     use std::time::Duration;
 

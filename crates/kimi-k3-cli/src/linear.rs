@@ -447,6 +447,9 @@ fn chat_io(args: &Args) -> Result<ChatIo, String> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Err("--voice needs macOS (on-device speech recognition)".into())
+        Err(format!(
+            "--voice (locale {}) needs macOS (on-device speech recognition)",
+            args.locale
+        ))
     }
 }

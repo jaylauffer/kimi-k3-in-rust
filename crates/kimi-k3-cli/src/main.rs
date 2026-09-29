@@ -32,6 +32,9 @@ mod quality;
 mod system_one;
 mod text_tools;
 mod thermal;
+// The wake-word parser and reply wrapper are portable and tested everywhere; only macOS
+// listens and speaks, so elsewhere they are used by the tests alone.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod voice;
 
 use kimi_k3_core::{
