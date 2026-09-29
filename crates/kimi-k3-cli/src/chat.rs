@@ -6,10 +6,13 @@
 
 use std::io::{BufRead, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kimi_k3_core::tokenizer::Tokenizer;
 use loadngo_inference::{Session, StopReason, Utf8Stream, tools::Toolbox};
+use serde_json::json;
+
+use crate::transcript::{Resumed, Transcript};
 
 const OPEN: u32 = 163_587;
 const CLOSE: u32 = 163_588;
@@ -18,13 +21,15 @@ const END: u32 = 163_586;
 const EOS: u32 = 163_585;
 
 const HELP: &str = "Type a message and press Enter. Commands:
-  /continue   resume a truncated or cancelled reply
+  /continue   resume a truncated or cancelled reply, or a turn paused at its budget or by
+              Ctrl-C (waiting tool calls run, with a fresh budget)
   /undo       remove the last user/reply pair (including an unfinished reply)
   /reset      clear conversation history
   /stats      show context usage
   /help       show these commands
-  /quit       exit (or Ctrl-D); Ctrl-C cancels generation
-One line per message. No transcript saving. Kimi Linear can read local files and the
+  /quit       exit (or Ctrl-D); Ctrl-C pauses a turn, and at the prompt quits
+One line per message. Chats are saved to ~/.loadngo/kimi/transcripts (--no-transcript
+turns that off); --resume latest picks the last one up. Kimi Linear can read local files and the
 signed CAS snapshot, and create/edit claimed workspace .rs, .md and .txt files (--no-tools
 disables these).
 File edits and terminal command side effects survive /undo and /reset.
@@ -293,8 +298,17 @@ impl ChatFormat {
         calls
     }
 
-    /// Tool results as the template's tool messages, then the assistant header.
-    fn tool_results(
+    /// The name saved chats record, so one is never resumed with another format's tokens.
+    #[must_use]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::K3 => "k3",
+            Self::KimiLinear(_) => "kimi-linear",
+        }
+    }
+
+    /// Tool results as the template's tool messages.
+    fn tool_messages(
         &self,
         tokenizer: &Tokenizer,
         results: &[(String, String, String)],
@@ -311,6 +325,19 @@ impl ChatFormat {
                 &format!("## Return of {id}\n{result}"),
             );
         }
+        ids
+    }
+
+    /// Tool results as the template's tool messages, then the assistant header.
+    fn tool_results(
+        &self,
+        tokenizer: &Tokenizer,
+        results: &[(String, String, String)],
+    ) -> Vec<u32> {
+        let Self::KimiLinear(t) = self else {
+            return Vec::new();
+        };
+        let mut ids = self.tool_messages(tokenizer, results);
         ids.push(t.assistant);
         ordinary(&mut ids, tokenizer, "assistant");
         ids.push(t.middle);
@@ -406,8 +433,90 @@ Prefer text_edit for claimed source changes. File edits and command side effects
 /undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
 successful edit you may read the updated file again. When a search finds nothing, say so plainly.";
 
-/// Most tool rounds (calls, results, continued reply) after one user message.
-const MAX_TOOL_ROUNDS: usize = 8;
+/// Limits on the work one user message leads to: every reply and tool round, until Kimi
+/// answers without calling a tool. Checked after each reply, before its tool calls run, so
+/// a reply in progress always finishes (it is bounded by `--gen` on its own).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnBudget {
+    /// Wall-clock time from the user's message; `None` is unlimited.
+    pub time: Option<Duration>,
+    /// Tokens Kimi generates across the turn's replies; `None` is unlimited.
+    pub tokens: Option<usize>,
+}
+
+impl TurnBudget {
+    pub const DEFAULT_MINUTES: u64 = 30;
+    pub const DEFAULT_TOKENS: usize = 16_384;
+
+    /// Why the turn should pause, once either limit is reached.
+    fn spent(&self, elapsed: Duration, tokens: usize) -> Option<String> {
+        if let Some(limit) = self.time.filter(|&limit| elapsed >= limit) {
+            return Some(format!("time budget of {} min spent", limit.as_secs() / 60));
+        }
+        let limit = self.tokens.filter(|&limit| tokens >= limit)?;
+        Some(format!("token budget of {limit} generated tokens spent"))
+    }
+}
+
+impl Default for TurnBudget {
+    fn default() -> Self {
+        Self {
+            time: Some(Duration::from_secs(Self::DEFAULT_MINUTES * 60)),
+            tokens: Some(Self::DEFAULT_TOKENS),
+        }
+    }
+}
+
+impl std::fmt::Display for TurnBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.time {
+            Some(time) => write!(f, "{} min", time.as_secs() / 60)?,
+            None => write!(f, "no time limit")?,
+        }
+        match self.tokens {
+            Some(tokens) => write!(f, ", {tokens} generated tokens"),
+            None => write!(f, ", no token limit"),
+        }
+    }
+}
+
+/// Tool calls from a finished reply that have not all run: the turn's budget ran out or
+/// Jay pressed Ctrl-C. `/continue` runs the rest; a new message answers them as not run.
+#[derive(Clone, Debug, Default)]
+pub struct Held {
+    /// `(call id, tool name, result)` for the calls that ran.
+    pub(crate) done: Vec<(String, String, String)>,
+    /// `(call id, arguments)` for the calls still to run.
+    pub(crate) remaining: Vec<(String, String)>,
+}
+
+const NOT_RUN: &str = "Not run: Jay paused this turn before this call ran and has sent a \
+new message instead. Do not assume the call happened.";
+
+impl Held {
+    /// Every call's result, the ones not run marked so.
+    fn abandoned(&self) -> Vec<(String, String, String)> {
+        self.done
+            .iter()
+            .cloned()
+            .chain(
+                self.remaining
+                    .iter()
+                    .map(|(id, _)| (id.clone(), tool_name(id).to_string(), NOT_RUN.to_string())),
+            )
+            .collect()
+    }
+}
+
+/// How a chat is budgeted, saved and started.
+#[derive(Default)]
+pub struct ChatOptions {
+    pub budget: TurnBudget,
+    /// Where the chat is saved; `None` keeps it in memory only.
+    pub transcript: Option<Transcript>,
+    /// A saved chat to carry on from.
+    pub resumed: Option<Resumed>,
+}
 
 /// A reply is ending in a loop once its last tokens are at least this many copies of one
 /// block ...
@@ -534,6 +643,7 @@ pub fn run(
     input: impl BufRead,
     output: impl Write,
     next: impl FnMut(&[u32]) -> Result<u32, String>,
+    options: ChatOptions,
 ) -> Result<(), String> {
     validate(tokenizer)?;
     run_with(
@@ -547,11 +657,16 @@ pub fn run(
         input,
         output,
         next,
+        options,
     )
 }
 
 /// Blocking terminal frontend. No application-local polling/timer/worker loop.
 /// The caller's model and disk cache stay loaded for the lifetime of this call.
+///
+/// One user message may lead to any number of replies and tool rounds. The turn ends
+/// when Kimi answers without calling a tool, or pauses when `options.budget` is spent or
+/// Jay presses Ctrl-C; `/continue` picks a paused turn up again with a fresh budget.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn run_with(
     format: &ChatFormat,
@@ -564,14 +679,53 @@ pub fn run_with(
     mut input: impl BufRead,
     mut output: impl Write,
     mut next: impl FnMut(&[u32]) -> Result<u32, String>,
+    options: ChatOptions,
 ) -> Result<(), String> {
-    let mut session = Session::new(max_context).map_err(|e| e.to_string())?;
+    let ChatOptions {
+        budget,
+        mut transcript,
+        resumed,
+    } = options;
+    let was_resumed = resumed.is_some();
+    // `reply_start`: where the latest assistant message begins, so a reply continued
+    // after a pause is read for tool calls as a whole. `held`: calls not yet run.
+    let (mut session, mut reply_start, mut held) = match resumed {
+        Some(saved) => (saved.session, saved.reply_start, saved.held),
+        None => (
+            Session::new(max_context).map_err(|e| e.to_string())?,
+            0,
+            None,
+        ),
+    };
     let mut display = Display::default();
     // The reply being generated, for the repetition check; reused across replies.
     let mut reply = Vec::with_capacity(max_tokens.min(max_context));
     writeln!(output, "{HELP}").map_err(|e| e.to_string())?;
+    writeln!(output, "Turn budget: {budget}.").map_err(|e| e.to_string())?;
+    if let Some(transcript) = &transcript {
+        writeln!(output, "Transcript: {}", transcript.log_path().display())
+            .map_err(|e| e.to_string())?;
+    }
+    if was_resumed {
+        writeln!(
+            output,
+            "Resumed a saved chat: {} context tokens.{}",
+            session.tokens().len(),
+            if session.is_pending() {
+                " The last reply is unfinished: /continue finishes it."
+            } else if held.is_some() {
+                " Tool calls are waiting: /continue runs them."
+            } else {
+                ""
+            }
+        )
+        .map_err(|e| e.to_string())?;
+    }
     loop {
         generating.store(false, Ordering::Relaxed);
+        if let Some(transcript) = &mut transcript {
+            transcript.save_state(&session, reply_start, held.as_ref());
+        }
         write!(output, "\nYou> ")
             .and_then(|()| output.flush())
             .map_err(|e| e.to_string())?;
@@ -589,6 +743,7 @@ pub fn run_with(
         if text.trim().is_empty() {
             continue;
         }
+        let mut run_held = None;
         match text {
             "/quit" | "/exit" => break,
             "/help" => {
@@ -598,23 +753,29 @@ pub fn run_with(
             "/stats" => {
                 writeln!(
                     output,
-                    "{} / {} context tokens; unfinished reply: {}",
+                    "{} / {} context tokens; unfinished reply: {}; waiting tool calls: {}; \
+                     turn budget: {budget}",
                     session.tokens().len(),
                     session.max_context(),
-                    session.is_pending()
+                    session.is_pending(),
+                    held.as_ref().map_or(0, |h| h.remaining.len()),
                 )
                 .map_err(|e| e.to_string())?;
                 continue;
             }
             "/reset" => {
                 session.reset();
+                (reply_start, held) = (0, None);
                 display = Display::default();
+                log(&mut transcript, json!({"event": "command", "text": text}));
                 writeln!(output, "Conversation cleared.").map_err(|e| e.to_string())?;
                 continue;
             }
             "/undo" => {
                 let removed = session.undo();
+                (reply_start, held) = (session.tokens().len(), None);
                 display = Display::default();
+                log(&mut transcript, json!({"event": "command", "text": text}));
                 writeln!(
                     output,
                     "{}",
@@ -629,24 +790,33 @@ pub fn run_with(
             }
             "/continue" => {
                 if !session.is_pending() {
-                    writeln!(output, "No unfinished reply.").map_err(|e| e.to_string())?;
-                    continue;
+                    run_held = held.take();
+                    if run_held.is_none() {
+                        writeln!(output, "Nothing to continue.").map_err(|e| e.to_string())?;
+                        continue;
+                    }
                 }
+                log(&mut transcript, json!({"event": "command", "text": text}));
             }
             command if command.starts_with('/') => {
                 writeln!(output, "Unknown command; use /help.").map_err(|e| e.to_string())?;
                 continue;
             }
             _ => {
-                if let Err(error) = session.begin_turn(&format.prompt(
-                    tokenizer,
-                    text,
-                    session.tokens().is_empty(),
-                    tools,
-                )) {
+                // Calls left waiting are answered as not run, so the history stays a
+                // well-formed conversation, then the new message follows.
+                let mut ids = held.as_ref().map_or_else(Vec::new, |held| {
+                    format.tool_messages(tokenizer, &held.abandoned())
+                });
+                ids.extend(format.prompt(tokenizer, text, session.tokens().is_empty(), tools));
+                if let Err(error) = session.begin_turn(&ids) {
                     writeln!(output, "{error}").map_err(|e| e.to_string())?;
                     continue;
                 }
+                held = None;
+                reply_start = session.tokens().len();
+                reply.clear();
+                log(&mut transcript, json!({"event": "user", "text": text}));
                 display = Display::default();
                 write!(output, "{}", format.opening())
                     .and_then(|()| output.flush())
@@ -654,115 +824,152 @@ pub fn run_with(
             }
         }
         cancel.store(false, Ordering::Relaxed);
+        // For the whole turn, tool rounds included: Ctrl-C pauses it instead of quitting.
+        generating.store(true, Ordering::Relaxed);
+        let turn_started = Instant::now();
+        let mut turn_tokens = 0;
+        let mut rounds = 0;
         let mut earlier_calls = Vec::new();
         let mut repeated_rounds = 0;
-        for round in 0..=MAX_TOOL_ROUNDS {
-            let reply_start = session.tokens().len();
-            generating.store(true, Ordering::Relaxed);
-            let started = Instant::now();
-            let stops = format.stops();
-            // Once the reply is looping, the next "token" is the end of the message: the
-            // turn closes normally instead of running to the token limit.
-            let looping = std::cell::Cell::new(None);
-            reply.clear();
-            let result = session.generate(
-                max_tokens,
-                &stops,
-                cancel,
-                |context| match looping.get() {
-                    Some(_) => Ok(stops[0]),
-                    None => next(context),
-                },
-                |token| {
-                    write!(output, "{}", format.push(&mut display, tokenizer, token))
-                        .and_then(|()| output.flush())
+        let stop: Option<String> = loop {
+            let mut calls = if let Some(calls) = run_held.take() {
+                calls
+            } else {
+                let round_start = session.tokens().len();
+                let started = Instant::now();
+                let stops = format.stops();
+                // Once the reply is looping, the next "token" is the end of the message:
+                // the turn closes normally instead of running to the token limit.
+                let looping = std::cell::Cell::new(None);
+                let result = session.generate(
+                    max_tokens,
+                    &stops,
+                    cancel,
+                    |context| match looping.get() {
+                        Some(_) => Ok(stops[0]),
+                        None => next(context),
+                    },
+                    |token| {
+                        write!(output, "{}", format.push(&mut display, tokenizer, token))
+                            .and_then(|()| output.flush())
+                            .map_err(|e| e.to_string())?;
+                        reply.push(token);
+                        if looping.get().is_none() {
+                            looping.set(repeating_period(&reply));
+                        }
+                        Ok(())
+                    },
+                );
+                let done = match result {
+                    Ok(done) => done,
+                    Err(loadngo_inference::Error::Output(error)) => return Err(error),
+                    Err(error) => {
+                        writeln!(
+                            output,
+                            "\n{error}; /continue retries, /undo discards this turn."
+                        )
                         .map_err(|e| e.to_string())?;
-                    reply.push(token);
-                    if looping.get().is_none() {
-                        looping.set(repeating_period(&reply));
+                        break Some(error.to_string());
                     }
-                    Ok(())
-                },
-            );
-            generating.store(false, Ordering::Relaxed);
-            let done = match result {
-                Ok(done) => done,
-                Err(loadngo_inference::Error::Output(error)) => return Err(error),
-                Err(error) => {
+                };
+                turn_tokens += done.tokens;
+                rounds += 1;
+                if done.reason == StopReason::EndToken {
+                    write!(output, "{}", terminal_text(&display.utf8.finish()))
+                        .map_err(|e| e.to_string())?;
+                }
+                writeln!(
+                    output,
+                    "\n[{:?}: {} tokens, {:.1}s, context {}/{}]",
+                    done.reason,
+                    done.tokens,
+                    started.elapsed().as_secs_f64(),
+                    session.tokens().len(),
+                    max_context
+                )
+                .map_err(|e| e.to_string())?;
+                log(
+                    &mut transcript,
+                    json!({
+                        "event": "reply",
+                        "text": tokenizer.decode_lossy(&session.tokens()[round_start..]),
+                        "tokens": done.tokens,
+                        "stop": format!("{:?}", done.reason),
+                        "seconds": started.elapsed().as_secs_f64(),
+                        "context": session.tokens().len(),
+                    }),
+                );
+                if session.is_pending() {
+                    let why = if done.reason == StopReason::ContextLimit {
+                        "Context full. Use /undo or /reset."
+                    } else {
+                        "Reply unfinished. Use /continue, /undo or /reset."
+                    };
+                    writeln!(output, "{why}").map_err(|e| e.to_string())?;
+                    break Some(format!("{:?}", done.reason));
+                }
+                if let Some(period) = looping.get() {
                     writeln!(
                         output,
-                        "\n{error}; /continue retries, /undo discards this turn."
+                        "[stopped: the reply was repeating a {period}-token block; \
+                         /undo removes this turn]"
                     )
                     .map_err(|e| e.to_string())?;
-                    break;
+                    break Some("repeating reply".into());
+                }
+                if tools.is_none() {
+                    break None;
+                }
+                let calls = format.tool_calls(tokenizer, &session.tokens()[reply_start..]);
+                if calls.is_empty() {
+                    break None;
+                }
+                if calls.iter().all(|(id, arguments)| {
+                    let key = call_key(tool_name(id), arguments);
+                    !repeatable_tool(&key.0) && earlier_calls.contains(&key)
+                }) {
+                    repeated_rounds += 1;
+                    if repeated_rounds == 2 {
+                        writeln!(
+                            output,
+                            "[stopped: Kimi repeated the same tool call; ask differently or /reset]"
+                        )
+                        .map_err(|e| e.to_string())?;
+                        break Some("repeated tool call".into());
+                    }
+                }
+                Held {
+                    done: Vec::new(),
+                    remaining: calls,
                 }
             };
-            if done.reason == StopReason::EndToken {
-                write!(output, "{}", terminal_text(&display.utf8.finish()))
-                    .map_err(|e| e.to_string())?;
-            }
-            writeln!(
-                output,
-                "\n[{:?}: {} tokens, {:.1}s, context {}/{}]",
-                done.reason,
-                done.tokens,
-                started.elapsed().as_secs_f64(),
-                session.tokens().len(),
-                max_context
-            )
-            .map_err(|e| e.to_string())?;
-            if session.is_pending() {
-                writeln!(output, "Reply unfinished. Use /continue, /undo or /reset.")
-                    .map_err(|e| e.to_string())?;
-                break;
-            }
-            if let Some(period) = looping.get() {
+            let Some(tools) = tools else { break None };
+            if let Some(spent) = budget.spent(turn_started.elapsed(), turn_tokens) {
                 writeln!(
                     output,
-                    "[stopped: the reply was repeating a {period}-token block; \
-                     /undo removes this turn]"
+                    "[paused: {spent}. /continue runs the {} waiting tool call(s) with a \
+                     fresh budget; a new message goes on without them]",
+                    calls.remaining.len()
                 )
                 .map_err(|e| e.to_string())?;
-                break;
+                held = Some(calls);
+                break Some(spent);
             }
-            let Some(tools) = tools else { break };
-            let calls = format.tool_calls(tokenizer, &session.tokens()[reply_start..]);
-            if calls.is_empty() {
-                break;
-            }
-            let keys: Vec<_> = calls
-                .iter()
-                .map(|(id, arguments)| call_key(tool_name(id), arguments))
-                .collect();
-            if keys
-                .iter()
-                .all(|key| !repeatable_tool(&key.0) && earlier_calls.contains(key))
-            {
-                repeated_rounds += 1;
-                if repeated_rounds == 2 {
-                    writeln!(
-                        output,
-                        "[stopped: Kimi repeated the same tool call; ask differently or /reset]"
-                    )
-                    .map_err(|e| e.to_string())?;
-                    break;
-                }
-            }
-            if round == MAX_TOOL_ROUNDS {
-                writeln!(
-                    output,
-                    "[tool limit: {MAX_TOOL_ROUNDS} rounds; ask a narrower question]"
-                )
-                .map_err(|e| e.to_string())?;
-                break;
-            }
-            let mut results = Vec::new();
-            for ((id, arguments), key) in calls.into_iter().zip(keys) {
+            while !calls.remaining.is_empty() && !cancel.load(Ordering::Relaxed) {
+                let (id, arguments) = calls.remaining.remove(0);
                 let name = tool_name(&id).to_string();
+                let key = call_key(&name, &arguments);
+                log(
+                    &mut transcript,
+                    json!({"event": "tool_call", "name": name, "arguments": arguments}),
+                );
                 if !repeatable_tool(&name) && earlier_calls.contains(&key) {
                     writeln!(output, "[tool call repeated: {name}; not run again]")
                         .map_err(|e| e.to_string())?;
-                    results.push((id, name, REPEATED_CALL.to_string()));
+                    if let Some(transcript) = &mut transcript {
+                        transcript.tool_result(&name, REPEATED_CALL);
+                    }
+                    calls.done.push((id, name, REPEATED_CALL.to_string()));
                     continue;
                 }
                 let text = match tools.call(&name, &arguments) {
@@ -797,10 +1004,25 @@ pub fn run_with(
                 };
                 writeln!(output, "[tool result {name}: {} bytes]", text.len())
                     .map_err(|e| e.to_string())?;
-                results.push((id, name, text));
+                if let Some(transcript) = &mut transcript {
+                    transcript.tool_result(&name, &text);
+                }
+                calls.done.push((id, name, text));
                 earlier_calls.push(key);
             }
+            if !calls.remaining.is_empty() {
+                writeln!(
+                    output,
+                    "[paused by Ctrl-C: {} tool call(s) not run. /continue runs them; a new \
+                     message goes on without them]",
+                    calls.remaining.len()
+                )
+                .map_err(|e| e.to_string())?;
+                held = Some(calls);
+                break Some("interrupted".into());
+            }
             // Fit the results into what is left of the context, keeping room to answer.
+            let mut results = calls.done;
             let mut prompt = format.tool_results(tokenizer, &results);
             let room = max_context.saturating_sub(session.tokens().len() + max_tokens.min(512));
             while prompt.len() > room && results.iter().any(|(_, _, t)| t.len() > 200) {
@@ -821,15 +1043,41 @@ pub fn run_with(
                     "{error}: tool results do not fit; /reset to start over"
                 )
                 .map_err(|e| e.to_string())?;
-                break;
+                break Some("context full".into());
+            }
+            reply_start = session.tokens().len();
+            reply.clear();
+            if let Some(transcript) = &mut transcript {
+                transcript.save_state(&session, reply_start, None);
             }
             display = Display::default();
             write!(output, "{}", format.opening())
                 .and_then(|()| output.flush())
                 .map_err(|e| e.to_string())?;
-        }
+        };
+        log(
+            &mut transcript,
+            json!({
+                "event": "turn_end",
+                "stop": stop.as_deref().unwrap_or("answered"),
+                "replies": rounds,
+                "tokens": turn_tokens,
+                "seconds": turn_started.elapsed().as_secs_f64(),
+            }),
+        );
+    }
+    generating.store(false, Ordering::Relaxed);
+    if let Some(transcript) = &mut transcript {
+        transcript.save_state(&session, reply_start, held.as_ref());
+        transcript.event(json!({"event": "exit"}));
     }
     Ok(())
+}
+
+fn log(transcript: &mut Option<Transcript>, event: serde_json::Value) {
+    if let Some(transcript) = transcript {
+        transcript.event(event);
+    }
 }
 
 #[cfg(test)]
@@ -946,7 +1194,7 @@ mod tests {
                 ids
             })
             .collect();
-        replies.insert(8, vec![t.end]); // Finish within the per-turn tool limit.
+        replies.insert(8, vec![t.end]); // The first message's turn ends here.
         replies.push(vec![t.end]);
         let mut replies = replies.into_iter().flatten();
         let mut output = Vec::new();
@@ -961,6 +1209,7 @@ mod tests {
             &b"Run checks\nStop the session\n/quit\n"[..],
             &mut output,
             |_| Ok(replies.next().expect("scripted reply")),
+            ChatOptions::default(),
         )
         .unwrap();
         assert_eq!(*recorded.borrow(), expected);
@@ -969,6 +1218,284 @@ mod tests {
                 .unwrap()
                 .contains("tool call repeated")
         );
+    }
+
+    /// Records each call's arguments; with `cancel`, presses Ctrl-C during its first call.
+    struct Step(
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        Option<std::sync::Arc<AtomicBool>>,
+    );
+
+    impl loadngo_inference::tools::Tool for Step {
+        fn name(&self) -> &'static str {
+            "fs_read"
+        }
+        fn description(&self) -> &'static str {
+            "test"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn call(&self, arguments: &serde_json::Value) -> Result<String, String> {
+            if let Some(cancel) = self.1.as_ref().filter(|_| self.0.borrow().is_empty()) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            self.0.borrow_mut().push(arguments["path"].to_string());
+            Ok("read".into())
+        }
+    }
+
+    /// Scripted replies: `rounds` replies that each call `fs_read` `per_round` times on new
+    /// paths, then a plain answer; the model is fed from the returned iterator.
+    fn stepping_replies(
+        tokenizer: &Tokenizer,
+        t: &LinearTokens,
+        rounds: usize,
+        per_round: usize,
+    ) -> std::vec::IntoIter<u32> {
+        let mut ids = Vec::new();
+        for round in 0..rounds {
+            ids.push(t.section_begin);
+            for call in 0..per_round {
+                ids.push(t.call_begin);
+                ordinary(
+                    &mut ids,
+                    tokenizer,
+                    &format!("functions.fs_read:{round}{call}"),
+                );
+                ids.push(t.argument_begin);
+                ordinary(
+                    &mut ids,
+                    tokenizer,
+                    &format!("{{\"path\": \"{round}-{call}\"}}"),
+                );
+                ids.push(t.call_end);
+            }
+            ids.extend([t.section_end, t.end]);
+        }
+        ordinary(&mut ids, tokenizer, "Done.");
+        ids.push(t.end);
+        ids.into_iter()
+    }
+
+    fn stepping_tools(
+        cancel: Option<std::sync::Arc<AtomicBool>>,
+    ) -> (Toolbox, std::rc::Rc<std::cell::RefCell<Vec<String>>>) {
+        let ran = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut tools = Toolbox::default();
+        tools.push(Box::new(Step(ran.clone(), cancel)));
+        (tools, ran)
+    }
+
+    #[test]
+    fn a_turn_runs_as_many_tool_rounds_as_the_work_needs() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let mut replies = stepping_replies(&tokenizer, t, 20, 1);
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Work through it\n/quit\n"[..],
+            &mut output,
+            |_| Ok(replies.next().expect("scripted reply")),
+            ChatOptions::default(),
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(ran.borrow().len(), 20, "{output}");
+        assert!(output.contains("Done."));
+        assert!(!output.contains("[paused"));
+    }
+
+    #[test]
+    fn a_spent_budget_pauses_the_turn_and_continue_runs_the_waiting_calls() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let mut replies = stepping_replies(&tokenizer, t, 3, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let transcript =
+            Transcript::create(dir.path(), "kimi-linear", std::path::Path::new("/m")).unwrap();
+        let log = transcript.log_path().to_path_buf();
+        let options = ChatOptions {
+            // One scripted reply is longer than this, so every round pauses.
+            budget: TurnBudget {
+                time: None,
+                tokens: Some(1),
+            },
+            transcript: Some(transcript),
+            resumed: None,
+        };
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Work\n/stats\n/continue\n/continue\n/continue\n/continue\n/quit\n"[..],
+            &mut output,
+            |_| Ok(replies.next().expect("scripted reply")),
+            options,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(
+            output
+                .matches("[paused: token budget of 1 generated tokens spent")
+                .count(),
+            3,
+            "{output}"
+        );
+        assert!(output.contains("waiting tool calls: 2"), "{output}");
+        assert_eq!(ran.borrow().len(), 6, "{output}");
+        assert!(output.contains("Done."));
+        assert!(output.contains("Nothing to continue."));
+        let log = std::fs::read_to_string(log).unwrap();
+        for event in [
+            "\"user\"",
+            "\"reply\"",
+            "\"tool_call\"",
+            "\"tool_result\"",
+            "\"turn_end\"",
+            "\"exit\"",
+        ] {
+            assert!(
+                log.contains(&format!("\"event\":{event}")),
+                "{event} missing: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_c_during_a_tool_holds_the_rest_and_a_resumed_chat_can_run_them() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (tools, ran) = stepping_tools(Some(cancel.clone()));
+        let mut replies = stepping_replies(&tokenizer, t, 1, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let options = ChatOptions {
+            transcript: Some(
+                Transcript::create(dir.path(), "kimi-linear", std::path::Path::new("/m")).unwrap(),
+            ),
+            ..ChatOptions::default()
+        };
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &cancel,
+            &AtomicBool::new(false),
+            &b"Work\n/quit\n"[..],
+            &mut output,
+            |_| Ok(replies.next().expect("scripted reply")),
+            options,
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(ran.borrow().len(), 1, "{output}");
+        assert!(
+            output.contains("[paused by Ctrl-C: 2 tool call(s) not run"),
+            "{output}"
+        );
+
+        // A new process: the saved chat, its two waiting calls, then Kimi's answer.
+        let (transcript, resumed) =
+            Transcript::resume(dir.path(), "latest", "kimi-linear", 32_768).unwrap();
+        let history = resumed.session.tokens().to_vec();
+        let mut output = Vec::new();
+        let mut answer = {
+            let mut ids = Vec::new();
+            ordinary(&mut ids, &tokenizer, "Done.");
+            ids.push(t.end);
+            ids.into_iter()
+        };
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"/continue\n/quit\n"[..],
+            &mut output,
+            |context| {
+                assert!(context.starts_with(&history));
+                Ok(answer.next().expect("scripted reply"))
+            },
+            ChatOptions {
+                transcript: Some(transcript),
+                resumed: Some(resumed),
+                ..ChatOptions::default()
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("Tool calls are waiting"), "{output}");
+        assert_eq!(*ran.borrow(), ["\"0-0\"", "\"0-1\"", "\"0-2\""], "{output}");
+        assert!(output.contains("Done."), "{output}");
+    }
+
+    #[test]
+    fn a_new_message_answers_waiting_calls_as_not_run() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let mut replies = stepping_replies(&tokenizer, t, 1, 1);
+        let mut saw_note = false;
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Work\nNever mind\n/quit\n"[..],
+            &mut output,
+            |context| {
+                let text = tokenizer.decode_lossy(context);
+                saw_note |= text.contains(NOT_RUN) && text.ends_with("assistant");
+                Ok(replies.next().unwrap_or(t.end))
+            },
+            ChatOptions {
+                budget: TurnBudget {
+                    time: None,
+                    tokens: Some(1),
+                },
+                ..ChatOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(ran.borrow().is_empty());
+        assert!(saw_note, "{}", String::from_utf8(output).unwrap());
     }
 
     fn reference_segments_match(tokenizer: &Tokenizer) {
@@ -1028,6 +1555,7 @@ mod tests {
                 }
                 Ok(END)
             },
+            ChatOptions::default(),
         )
         .unwrap();
         assert_eq!(calls, 2);
@@ -1063,6 +1591,7 @@ mod tests {
                     _ => Ok(END),
                 }
             },
+            ChatOptions::default(),
         )
         .unwrap();
         assert_eq!(calls, 3);
@@ -1143,6 +1672,7 @@ mod tests {
                 assert_eq!(context[after], END);
                 Ok(END)
             },
+            ChatOptions::default(),
         )
         .unwrap();
         assert_eq!(calls, MIN_REPEAT_TOKENS + 1, "no model call after the loop");
@@ -1227,6 +1757,7 @@ mod tests {
                 }
                 Ok(token)
             },
+            ChatOptions::default(),
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
@@ -1334,6 +1865,7 @@ mod tests {
                 }
                 Ok(END)
             },
+            ChatOptions::default(),
         )
         .unwrap();
         assert_eq!(calls, 2);

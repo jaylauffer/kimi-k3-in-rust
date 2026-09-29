@@ -21,7 +21,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod accel;
 mod board;
@@ -44,6 +44,7 @@ mod terminal {
 }
 mod text_tools;
 mod thermal;
+mod transcript;
 // The wake-word parser and reply wrapper are portable and tested everywhere; only macOS
 // listens and speaks, so elsewhere they are used by the tests alone.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -100,6 +101,9 @@ struct Args {
     temperature: f32,
     voice: bool,
     locale: String,
+    budget: chat::TurnBudget,
+    no_transcript: bool,
+    resume: Option<String>,
 }
 
 impl Args {
@@ -136,6 +140,9 @@ impl Args {
         let mut temperature = 1.0_f32;
         let mut voice = false;
         let mut locale = String::from("en-US");
+        let mut budget = chat::TurnBudget::default();
+        let mut no_transcript = false;
+        let mut resume = None;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -195,6 +202,16 @@ impl Args {
                 "--temperature" => temperature = parse_arg(&mut raw, "--temperature")?,
                 "--voice" => voice = true,
                 "--locale" => locale = next_value(&mut raw, "--locale")?,
+                "--turn-minutes" => {
+                    let minutes: u64 = parse_arg(&mut raw, "--turn-minutes")?;
+                    budget.time = (minutes > 0).then(|| Duration::from_secs(minutes * 60));
+                }
+                "--turn-tokens" => {
+                    let tokens: usize = parse_arg(&mut raw, "--turn-tokens")?;
+                    budget.tokens = (tokens > 0).then_some(tokens);
+                }
+                "--no-transcript" => no_transcript = true,
+                "--resume" => resume = Some(next_value(&mut raw, "--resume")?),
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
                 "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
@@ -213,6 +230,11 @@ impl Args {
                 return Err("pass only one of --prompt or --prompt-file".to_owned());
             }
             _ => {}
+        }
+        if resume.is_some() && (!chat || no_transcript) {
+            return Err(
+                "--resume needs chat and saved transcripts (no --no-transcript); run --help".into(),
+            );
         }
         if chat && (prompt.is_some() || prompt_file.is_some() || layers.is_some()) {
             return Err("--chat cannot be combined with --prompt, --prompt-file or diagnostic --layers; run --help".into());
@@ -261,8 +283,41 @@ impl Args {
             temperature,
             voice,
             locale,
+            budget,
+            no_transcript,
+            resume,
         })
     }
+}
+
+/// The chat's budget, and where it is saved or resumed from, as the flags ask.
+fn chat_options(
+    args: &Args,
+    format: &'static str,
+    max_context: usize,
+) -> Result<chat::ChatOptions, String> {
+    let mut options = chat::ChatOptions {
+        budget: args.budget,
+        ..chat::ChatOptions::default()
+    };
+    if args.no_transcript {
+        return Ok(options);
+    }
+    let Some(dir) = transcript::default_dir() else {
+        eprintln!("transcript: HOME is not set; the chat is not saved");
+        return Ok(options);
+    };
+    if let Some(which) = &args.resume {
+        let (saved, resumed) = transcript::Transcript::resume(&dir, which, format, max_context)?;
+        options.transcript = Some(saved);
+        options.resumed = Some(resumed);
+    } else {
+        match transcript::Transcript::create(&dir, format, &args.model_dir) {
+            Ok(saved) => options.transcript = Some(saved),
+            Err(e) => eprintln!("transcript: {e}; the chat is not saved"),
+        }
+    }
+    Ok(options)
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -309,8 +364,10 @@ fn print_usage() {
          \x20 --help, -h            show help and exit\n\
          \n\
          example: k3 /Volumes/Jarraya/kimi-k3 --chat --gen 64 --max-context 512\n\
-         In chat: /help, /continue, /undo, /reset, /stats, /quit. Ctrl-C cancels\n\
-         generation at a safe layer/output boundary; Ctrl-D exits at the prompt.\n\
+         In chat: /help, /continue, /undo, /reset, /stats, /quit. Ctrl-C pauses a turn\n\
+         (generation stops at a safe layer/output boundary, a running terminal command is\n\
+         stopped, and tool calls not yet run wait for /continue). At the prompt, Ctrl-C or\n\
+         Ctrl-D exits; --resume latest carries the saved chat on.\n\
          \x20 --fs-base DIR        optional: workspace for reads and claimed file edits\n\
          \x20                      with relative paths starting here (default: current dir)\n\
          \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
@@ -337,6 +394,16 @@ fn print_usage() {
          \x20                      recognition listens; say \"Kimi, ...\" to ask something, and\n\
          \x20                      the reply is also spoken. Nothing leaves the machine.\n\
          \x20 --locale L           optional, with --voice: speech locale (default en-US)\n\
+         \x20 --turn-minutes N     optional, chat: pause a turn (every reply and tool round\n\
+         \x20                      after one message) after N minutes; 0 = no limit (default 30)\n\
+         \x20 --turn-tokens N      optional, chat: pause a turn once Kimi has generated N\n\
+         \x20                      tokens in it; 0 = no limit (default 16384). /continue\n\
+         \x20                      resumes a paused turn with a fresh budget\n\
+         \x20 --no-transcript      optional, chat: do not save the chat. By default each chat\n\
+         \x20                      is logged to ~/.loadngo/kimi/transcripts/<time>.jsonl for\n\
+         \x20                      review, with a resume snapshot beside it (<time>.state.json)\n\
+         \x20 --resume latest|PATH optional, chat: carry on a saved chat (the newest, or a\n\
+         \x20                      .jsonl/.state.json path) from its exact history\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
@@ -401,7 +468,7 @@ fn run() -> Result<(), String> {
         if signal_generating.load(Ordering::Relaxed) {
             signal_cancel.store(true, Ordering::Relaxed);
         } else {
-            // Idle/loading: no partial transcript is being persisted.
+            // Idle at the prompt, or loading: the saved chat is complete up to here.
             std::process::exit(130);
         }
     })
@@ -472,6 +539,7 @@ fn run() -> Result<(), String> {
     let mut session = TrunkSession::new(&config, args.max_context);
     let mut session_logits: Option<Vec<f32>> = None;
     if args.chat {
+        let options = chat_options(&args, "k3", args.max_context)?;
         println!("Local Kimi K3 -- about a minute per token on this Mac mini with --accel ane.");
         return chat::run(
             &tokenizer,
@@ -543,6 +611,7 @@ fn run() -> Result<(), String> {
                 }
                 u32::try_from(argmax(last)).map_err(|e| e.to_string())
             },
+            options,
         );
     }
 

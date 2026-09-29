@@ -645,7 +645,7 @@ mod tests {
     #[test]
     #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files"]
     fn chat_reads_edits_rereads_and_creates_files() {
-        use crate::chat::{ChatFormat, run_with};
+        use crate::chat::{ChatFormat, ChatOptions, run_with};
         use kimi_k3_core::tokenizer::Tokenizer;
         use std::sync::atomic::AtomicBool;
         let (root, tools) = fixture();
@@ -687,6 +687,7 @@ mod tests {
                 }
                 Ok(token)
             },
+            ChatOptions::default(),
         )
         .unwrap();
         let output = String::from_utf8(output).unwrap();

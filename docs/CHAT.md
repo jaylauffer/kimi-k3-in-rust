@@ -22,10 +22,50 @@ root `~/pudding/launch-kimi-k3.sh` builds offline and starts chat with no argume
 An initial positional text argument retains the old raw-completion mode.
 
 Type one message per line. Commands: `/help`, `/stats`, `/continue`, `/undo`,
-`/reset`, `/quit`. Ctrl-D exits while waiting for input. Ctrl-C requests cancellation
-during generation; it is checked between layers/output rows, not inside a kernel
-or in-flight disk read. At the idle prompt or during loading Ctrl-C exits.
-No conversation files are written: closing the process loses its history.
+`/reset`, `/quit`. Ctrl-D exits while waiting for input. Ctrl-C pauses the turn in
+progress: generation stops at the next check (between layers/output rows, not inside a
+kernel or in-flight disk read), a running terminal command is stopped, and tool calls
+not yet run wait for `/continue`. At the idle prompt or during loading Ctrl-C exits.
+
+### Turns, budgets and pauses (since 2026-09-30)
+
+One message can lead to any number of replies and tool rounds; the turn ends when
+Kimi answers without calling a tool. There is no round limit (the old limit of
+eight rounds, 2026-09-24 to 09-30, stopped real work partway). A turn instead pauses
+when its budget is spent: `--turn-minutes` (default 30) of wall-clock time, or
+`--turn-tokens` (default 16384) tokens generated across its replies; 0 turns either
+off. The budget is checked after each reply, before its tool calls run, so a reply in
+progress always finishes. A paused turn keeps its waiting tool calls:
+
+- `/continue` runs them and carries on with a fresh budget;
+- a new message answers them as not run (so Kimi never assumes they happened) and
+  goes on from there;
+- `/undo` or `/reset` drops them.
+
+The guards against a stuck model stay: a reply repeating one block is ended, and the
+same read-only call made twice in a row ends the turn. Context is the other real
+bound: `--max-context` (32768 for Kimi Linear) holds every tool result, and a turn
+that fills it has to be undone or reset.
+
+### Saved chats and resume
+
+Every chat is saved in `~/.loadngo/kimi/transcripts/` unless `--no-transcript` is
+given; the path is printed at the start:
+
+- `<time>.jsonl`, one JSON event per line for review: `start`/`resume`, `user`,
+  `reply` (decoded text including tool-call markup, tokens, stop reason, seconds,
+  context size), `tool_call` (name, arguments), `tool_result` (the text, cut at 64 KiB
+  with `"cut": true`), `command`, `turn_end` (why it stopped, replies, tokens,
+  seconds) and `exit`. Each event carries its local time in `at`.
+- `<time>.state.json`, the exact token history, turn boundaries and waiting calls,
+  rewritten (via a temporary file) after every round and at each prompt.
+
+`--resume latest` (or a `.jsonl`/`.state.json` path) rebuilds the conversation from
+the snapshot and appends to the same log, so a chat survives Ctrl-C at the prompt, a
+crash or a restart. The model re-reads the saved history on the first reply. A
+snapshot is only resumed by the same chat format (Kimi Linear or K3), and needs a
+`--max-context` at least as large as its history. Saved chats hold whatever Kimi read
+(files, command output, web pages); they stay on this Mac.
 
 `--gen` limits each generation/continuation, including thinking and structure tokens.
 A truncated/cancelled response remains **unfinished**. Use `/continue` or discard it
@@ -53,7 +93,8 @@ the initial system message requests `thinking_effort=low`. Ordinary user text is
 encoded separately from structural tokens, matching the reference segment boundaries.
 Pasted control-marker spellings remain ordinary text. Generated tokens (including
 thinking and end markers) remain exact in history, not decoded and re-tokenized.
-No tools are advertised or executed. Terminal escape/control characters are escaped.
+K3 chat advertises no tools (Kimi Linear's are in [FILE_EDITING.md](FILE_EDITING.md)
+and [TERMINAL.md](TERMINAL.md)). Terminal escape/control characters are escaped.
 
 This corrects the older port note calling the release a raw base model: the local
 checkpoint explicitly provides chat encoding and preserved thinking-history support.
@@ -73,8 +114,8 @@ The interface work does not establish satisfactory speed or answer quality.
 Remaining inference work: logit-level ANE-vs-CPU agreement and answer quality on the
 full model, less data per token (more pinned layers, or a smaller trunk, which is a
 numerics decision for Jay), and the ANE path's peak memory.
-Also absent: persistent transcripts, multiline editor, tool calls, images, sampling
-controls and a GUI. Do not describe any of those as shipped.
+Also absent: multiline editor, K3 tool calls, images, sampling controls and a GUI.
+Do not describe any of those as shipped.
 
 ## Verification and publication
 

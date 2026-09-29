@@ -261,6 +261,7 @@ pub fn run(
         if args.voice {
             format = format.with_note(VOICE_NOTE);
         }
+        let options = crate::chat_options(args, format.name(), max_context)?;
         let tools = toolbox(args);
         let tools = Some(&tools).filter(|t| !t.is_empty());
         // Every conversation opens with the same tool declarations (~800 tokens, about a
@@ -326,6 +327,7 @@ pub fn run(
                 last = Some(logits);
                 Ok(token)
             },
+            options,
         );
     }
 

@@ -42,7 +42,8 @@ must remain in their assigned process group; do not launch detached daemons.
 
 Terminal calls may repeat: output reads consume new data and commands can be
 rerun after completion. Terminal activity invalidates cached file-read results.
-The existing eight-round tool limit still bounds each model turn.
+Each turn is bounded by its time and token budget, not a round count; see
+[CHAT.md](CHAT.md#turns-budgets-and-pauses-since-2026-09-30).
 
 Commands inherit Kimi's OS permissions and environment. The working
 directory is not a sandbox: commands can write files and access the network.
