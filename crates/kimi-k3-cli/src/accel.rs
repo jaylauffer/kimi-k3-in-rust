@@ -314,6 +314,10 @@ mod gpu {
         n.div_ceil(16) * 16
     }
 
+    /// Positions from which an expert's rows are padded to tiles of 32 and multiplied on
+    /// the matrix units; fewer (decoding) keep one product per position.
+    const TILED_FROM: usize = 8;
+
     /// A weight in GPU memory: bf16, or MXFP4 elements with their scales.
     type ResidentWeight = (Arc<Resident>, Option<Arc<Resident>>);
 
@@ -329,31 +333,53 @@ mod gpu {
     ) -> Result<usize, String> {
         let wi = batch.attach(w);
         let si = scales.as_ref().map(|s| batch.attach(s));
-        let reads = if rows == 1 || si.is_some() {
-            rows
+        let weight_bytes = w.len() + scales.as_ref().map_or(0, |s| s.len());
+        let (xs, ys) = (x_stride / 4, y_stride / 4);
+        let e = |r: Result<(), loadngo_metal_compute::Error>| r.map_err(|e| e.to_string());
+        // Whole tiles of 32 positions on the matrix units: each weight read once per 32.
+        let whole = if out % 64 == 0 && inp % 32 == 0 {
+            rows / 32 * 32
         } else {
-            rows.div_ceil(8)
+            0
         };
-        let bytes = reads * (w.len() + scales.as_ref().map_or(0, |s| s.len()));
-        let result = if rows == 1 || si.is_some() {
-            // One position, or an MXFP4 weight: one product per position (the
+        let mut bytes = 0;
+        if whole > 0 {
+            let x = Slice::new(xb, x_at, ((whole - 1) * xs + inp) * 4);
+            let y = Slice::new(yb, y_at, ((whole - 1) * ys + out) * 4);
+            e(match si {
+                Some(si) => batch.gemm_mxfp4_tiled(wi, si, x, y, out, inp, whole, (xs, ys)),
+                None => batch.gemm_bf16_tiled(wi, x, y, out, inp, whole, (xs, ys)),
+            })?;
+            bytes += whole / 32 * weight_bytes;
+        }
+        // The rest (fewer than 32 positions, or shapes the tiles do not cover).
+        let (rest, x_at, y_at) = (
+            rows - whole,
+            x_at + whole * x_stride,
+            y_at + whole * y_stride,
+        );
+        if rest == 0 {
+            return Ok(bytes);
+        }
+        if rest == 1 || si.is_some() {
+            // One position, or an MXFP4 weight: one product per position (the untiled
             // multi-position MXFP4 kernel measured slower; see METAL_COMPUTE_PLAN).
-            (0..rows).try_for_each(|r| {
+            bytes += rest * weight_bytes;
+            (0..rest).try_for_each(|r| {
                 let x = Slice::new(xb, x_at + r * x_stride, inp * 4);
                 let y = Slice::new(yb, y_at + r * y_stride, out * 4);
-                match si {
+                e(match si {
                     Some(si) => batch.gemv_mxfp4(wi, si, x, y, out, inp),
                     None => batch.gemv_bf16(wi, x, y, out, inp),
-                }
-            })
+                })
+            })?;
         } else {
             // bf16 over several positions: one dispatch, one weight read per eight.
-            let (xs, ys) = (x_stride / 4, y_stride / 4);
-            let x = Slice::new(xb, x_at, ((rows - 1) * xs + inp) * 4);
-            let y = Slice::new(yb, y_at, ((rows - 1) * ys + out) * 4);
-            batch.gemm_bf16(wi, x, y, out, inp, rows, (xs, ys))
-        };
-        result.map_err(|e| e.to_string())?;
+            bytes += rest.div_ceil(8) * weight_bytes;
+            let x = Slice::new(xb, x_at, ((rest - 1) * xs + inp) * 4);
+            let y = Slice::new(yb, y_at, ((rest - 1) * ys + out) * 4);
+            e(batch.gemm_bf16(wi, x, y, out, inp, rest, (xs, ys)))?;
+        }
         Ok(bytes)
     }
 
@@ -743,7 +769,13 @@ mod gpu {
                     .ok_or_else(|| "an MLA weight is not in GPU memory".to_string())
             };
             let norm = self.constant(job.kv_a_norm)?;
-            let mut copy = self.cache_copy((&mut *job.device, cached), rows, (row, qr))?;
+            // The tiled attention reads cache rows up to the next multiple of 32.
+            let tiled = t >= 32 && qn % 8 == 0 && qr % 8 == 0 && vh == 128;
+            let mut copy = self.cache_copy(
+                (&mut *job.device, cached),
+                rows.div_ceil(32) * 32,
+                (row, qr),
+            )?;
             // Rows before `cached` the copy lacks (computed on the CPU earlier).
             let from = copy.len.min(cached);
             copy.kv.as_f32_mut()[from * row..cached * row]
@@ -757,8 +789,10 @@ mod gpu {
                 total += floats.div_ceil(4) * 4;
                 at
             };
-            let (lx, lq, lct) = (take(t * hidden), take(t * heads * dq), take(t * kvw));
-            let (lacc, lout) = (take(t * heads * vh), take(t * hidden));
+            // Queries and attention outputs padded to whole tiles of 32 for the tiled kernel.
+            let t_rows = if tiled { t.div_ceil(32) * 32 } else { t };
+            let (lx, lq, lct) = (take(t * hidden), take(t_rows * heads * dq), take(t * kvw));
+            let (lacc, lout) = (take(t_rows * heads * vh), take(t * hidden));
             let mut work = self.take_work(total)?;
             work.as_f32_mut()[lx..lx + t * hidden].copy_from_slice(job.x);
             let capacity = copy.capacity;
@@ -805,21 +839,33 @@ mod gpu {
                 (t, kvr, row),
             )?;
             batch.barrier();
-            checked(batch.attention_split_key(
-                region(lq, t * heads * dq),
-                Slice::new(KV, 0, rows * row * 4),
-                Slice::new(ROPE, 0, rows * qr * 4),
-                region(lacc, t * heads * vh),
-                AttentionShape {
-                    t,
-                    cached,
-                    heads,
-                    qa: qn,
-                    qb: qr,
-                    dv: vh,
-                    scale: job.scale,
-                },
-            ))?;
+            let shape = AttentionShape {
+                t,
+                cached,
+                heads,
+                qa: qn,
+                qb: qr,
+                dv: vh,
+                scale: job.scale,
+            };
+            checked(if tiled {
+                let padded = rows.div_ceil(32) * 32;
+                batch.attention_split_key_tiled(
+                    region(lq, t_rows * heads * dq),
+                    Slice::new(KV, 0, padded * row * 4),
+                    Slice::new(ROPE, 0, padded * qr * 4),
+                    region(lacc, t_rows * heads * vh),
+                    shape,
+                )
+            } else {
+                batch.attention_split_key(
+                    region(lq, t * heads * dq),
+                    Slice::new(KV, 0, rows * row * 4),
+                    Slice::new(ROPE, 0, rows * qr * 4),
+                    region(lacc, t * heads * vh),
+                    shape,
+                )
+            })?;
             batch.barrier();
             bytes += encode_product(
                 &mut batch,
@@ -881,16 +927,27 @@ mod gpu {
             };
             let rows = job.rows;
             let (sx, sy) = (take(rows * job.shared.inp), take(rows * job.shared.out));
+            // Rows each expert computes: from TILED_FROM positions on, padded with zero
+            // rows to whole tiles of 32 for the matrix-unit kernel.
+            let padded: Vec<usize> = job
+                .experts
+                .iter()
+                .map(|x| match x.rows.len() {
+                    n if n >= TILED_FROM => n.div_ceil(32) * 32,
+                    n => n,
+                })
+                .collect();
             // Per expert: input, gate, up, output.
             let layout: Vec<[usize; 4]> = job
                 .experts
                 .iter()
-                .map(|x| {
+                .zip(&padded)
+                .map(|(x, &n)| {
                     [
-                        take(x.rows.len() * x.w1.inp),
-                        take(x.rows.len() * x.w1.out),
-                        take(x.rows.len() * x.w3.out),
-                        take(x.rows.len() * x.w2.out),
+                        take(n * x.w1.inp),
+                        take(n * x.w1.out),
+                        take(n * x.w3.out),
+                        take(n * x.w2.out),
                     ]
                 })
                 .collect();
@@ -902,12 +959,13 @@ mod gpu {
             let floats = work.as_f32_mut();
             floats[sx..sx + job.shared_x.len()].copy_from_slice(job.shared_x);
             // Each expert's rows, gathered from the layer's input.
-            for (x, at) in job.experts.iter().zip(&layout) {
+            for ((x, at), &n) in job.experts.iter().zip(&layout).zip(&padded) {
                 let inp = x.w1.inp;
                 for (r, &row) in x.rows.iter().enumerate() {
                     floats[at[0] + r * inp..at[0] + (r + 1) * inp]
                         .copy_from_slice(&x.x[row * inp..(row + 1) * inp]);
                 }
+                floats[at[0] + x.rows.len() * inp..at[0] + n * inp].fill(0.0);
             }
             let mut batch = self
                 .metal
@@ -921,32 +979,32 @@ mod gpu {
                 (WORK, sy * 4, job.shared.out * 4),
                 (rows, job.shared.inp, job.shared.out),
             )?;
-            for (x, at) in job.experts.iter().zip(&layout) {
+            for ((x, at), &n) in job.experts.iter().zip(&layout).zip(&padded) {
                 for (w, out) in [(x.w1, at[1]), (x.w3, at[2])] {
                     bytes += encode_product(
                         &mut batch,
                         &resident(w)?,
                         (WORK, at[0] * 4, w.inp * 4),
                         (WORK, out * 4, w.out * 4),
-                        (x.rows.len(), w.inp, w.out),
+                        (n, w.inp, w.out),
                     )?;
                 }
             }
             batch.barrier();
-            for (x, at) in job.experts.iter().zip(&layout) {
-                let n = x.rows.len() * x.w1.out;
+            for ((x, at), &n) in job.experts.iter().zip(&layout).zip(&padded) {
+                let n = n * x.w1.out;
                 batch
                     .silu_mul(region(at[1], n), region(at[2], n), n)
                     .map_err(|e| e.to_string())?;
             }
             batch.barrier();
-            for (x, at) in job.experts.iter().zip(&layout) {
+            for ((x, at), &n) in job.experts.iter().zip(&layout).zip(&padded) {
                 bytes += encode_product(
                     &mut batch,
                     &resident(x.w2)?,
                     (WORK, at[1] * 4, x.w2.inp * 4),
                     (WORK, at[3] * 4, x.w2.out * 4),
-                    (x.rows.len(), x.w2.inp, x.w2.out),
+                    (n, x.w2.inp, x.w2.out),
                 )?;
             }
             let done = self.submit(batch)?;
@@ -1052,6 +1110,10 @@ mod gpu {
                         len: 0,
                         capacity,
                     };
+                    // Rows past the valid ones are read (times zero) by the tiled
+                    // attention kernel: they must be finite.
+                    grown.kv.as_f32_mut().fill(0.0);
+                    grown.rope.as_f32_mut().fill(0.0);
                     if let Some(old) = old {
                         let keep = old.len.min(cached);
                         grown.kv.as_f32_mut()[..keep * row]

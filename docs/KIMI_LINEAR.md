@@ -312,7 +312,10 @@ GPU weight memory is locked (it had been left mostly compressed), experts move i
 memory layer by layer as they load (launch ~9 s faster, peak 37 GB), and the MoE layer
 reuses one scratch buffer instead of allocating per layer. The first token after the
 3,895-token prompt takes 0.24–0.30 s (was 1.5–5.9 s), and the prompt itself 44–47 s.
-See loadngo `docs/METAL_COMPUTE_PLAN.md`, "Memory". The text below predates these changes.
+See loadngo `docs/METAL_COMPUTE_PLAN.md`, "Memory". Then prompts moved onto the GPU's
+matrix units (tiled MXFP4 experts, tiled bf16 projections, flash-style attention): the
+3,895-token prompt reads in 9.9 s, about 390 tokens/s (439 s this morning), still exact
+against the CPU on 453 tokens ("Prompts on the matrix units"). The text below predates these changes.
 
 - **Prompt processing is CPU-bound.** A `sample` during the preamble put about 54% of
   the main thread in single-threaded model code (MLA attention, which is quadratic in
