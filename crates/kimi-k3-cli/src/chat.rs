@@ -27,8 +27,10 @@ const HELP: &str = "Type a message and press Enter. Commands:
 One line per message. No transcript saving. Kimi Linear can read local files and the
 signed CAS snapshot, and create/edit claimed workspace .rs, .md and .txt files (--no-tools
 disables these).
-File edits survive /undo and /reset. Kimi can also search and read public web
-pages (--no-web turns that off; it is the only thing that leaves this machine).
+File edits and terminal command side effects survive /undo and /reset.
+Terminal tools run commands, read output, send stdin and stop sessions (no PTY).
+Kimi can also search and read public web pages (--no-web turns those tools off;
+terminal commands can still use the network).
 ";
 
 fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
@@ -176,6 +178,8 @@ impl ChatFormat {
                 } else {
                     Vec::new()
                 };
+                // A fresh clock observation per user turn, outside the cached opening.
+                t.message(&mut ids, tokenizer, "system", &current_date_note());
                 ids.push(t.user);
                 ordinary(&mut ids, tokenizer, "user");
                 ids.push(t.middle);
@@ -364,6 +368,20 @@ impl ChatFormat {
     }
 }
 
+pub const FRESHNESS_GUIDANCE: &str = "Use the current date supplied each turn when researching \
+present-day conditions. For current costs, visas, jobs or news, start with a date-neutral \
+query or the current year; do not insert a past year unless Jay asks for that period. \
+Historical questions keep their requested dates. Check publication and event dates, prefer \
+official sources for visa rules, and distinguish old information from verified current facts. \
+Search snippets are leads; read the source before relying on its details.";
+
+fn current_date_note() -> String {
+    format!(
+        "Current local date: {}. Use this date for current research, not a year remembered from training.",
+        chrono::Local::now().format("%Y-%m-%d (%Z, UTC%:z)")
+    )
+}
+
 const TOOL_GUIDANCE: &str = "You are Kimi, running locally on Jay's Mac mini. You can read \
 files with tools: fs_list, fs_read, fs_find and fs_grep read the local drive (read-only); \
 cas_archives lists every loadngo Archive CAS archive on the attached drives (the same archives \
@@ -378,7 +396,13 @@ and COLLABORATION.md and the board. Claim exact repo-relative paths via board_ad
 a revision; text_edit uses that revision and one unique old_text/new_text replacement. \
 text_write creates a new file. Only .rs, .md and .txt files in a workspace Git repository \
 can be written. Paths start at the workspace. Never adopt another agent's \
-dirty files. Report edits as untested; no shell/build/commit tool exists. File edits survive \
+dirty files. terminal_exec starts a shell command and returns a session id; terminal_read \
+reads output/status, terminal_write sends stdin or closes it, and terminal_stop cancels. \
+Use these to inspect repositories and run builds/tests. Read command exit status before \
+claiming success; report checks not run. Commands run with your OS user's permissions, \
+including filesystem writes and network access: follow Jay's scope and shared-work claims. \
+Never push, publish, delete user data, or alter another agent's work without Jay's authorization. \
+Prefer text_edit for claimed source changes. File edits and command side effects survive \
 /undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
 successful edit you may read the updated file again. When a search finds nothing, say so plainly.";
 
@@ -412,6 +436,15 @@ fn call_key(name: &str, arguments: &str) -> (String, serde_json::Value) {
     let arguments = serde_json::from_str(arguments)
         .unwrap_or_else(|_| serde_json::Value::String(arguments.trim().to_string()));
     (name.to_string(), arguments)
+}
+
+// Session reads consume output, and writes/stops can legitimately repeat. Never cache
+// them as immutable lookups. Commands can change files asynchronously too.
+fn repeatable_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "terminal_exec" | "terminal_read" | "terminal_write" | "terminal_stop"
+    )
 }
 
 const REPEATED_CALL: &str = "Not run: you already made this exact call in this turn, and its \
@@ -701,7 +734,10 @@ pub fn run_with(
                 .iter()
                 .map(|(id, arguments)| call_key(tool_name(id), arguments))
                 .collect();
-            if keys.iter().all(|key| earlier_calls.contains(key)) {
+            if keys
+                .iter()
+                .all(|key| !repeatable_tool(&key.0) && earlier_calls.contains(key))
+            {
                 repeated_rounds += 1;
                 if repeated_rounds == 2 {
                     writeln!(
@@ -723,7 +759,7 @@ pub fn run_with(
             let mut results = Vec::new();
             for ((id, arguments), key) in calls.into_iter().zip(keys) {
                 let name = tool_name(&id).to_string();
-                if earlier_calls.contains(&key) {
+                if !repeatable_tool(&name) && earlier_calls.contains(&key) {
                     writeln!(output, "[tool call repeated: {name}; not run again]")
                         .map_err(|e| e.to_string())?;
                     results.push((id, name, REPEATED_CALL.to_string()));
@@ -731,13 +767,26 @@ pub fn run_with(
                 }
                 let text = match tools.call(&name, &arguments) {
                     Ok(text) => {
-                        if matches!(name.as_str(), "text_write" | "text_edit") {
+                        if matches!(
+                            name.as_str(),
+                            "text_write"
+                                | "text_edit"
+                                | "terminal_exec"
+                                | "terminal_write"
+                                | "terminal_read"
+                                | "terminal_stop"
+                        ) {
                             // Files changed: previous reads/finds may now have different
-                            // results. Keep mutation keys so a write is never replayed.
+                            // results. Keep text mutation keys so an edit is never replayed.
                             earlier_calls.retain(|(tool, _)| {
                                 !matches!(
                                     tool.as_str(),
-                                    "text_read" | "fs_read" | "fs_list" | "fs_find" | "fs_grep"
+                                    "text_read"
+                                        | "fs_read"
+                                        | "fs_list"
+                                        | "fs_find"
+                                        | "fs_grep"
+                                        | "terminal_exec"
                                 )
                             });
                             repeated_rounds = 0;
@@ -793,6 +842,133 @@ mod tests {
                 .join("../../tests/fixtures/tokenizer/byte_chat"),
         )
         .unwrap()
+    }
+
+    // Distinct synthetic controls let the byte fixture exercise Linear chat
+    // mechanics in CI without downloading checkpoint tokenizer files.
+    fn tiny_linear_format() -> ChatFormat {
+        ChatFormat::KimiLinear(LinearTokens {
+            system: 200_000,
+            user: 200_001,
+            assistant: 200_002,
+            middle: 200_003,
+            end: 200_004,
+            section_begin: 200_005,
+            section_end: 200_006,
+            call_begin: 200_007,
+            argument_begin: 200_008,
+            call_end: 200_009,
+            eos: [200_004; 2],
+            note: None,
+        })
+    }
+
+    #[test]
+    fn current_date_is_in_each_user_turn_outside_cached_preamble() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format().with_note(FRESHNESS_GUIDANCE);
+        let preamble = format.preamble(&tokenizer, None);
+        assert!(
+            !tokenizer
+                .decode_lossy(&preamble)
+                .contains("Current local date:")
+        );
+        for first in [true, false] {
+            let before = current_date_note();
+            let prompt = format.prompt(&tokenizer, "research", first, None);
+            let after = current_date_note();
+            let text = tokenizer.decode_lossy(&prompt);
+            assert!(text.contains(&before) || text.contains(&after));
+            assert_eq!(text.matches("Current local date:").count(), 1);
+            assert!(text.find("Current local date:").unwrap() < text.find("userresearch").unwrap());
+            assert_eq!(prompt.starts_with(&preamble), first);
+        }
+    }
+
+    #[test]
+    fn terminal_rounds_repeat_and_refresh_file_reads_in_chat() {
+        use loadngo_inference::tools::Tool;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        struct Recorded(&'static str, Rc<RefCell<Vec<&'static str>>>);
+        impl Tool for Recorded {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object"})
+            }
+            fn call(&self, _: &serde_json::Value) -> Result<String, String> {
+                self.1.borrow_mut().push(self.0);
+                Ok("recorded".into())
+            }
+        }
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let recorded = Rc::new(RefCell::new(Vec::new()));
+        let mut tools = Toolbox::default();
+        for name in [
+            "terminal_exec",
+            "terminal_read",
+            "terminal_write",
+            "terminal_stop",
+            "fs_read",
+        ] {
+            tools.push(Box::new(Recorded(name, Rc::clone(&recorded))));
+        }
+        let expected = [
+            "terminal_exec",
+            "terminal_exec",
+            "fs_read",
+            "terminal_read",
+            "terminal_read",
+            "fs_read",
+            "terminal_write",
+            "terminal_write",
+            "terminal_stop",
+            "terminal_stop",
+        ];
+        let mut replies: Vec<Vec<u32>> = expected
+            .iter()
+            .enumerate()
+            .map(|(n, name)| {
+                let mut ids = vec![t.section_begin, t.call_begin];
+                ordinary(&mut ids, &tokenizer, &format!("functions.{name}:{n}"));
+                ids.push(t.argument_begin);
+                ordinary(&mut ids, &tokenizer, "{}");
+                ids.extend([t.call_end, t.section_end, t.end]);
+                ids
+            })
+            .collect();
+        replies.insert(8, vec![t.end]); // Finish within the per-turn tool limit.
+        replies.push(vec![t.end]);
+        let mut replies = replies.into_iter().flatten();
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Run checks\nStop the session\n/quit\n"[..],
+            &mut output,
+            |_| Ok(replies.next().expect("scripted reply")),
+        )
+        .unwrap();
+        assert_eq!(*recorded.borrow(), expected);
+        assert!(
+            !String::from_utf8(output)
+                .unwrap()
+                .contains("tool call repeated")
+        );
     }
 
     fn reference_segments_match(tokenizer: &Tokenizer) {

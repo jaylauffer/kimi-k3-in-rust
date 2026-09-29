@@ -30,6 +30,18 @@ mod convert;
 mod linear;
 mod quality;
 mod system_one;
+#[cfg(unix)]
+mod terminal;
+#[cfg(not(unix))]
+mod terminal {
+    pub fn interrupt() {}
+
+    pub fn tools(
+        _: &std::path::Path,
+    ) -> Result<Vec<Box<dyn loadngo_inference::tools::Tool>>, String> {
+        Err("terminal tools require Unix process groups; this platform is not supported yet".into())
+    }
+}
 mod text_tools;
 mod thermal;
 // The wake-word parser and reply wrapper are portable and tested everywhere; only macOS
@@ -305,9 +317,9 @@ fn print_usage() {
          \x20                      on attached drives (cas_archives lists every archive)\n\
          \x20 --cas-key PATH       optional: trusted Dilithium public key; archives it signed\n\
          \x20                      are marked signed, all others unsigned\n\
-         \x20 --no-tools           optional: chat without file tools, including file edits\n\
-         \x20 --no-web             optional: chat without web_search/web_fetch (the only tools\n\
-         \x20                      that send anything off this machine)\n\
+         \x20 --no-tools           optional: chat without tools, including terminal commands\n\
+         \x20 --no-web             optional: disable web_search/web_fetch; terminal commands\n\
+         \x20                      can still use the network\n\
          \x20 --no-memory          optional: chat without her memory (notes she keeps across\n\
          \x20                      sessions in ~/.loadngo/kimi/memory.jsonl)\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
@@ -385,6 +397,7 @@ fn run() -> Result<(), String> {
     let signal_cancel = Arc::clone(&cancel);
     let signal_generating = Arc::clone(&generating);
     ctrlc::set_handler(move || {
+        terminal::interrupt();
         if signal_generating.load(Ordering::Relaxed) {
             signal_cancel.store(true, Ordering::Relaxed);
         } else {

@@ -76,6 +76,17 @@ fn toolbox(args: &Args) -> Toolbox {
         }
         Err(error) => eprintln!("File editing unavailable: {error}"),
     }
+    match crate::terminal::tools(&base) {
+        Ok(terminal) => {
+            eprintln!(
+                "terminal tools: commands, output, stdin and stop; same OS permissions as Kimi"
+            );
+            for tool in terminal {
+                tools.push(tool);
+            }
+        }
+        Err(error) => eprintln!("terminal tools unavailable: {error}"),
+    }
     for tool in FsTools::new(base, home.as_deref()).into_tools() {
         tools.push(tool);
     }
@@ -246,10 +257,7 @@ pub fn run(
         if let Some(memory) = memory_store(args) {
             format = format.with_note(&memory_note(&memory));
         }
-        if let Some(today) = today() {
-            // Without it she searched for "... 2024" news in 2026.
-            format = format.with_note(&format!("Today is {today}."));
-        }
+        format = format.with_note(crate::chat::FRESHNESS_GUIDANCE);
         if args.voice {
             format = format.with_note(VOICE_NOTE);
         }
@@ -405,11 +413,6 @@ memory_search; drop wrong or outdated notes with memory_forget.";
         Ok(_) => format!("{intro} You have no notes yet."),
         Err(e) => format!("{intro} (Your notes could not be read: {e}.)"),
     }
-}
-
-/// Today's local date, for example "Saturday, 27 September 2026", read once at launch.
-fn today() -> Option<String> {
-    date("+%A, %-d %B %Y")
 }
 
 /// The local date in `date`'s `format`.
