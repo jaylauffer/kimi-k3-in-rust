@@ -25,7 +25,8 @@ const HELP: &str = "Type a message and press Enter. Commands:
   /help       show these commands
   /quit       exit (or Ctrl-D); Ctrl-C cancels generation
 One line per message. No transcript saving. Kimi Linear can read local files and the
-signed CAS snapshot, and create/edit claimed workspace Rust files (--no-tools disables these).
+signed CAS snapshot, and create/edit claimed workspace .rs, .md and .txt files (--no-tools
+disables these).
 File edits survive /undo and /reset. Kimi can also search and read public web
 pages (--no-web turns that off; it is the only thing that leaves this machine).
 ";
@@ -371,11 +372,12 @@ and cas_grep read one of them by name, verifying every file against its manifest
 file's contents, read it before answering and name the path you read. web_search searches the \
 public web and web_fetch reads a page: use them for current events, prices, schedules and \
 anything recent or that you are unsure of, and say which site the answer came from. Answer \
-everything else from your own knowledge. For Rust changes, first read applicable AGENTS.md \
+everything else from your own knowledge. Before changing files, read applicable AGENTS.md \
 and COLLABORATION.md and the board. Claim exact repo-relative paths via board_add_row \
-(Active claims, exact repo name, comma-separated paths, status in progress). rust_read returns \
-a revision; rust_edit uses that revision and one unique old_text/new_text replacement. \
-rust_write creates a new .rs file. Paths start at the workspace. Never adopt another agent's \
+(Active claims, exact repo name, comma-separated paths, status in progress). text_read returns \
+a revision; text_edit uses that revision and one unique old_text/new_text replacement. \
+text_write creates a new file. Only .rs, .md and .txt files in a workspace Git repository \
+can be written. Paths start at the workspace. Never adopt another agent's \
 dirty files. Report edits as untested; no shell/build/commit tool exists. File edits survive \
 /undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
 successful edit you may read the updated file again. When a search finds nothing, say so plainly.";
@@ -729,13 +731,13 @@ pub fn run_with(
                 }
                 let text = match tools.call(&name, &arguments) {
                     Ok(text) => {
-                        if matches!(name.as_str(), "rust_write" | "rust_edit") {
+                        if matches!(name.as_str(), "text_write" | "text_edit") {
                             // Files changed: previous reads/finds may now have different
                             // results. Keep mutation keys so a write is never replayed.
                             earlier_calls.retain(|(tool, _)| {
                                 !matches!(
                                     tool.as_str(),
-                                    "rust_read" | "fs_read" | "fs_list" | "fs_find" | "fs_grep"
+                                    "text_read" | "fs_read" | "fs_list" | "fs_find" | "fs_grep"
                                 )
                             });
                             repeated_rounds = 0;

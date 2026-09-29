@@ -29,8 +29,8 @@ mod chat;
 mod convert;
 mod linear;
 mod quality;
-mod rust_tools;
 mod system_one;
+mod text_tools;
 mod thermal;
 mod voice;
 
@@ -296,13 +296,13 @@ fn print_usage() {
          example: k3 /Volumes/Jarraya/kimi-k3 --chat --gen 64 --max-context 512\n\
          In chat: /help, /continue, /undo, /reset, /stats, /quit. Ctrl-C cancels\n\
          generation at a safe layer/output boundary; Ctrl-D exits at the prompt.\n\
-         \x20 --fs-base DIR        optional: workspace for reads and claimed Rust edits\n\
+         \x20 --fs-base DIR        optional: workspace for reads and claimed file edits\n\
          \x20                      with relative paths starting here (default: current dir)\n\
          \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
          \x20                      on attached drives (cas_archives lists every archive)\n\
          \x20 --cas-key PATH       optional: trusted Dilithium public key; archives it signed\n\
          \x20                      are marked signed, all others unsigned\n\
-         \x20 --no-tools           optional: chat without file tools, including Rust writes\n\
+         \x20 --no-tools           optional: chat without file tools, including file edits\n\
          \x20 --no-web             optional: chat without web_search/web_fetch (the only tools\n\
          \x20                      that send anything off this machine)\n\
          \x20 --no-memory          optional: chat without her memory (notes she keeps across\n\

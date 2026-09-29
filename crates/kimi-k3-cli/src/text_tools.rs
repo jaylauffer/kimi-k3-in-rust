@@ -1,4 +1,5 @@
-//! Workspace-scoped Rust editing with board claims, revision checks and atomic writes.
+//! Workspace-scoped editing of Rust, Markdown and plain-text files, with board claims,
+//! revision checks and atomic writes.
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
@@ -14,6 +15,13 @@ use serde_json::{Value, json};
 const MAX_FILE: usize = 1024 * 1024;
 const MAX_CHANGE: usize = 64 * 1024;
 const MAX_WRITTEN: usize = 128;
+/// File types Kimi may create and edit: Rust source, Markdown and plain text.
+const EDITABLE: [&str; 3] = ["rs", "md", "txt"];
+
+fn editable(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| EDITABLE.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
 
 struct Workspace {
     root: PathBuf,
@@ -28,9 +36,9 @@ pub fn tools(root: &Path) -> Result<Vec<Box<dyn Tool>>, String> {
         written: RefCell::default(),
     });
     Ok(vec![
-        Box::new(RustRead(Rc::clone(&workspace))),
-        Box::new(RustWrite(Rc::clone(&workspace))),
-        Box::new(RustEdit(workspace)),
+        Box::new(TextRead(Rc::clone(&workspace))),
+        Box::new(TextWrite(Rc::clone(&workspace))),
+        Box::new(TextEdit(workspace)),
     ])
 }
 
@@ -54,7 +62,7 @@ fn read(path: &Path) -> Result<String, String> {
         .read_to_string(&mut text)
         .map_err(err)?;
     if text.len() > MAX_FILE || text.contains('\0') {
-        return Err("Rust files must be UTF-8 text without NUL, at most 1 MiB".into());
+        return Err("files must be UTF-8 text without NUL, at most 1 MiB".into());
     }
     Ok(text)
 }
@@ -69,8 +77,8 @@ fn valid_change(text: &str) -> Result<(), String> {
 impl Workspace {
     fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let relative = Path::new(path);
-        if relative.extension().is_none_or(|e| e != "rs") {
-            return Err("only .rs files may be edited".into());
+        if !editable(relative) {
+            return Err("only .rs, .md and .txt files may be edited".into());
         }
         let mut real = self.root.clone();
         let parts: Vec<_> = relative.components().collect();
@@ -180,7 +188,7 @@ impl Workspace {
         self.authorize(&path, revision)?;
         if let Some(expected) = previous {
             if read(&path)? != expected {
-                return Err("file changed since rust_read; read again before editing".into());
+                return Err("file changed since text_read; read again before editing".into());
             }
             temp.persist(&path).map_err(err)?;
         } else {
@@ -262,7 +270,7 @@ fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
             let explicit = paths.iter().all(|p| {
                 !p.is_empty()
                     && !p.contains(char::is_whitespace)
-                    && (Path::new(p).extension().is_some_and(|ext| ext == "rs") || p.ends_with('/'))
+                    && (Path::new(p).extension().is_some() || p.ends_with('/'))
             });
             if !explicit
                 || paths
@@ -285,16 +293,16 @@ fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
     }
 }
 
-struct RustRead(Rc<Workspace>);
-struct RustWrite(Rc<Workspace>);
-struct RustEdit(Rc<Workspace>);
+struct TextRead(Rc<Workspace>);
+struct TextWrite(Rc<Workspace>);
+struct TextEdit(Rc<Workspace>);
 
-impl Tool for RustRead {
+impl Tool for TextRead {
     fn name(&self) -> &'static str {
-        "rust_read"
+        "text_read"
     }
     fn description(&self) -> &'static str {
-        "Read workspace Rust source and its revision before editing. Numbered text, at most 16 KiB."
+        "Read a workspace .rs, .md or .txt file and its revision before editing. Numbered text, at most 16 KiB."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"line_start":{"type":"integer"},"line_count":{"type":"integer"}},"required":["path"]})
@@ -318,12 +326,12 @@ impl Tool for RustRead {
     }
 }
 
-impl Tool for RustWrite {
+impl Tool for TextWrite {
     fn name(&self) -> &'static str {
-        "rust_write"
+        "text_write"
     }
     fn description(&self) -> &'static str {
-        "Create a new .rs file in an existing workspace directory. Requires an exact active Kimi board claim. Never overwrites."
+        "Create a new .rs, .md or .txt file in an existing workspace directory. Requires an exact active Kimi board claim. Never overwrites."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
@@ -335,12 +343,12 @@ impl Tool for RustWrite {
     }
 }
 
-impl Tool for RustEdit {
+impl Tool for TextEdit {
     fn name(&self) -> &'static str {
-        "rust_edit"
+        "text_edit"
     }
     fn description(&self) -> &'static str {
-        "Replace one unique exact string in a claimed .rs file. Supply revision from rust_read, old_text and new_text. Refuses stale or pre-existing dirty files."
+        "Replace one unique exact string in a claimed .rs, .md or .txt file. Supply revision from text_read, old_text and new_text. Refuses stale or pre-existing dirty files."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"revision":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","revision","old_text","new_text"]})
@@ -349,7 +357,7 @@ impl Tool for RustEdit {
         let name = string(args, "path")?;
         let text = read(&self.0.resolve(name)?)?;
         if string(args, "revision")? != CasHash::digest(text.as_bytes()).to_hex() {
-            return Err("stale revision; rust_read again".into());
+            return Err("stale revision; text_read again".into());
         }
         let old = string(args, "old_text")?;
         let new = string(args, "new_text")?;
@@ -411,7 +419,10 @@ mod tests {
         git(&repo, &["commit", "--quiet", "-m", "fixture"]);
         fs::write(
             root.path().join("AGENT-BOARD.md"),
-            board("Kimi", "src/lib.rs, src/new.rs, ignored.rs"),
+            board(
+                "Kimi",
+                "src/lib.rs, src/new.rs, ignored.rs, README.md, notes.txt",
+            ),
         )
         .unwrap();
         let mut toolbox = Toolbox::default();
@@ -423,7 +434,7 @@ mod tests {
 
     fn edit(toolbox: &Toolbox, text: &str, old: &str, new: &str) -> Result<String, String> {
         toolbox.call(
-            "rust_edit",
+            "text_edit",
             &json!({"path":"demo/src/lib.rs",
             "revision": CasHash::digest(text.as_bytes()).to_hex(),
             "old_text":old,"new_text":new})
@@ -435,7 +446,7 @@ mod tests {
     fn clean_claimed_file_can_be_read_edited_and_edited_again() {
         let (root, toolbox) = fixture();
         let read = toolbox
-            .call("rust_read", r#"{"path":"demo/src/lib.rs"}"#)
+            .call("text_read", r#"{"path":"demo/src/lib.rs"}"#)
             .unwrap();
         assert!(read.contains(&CasHash::digest(ORIGINAL.as_bytes()).to_hex()));
         assert!(read.contains("1  pub fn value"));
@@ -452,9 +463,9 @@ mod tests {
     fn create_is_noclobber_and_subsequent_edits_are_owned() {
         let (root, toolbox) = fixture();
         let args = json!({"path":"demo/src/new.rs","content":"// new\n"}).to_string();
-        toolbox.call("rust_write", &args).unwrap();
-        assert!(toolbox.call("rust_write", &args).is_err());
-        toolbox.call("rust_edit", &json!({"path":"demo/src/new.rs", "revision":CasHash::digest(b"// new\n").to_hex(), "old_text":"new", "new_text":"edited"}).to_string()).unwrap();
+        toolbox.call("text_write", &args).unwrap();
+        assert!(toolbox.call("text_write", &args).is_err());
+        toolbox.call("text_edit", &json!({"path":"demo/src/new.rs", "revision":CasHash::digest(b"// new\n").to_hex(), "old_text":"new", "new_text":"edited"}).to_string()).unwrap();
         assert_eq!(
             fs::read_to_string(root.path().join("demo/src/new.rs")).unwrap(),
             "// edited\n"
@@ -477,7 +488,7 @@ mod tests {
         assert!(
             toolbox
                 .call(
-                    "rust_write",
+                    "text_write",
                     &json!({"path":"demo/src/lib.rs","content":ORIGINAL}).to_string()
                 )
                 .is_err()
@@ -488,6 +499,49 @@ mod tests {
         edit(&toolbox, ORIGINAL, "{ 1 }", "{ 2 }").unwrap();
         fs::write(root.path().join("demo/src/lib.rs"), "// peer\n").unwrap();
         assert!(edit(&toolbox, "// peer\n", "peer", "mine").is_err());
+    }
+
+    #[test]
+    fn markdown_and_text_files_can_be_created_and_edited() {
+        let (root, toolbox) = fixture();
+        for (path, content) in [("demo/README.md", "# Demo\n"), ("demo/notes.txt", "one\n")] {
+            toolbox
+                .call(
+                    "text_write",
+                    &json!({"path":path,"content":content}).to_string(),
+                )
+                .unwrap();
+            let read = toolbox
+                .call("text_read", &json!({"path":path}).to_string())
+                .unwrap();
+            assert!(read.contains(&CasHash::digest(content.as_bytes()).to_hex()));
+            toolbox
+                .call(
+                    "text_edit",
+                    &json!({"path":path,"revision":CasHash::digest(content.as_bytes()).to_hex(),
+                    "old_text":content.trim_end(),"new_text":"edited"})
+                    .to_string(),
+                )
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(root.path().join(path)).unwrap(),
+                "edited\n"
+            );
+        }
+        // A peer claim naming a Markdown file is explicit, not repo-wide.
+        let rows = board("Kimi", "README.md").replace(
+            "## Handoffs",
+            "| today | Claude | demo | docs/PLAN.md | task | in progress |\n## Handoffs",
+        );
+        assert!(check_claims(&rows, "demo", "README.md").is_ok());
+        assert!(
+            check_claims(
+                &rows.replace("docs/PLAN.md", "README.md"),
+                "demo",
+                "README.md"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -538,7 +592,7 @@ mod tests {
         for path in [
             "../outside.rs",
             "/tmp/outside.rs",
-            "demo/src/no.txt",
+            "demo/src/no.json",
             "demo/.git/hooks/x.rs",
             "demo/target/x.rs",
             "demo/missing/x.rs",
@@ -547,7 +601,7 @@ mod tests {
             assert!(
                 toolbox
                     .call(
-                        "rust_write",
+                        "text_write",
                         &json!({"path":path,"content":"// x"}).to_string()
                     )
                     .is_err(),
@@ -555,7 +609,7 @@ mod tests {
             );
         }
         fs::write(root.path().join("demo/src/new.rs"), "// peer").unwrap();
-        assert!(toolbox.call("rust_edit", &json!({"path":"demo/src/new.rs","revision":CasHash::digest(b"// peer").to_hex(),"old_text":"peer","new_text":"mine"}).to_string()).is_err());
+        assert!(toolbox.call("text_edit", &json!({"path":"demo/src/new.rs","revision":CasHash::digest(b"// peer").to_hex(),"old_text":"peer","new_text":"mine"}).to_string()).is_err());
     }
 
     #[cfg(unix)]
@@ -566,14 +620,14 @@ mod tests {
         symlink("lib.rs", root.path().join("demo/src/link.rs")).unwrap();
         assert!(
             toolbox
-                .call("rust_read", r#"{"path":"demo/src/link.rs"}"#)
+                .call("text_read", r#"{"path":"demo/src/link.rs"}"#)
                 .is_err()
         );
         symlink("src", root.path().join("demo/alias")).unwrap();
         assert!(
             toolbox
                 .call(
-                    "rust_write",
+                    "text_write",
                     r#"{"path":"demo/alias/new.rs","content":"// x"}"#
                 )
                 .is_err()
@@ -590,22 +644,22 @@ mod tests {
     /// Exercises real tool-call framing and the repeated-read guard, without weights.
     #[test]
     #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files"]
-    fn chat_reads_edits_rereads_and_creates_rust_files() {
+    fn chat_reads_edits_rereads_and_creates_files() {
         use crate::chat::{ChatFormat, run_with};
         use kimi_k3_core::tokenizer::Tokenizer;
         use std::sync::atomic::AtomicBool;
         let (root, tools) = fixture();
         let tokenizer = Tokenizer::load(std::env::var("KIMI_LINEAR_CHECKPOINT").unwrap()).unwrap();
         let format = ChatFormat::kimi_linear(&tokenizer, 163_586).unwrap();
-        let read = ("rust_read", json!({"path":"demo/src/lib.rs"}));
+        let read = ("text_read", json!({"path":"demo/src/lib.rs"}));
         let edit = (
-            "rust_edit",
+            "text_edit",
             json!({"path":"demo/src/lib.rs",
             "revision":CasHash::digest(ORIGINAL.as_bytes()).to_hex(),
             "old_text":"{ 1 }", "new_text":"{ 2 }"}),
         );
         let create = (
-            "rust_write",
+            "text_write",
             json!({"path":"demo/src/new.rs","content":"pub fn created() {}\n"}),
         );
         let replies: Vec<Vec<u32>> = [read.clone(), edit.clone(), read, create, edit].iter()
@@ -637,17 +691,17 @@ mod tests {
         .unwrap();
         let output = String::from_utf8(output).unwrap();
         assert_eq!(
-            output.matches("[tool result rust_read:").count(),
+            output.matches("[tool result text_read:").count(),
             2,
             "{output}"
         );
         assert_eq!(
-            output.matches("[tool result rust_edit:").count(),
+            output.matches("[tool result text_edit:").count(),
             1,
             "{output}"
         );
         assert!(
-            output.contains("[tool call repeated: rust_edit; not run again]"),
+            output.contains("[tool call repeated: text_edit; not run again]"),
             "{output}"
         );
         assert_eq!(
