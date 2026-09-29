@@ -304,7 +304,12 @@ position at a time: top-1 100%, KL 0.00000. Details and the check are in loadngo
 were still serial CPU work then. Later the same day the router's logits, the KDA
 recurrence and a decoding attention kernel moved to the GPU too. The 3,895-token prompt
 now reads in 59.2 s, and a new token at that context takes 0.06 s. CPU and GPU still agree
-on 453 tokens: top-1 100%, KL 0.00000. The text below predates both changes.
+on 453 tokens: top-1 100%, KL 0.00000. Then whole KDA and MLA blocks and each layer's routed experts became single GPU
+submissions, about 82 round trips per token instead of 187. Short-context decoding is
+now 0.031 s/token (about 32 tokens/s, was 0.050), the long prompt 51 s, and decoding at
+~3.9k context 0.040 s/token. It still agrees with the CPU exactly on 453 tokens. The first tokens after a long prompt can
+stall for seconds under memory pressure (41 GB peak on a 64 GB Mac); see loadngo
+`docs/METAL_COMPUTE_PLAN.md`, "Fewer round trips". The text below predates these changes.
 
 - **Prompt processing is CPU-bound.** A `sample` during the preamble put about 54% of
   the main thread in single-threaded model code (MLA attention, which is quadratic in

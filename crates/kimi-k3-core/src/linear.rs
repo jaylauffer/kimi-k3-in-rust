@@ -45,8 +45,8 @@ use serde_json::Value;
 use crate::{
     io::ReadRequest,
     layer::{
-        Accel, AttentionJob, DenseAccel, DenseJob, DeviceCache, Matrix, Mxfp4Matrix, RecurrenceJob,
-        Shared, WeightRef,
+        Accel, AttentionJob, DenseAccel, DenseJob, DeviceCache, ExpertJob, ExpertsJob, KdaBlockJob,
+        Matrix, MlaBlockJob, Mxfp4Matrix, RecurrenceJob, Shared, WeightRef, WeightShape,
     },
     ops::{
         kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, select_experts,
@@ -363,6 +363,14 @@ impl Weight {
             data: Stored::Bf16(words),
             out,
             inp,
+        }
+    }
+
+    fn shape(&self) -> WeightShape<'_> {
+        WeightShape {
+            w: self.as_ref(),
+            out: self.out,
+            inp: self.inp,
         }
     }
 
@@ -1292,6 +1300,38 @@ fn kda(
     let p = heads * d;
     let k = c.short_conv_kernel_size;
     let hist = k - 1;
+    let fused = accel.is_some_and(|device_accel| {
+        device_accel.kda_block(&mut KdaBlockJob {
+            x,
+            out: &mut *out,
+            weights: [
+                w.q.shape(),
+                w.k.shape(),
+                w.v.shape(),
+                w.b.shape(),
+                w.f_a.shape(),
+                w.f_b.shape(),
+                w.g_a.shape(),
+                w.g_b.shape(),
+                w.o.shape(),
+            ],
+            conv: [&w.q_conv, &w.k_conv, &w.v_conv],
+            a_log: &w.a_log,
+            dt_bias: &w.dt_bias,
+            o_norm: &w.o_norm,
+            eps: c.rms_norm_eps,
+            conv_state: &mut *conv,
+            recurrent: &mut *recurrent,
+            t,
+            heads,
+            d,
+            kernel: k,
+            device: &mut *device,
+        })
+    });
+    if fused {
+        return;
+    }
 
     let mut q = vec![0.0_f32; t * p];
     let mut kk = vec![0.0_f32; t * p];
@@ -1482,6 +1522,30 @@ fn mla(
     let kvw = kvr + qr;
     let kvd = qn + vh;
     let scale = 1.0_f32 / (qh as f32).sqrt();
+    let rows = cached + t;
+    let fused = accel.is_some_and(|device_accel| {
+        device_accel.mla_block(&mut MlaBlockJob {
+            x,
+            out: &mut *out,
+            weights: [w.q.shape(), w.kv_a.shape(), w.kv_b.shape(), w.o.shape()],
+            kv_a_norm: &w.kv_a_norm,
+            eps: c.rms_norm_eps,
+            kv: &mut kv[..rows * heads * kvd],
+            rope: &mut rope[..rows * qr],
+            t,
+            cached,
+            heads,
+            qn,
+            qr,
+            vh,
+            kvr,
+            scale,
+            device: &mut *device,
+        })
+    });
+    if fused {
+        return;
+    }
 
     let mut q = vec![0.0_f32; t * heads * qh];
     let mut ct = vec![0.0_f32; t * kvw];
@@ -1514,7 +1578,6 @@ fn mla(
     );
 
     let mut acc = vec![0.0_f32; t * heads * vh];
-    let rows = cached + t;
     let on_device = accel.is_some_and(|device_accel| {
         device_accel.attention(&mut AttentionJob {
             q: &q,
@@ -1719,17 +1782,74 @@ fn moe(
     let zeros = |width: usize| -> Vec<Vec<f32>> {
         slots.iter().map(|s| vec![0.0; s.len() * width]).collect()
     };
-    let (mut g, mut u, mut ys) = (zeros(inter), zeros(inter), zeros(e));
+    let mut ys = zeros(e);
     let mut sdn = vec![0.0_f32; t * e];
+    // With the router on the device, the shared expert's gate and up are done: the rest
+    // (every routed expert, the shared down projection) can go as one submission.
+    let fused = routed_on_device && {
+        silu_mul(&mut sg, &su);
+        let jobs = zs
+            .iter()
+            .zip(&mut ys)
+            .zip(&uniq)
+            .map(|((z, y), &expert)| {
+                let w = experts.get(layer, expert);
+                ExpertJob {
+                    x: z,
+                    rows: z.len() / e,
+                    w1: w.w1.shape(),
+                    w3: w.w3.shape(),
+                    w2: w.w2.shape(),
+                    y,
+                }
+            })
+            .collect();
+        accel.is_some_and(|device_accel| {
+            device_accel.experts(&mut ExpertsJob {
+                experts: jobs,
+                shared: shared.down.shape(),
+                shared_x: &sg,
+                shared_y: &mut sdn,
+                rows: t,
+            })
+        })
+    };
+    if !fused {
+        routed_experts(
+            (&mut ys, &mut sdn),
+            (&zs, &uniq),
+            (&mut sg, &mut su),
+            (x, shared, t, e, inter),
+            (experts, layer, routed_on_device),
+            accel,
+        );
+    }
+    mix(out, (&slots, &ys, &wt, &sdn), t, topk, e);
+    Ok(())
+}
+
+/// The expert work as separate products: routed gate and up (and the shared expert's,
+/// unless the router already did them), then the down projections.
+#[allow(clippy::type_complexity)]
+fn routed_experts(
+    (ys, sdn): (&mut [Vec<f32>], &mut [f32]),
+    (zs, uniq): (&[Vec<f32>], &[usize]),
+    (sg, su): (&mut [f32], &mut [f32]),
+    (x, shared, t, e, inter): (&[f32], &Mlp, usize, usize, usize),
+    (experts, layer, shared_done): (&ExpertStore, usize, bool),
+    accel: Accel<'_>,
+) {
+    let zeros = || -> Vec<Vec<f32>> { zs.iter().map(|z| vec![0.0; z.len() / e * inter]).collect() };
+    let (mut g, mut u) = (zeros(), zeros());
     let mut muls = Vec::new();
-    if !routed_on_device {
+    if !shared_done {
         muls.push(Mul {
             x,
             rows: t,
-            parts: vec![(&shared.gate, &mut sg), (&shared.up, &mut su)],
+            parts: vec![(&shared.gate, &mut *sg), (&shared.up, &mut *su)],
         });
     }
-    for (((z, gi), ui), &expert) in zs.iter().zip(&mut g).zip(&mut u).zip(&uniq) {
+    for (((z, gi), ui), &expert) in zs.iter().zip(g.iter_mut()).zip(u.iter_mut()).zip(uniq) {
         let w = experts.get(layer, expert);
         muls.push(Mul {
             x: z,
@@ -1738,16 +1858,18 @@ fn moe(
         });
     }
     products(accel, &mut muls);
-    silu_mul(&mut sg, &su);
-    for (gi, ui) in g.iter_mut().zip(&u) {
+    if !shared_done {
+        silu_mul(sg, su);
+    }
+    for (gi, ui) in g.iter_mut().zip(u.iter()) {
         silu_mul(gi, ui);
     }
     let mut muls = vec![Mul {
-        x: &sg,
+        x: sg,
         rows: t,
-        parts: vec![(&shared.down, &mut sdn)],
+        parts: vec![(&shared.down, sdn)],
     }];
-    for ((gi, yi), &expert) in g.iter().zip(&mut ys).zip(&uniq) {
+    for ((gi, yi), &expert) in g.iter().zip(ys.iter_mut()).zip(uniq) {
         let w = experts.get(layer, expert);
         muls.push(Mul {
             x: gi,
@@ -1756,9 +1878,19 @@ fn moe(
         });
     }
     products(accel, &mut muls);
+}
 
+/// `out = sum over each position's slots of weight * expert output, + shared`.
+#[allow(clippy::type_complexity)]
+fn mix(
+    out: &mut [f32],
+    (slots, ys, wt, sdn): (&[Vec<usize>], &[Vec<f32>], &[f32], &[f32]),
+    t: usize,
+    topk: usize,
+    e: usize,
+) {
     let mut contrib = vec![0.0_f32; t * topk * e];
-    for (s, yi) in slots.iter().zip(&ys) {
+    for (s, yi) in slots.iter().zip(ys) {
         for (r, &slot) in s.iter().enumerate() {
             contrib[slot * e..(slot + 1) * e].copy_from_slice(&yi[r * e..(r + 1) * e]);
         }
@@ -1773,10 +1905,9 @@ fn moe(
             }
         }
     }
-    for (oi, &si) in out[..t * e].iter_mut().zip(&sdn) {
+    for (oi, &si) in out[..t * e].iter_mut().zip(sdn) {
         *oi += si;
     }
-    Ok(())
 }
 
 #[cfg(test)]

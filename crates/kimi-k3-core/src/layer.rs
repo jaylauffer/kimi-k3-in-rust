@@ -125,6 +125,30 @@ pub trait DenseAccel {
         false
     }
 
+    /// A whole Kimi Delta Attention block in one submission (see [`KdaBlockJob`]).
+    /// Returns false, with `out` unspecified and both states untouched, to decline; the
+    /// caller then runs the block step by step and empties `job.device`.
+    #[allow(unused_variables)]
+    fn kda_block(&self, job: &mut KdaBlockJob<'_>) -> bool {
+        false
+    }
+
+    /// A whole multi-head latent attention block in one submission (see
+    /// [`MlaBlockJob`]). Returns false to decline, with `out` and the new cache rows
+    /// unspecified; the caller then runs the block step by step (and rewrites them).
+    #[allow(unused_variables)]
+    fn mla_block(&self, job: &mut MlaBlockJob<'_>) -> bool {
+        false
+    }
+
+    /// A mixture-of-experts layer's expert work once routing is decided, in one
+    /// submission (see [`ExpertsJob`]). Returns false, with every output unspecified, to
+    /// decline; the caller then runs it as separate products.
+    #[allow(unused_variables)]
+    fn experts(&self, job: &mut ExpertsJob<'_>) -> bool {
+        false
+    }
+
     /// The KDA recurrence (see [`RecurrenceJob`]). Returns false, with `out` and
     /// `state` untouched, to decline; the caller then runs it on the CPU and empties
     /// `job.device`.
@@ -157,6 +181,101 @@ pub struct RecurrenceJob<'a> {
     pub dk: usize,
     pub dv: usize,
     pub device: &'a mut DeviceCache,
+}
+
+/// A weight and its shape `[out][inp]`, as a device reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct WeightShape<'a> {
+    pub w: WeightRef<'a>,
+    pub out: usize,
+    pub inp: usize,
+}
+
+/// One Kimi Delta Attention block, as `kimi_k3_core::linear` computes it step by step:
+/// the projections of `x`, the short convolutions (with `SiLU`) of q, k and v carrying
+/// their history, L2-normalized q (then scaled by `1 / sqrt(d)`) and k, the decay
+/// `exp(-exp(a_log[h]) * softplus(f_b(f_a x) + dt_bias))`, `beta = sigmoid(b x)`, the
+/// recurrence of [`RecurrenceJob`], a per-head `RMSNorm` (`o_norm`) times
+/// `sigmoid(g_b(g_a x))`, and the output projection.
+pub struct KdaBlockJob<'a> {
+    /// `[t][hidden]`: the block's normalized input.
+    pub x: &'a [f32],
+    /// `[t][hidden]`: the block's output, before the residual add.
+    pub out: &'a mut [f32],
+    /// `q`, `k`, `v`, `b`, `f_a`, `f_b`, `g_a`, `g_b`, `o`.
+    pub weights: [WeightShape<'a>; 9],
+    /// The q, k and v convolution taps, `[heads * d][kernel]` each.
+    pub conv: [&'a [f32]; 3],
+    /// `[heads]`.
+    pub a_log: &'a [f32],
+    /// `[heads * d]`.
+    pub dt_bias: &'a [f32],
+    /// `[d]`.
+    pub o_norm: &'a [f32],
+    pub eps: f32,
+    /// `[3][heads * d][kernel - 1]`: the q, k and v convolution history; read, then
+    /// updated.
+    pub conv_state: &'a mut [f32],
+    /// `[heads][d][d]`: read, then updated.
+    pub recurrent: &'a mut [f32],
+    pub t: usize,
+    pub heads: usize,
+    pub d: usize,
+    pub kernel: usize,
+    pub device: &'a mut DeviceCache,
+}
+
+/// One multi-head latent attention block (no rotary embedding): `q = W_q x`;
+/// `[c | r] = W_kv_a x`, `c` normalized with `kv_a_norm`, `r` appended to the shared-key
+/// cache `rope`; `W_kv_b c` appended to `kv`; causal attention as in [`AttentionJob`];
+/// then the output projection `W_o`.
+pub struct MlaBlockJob<'a> {
+    /// `[t][hidden]`: the block's normalized input.
+    pub x: &'a [f32],
+    /// `[t][hidden]`: the block's output, before the residual add.
+    pub out: &'a mut [f32],
+    /// `q`, `kv_a`, `kv_b`, `o`.
+    pub weights: [WeightShape<'a>; 4],
+    /// `[kvr]`.
+    pub kv_a_norm: &'a [f32],
+    pub eps: f32,
+    /// `[cached + t][heads][qn + vh]`; rows from `cached` on are written.
+    pub kv: &'a mut [f32],
+    /// `[cached + t][qr]`; rows from `cached` on are written.
+    pub rope: &'a mut [f32],
+    pub t: usize,
+    pub cached: usize,
+    pub heads: usize,
+    pub qn: usize,
+    pub qr: usize,
+    pub vh: usize,
+    /// The latent width (`kv_lora_rank`).
+    pub kvr: usize,
+    pub scale: f32,
+    pub device: &'a mut DeviceCache,
+}
+
+/// One routed expert over the rows that selected it:
+/// `y = w2 (silu(w1 x) * (w3 x))`, `x` `[rows][w1.inp]`, `y` `[rows][w2.out]`.
+pub struct ExpertJob<'a> {
+    pub x: &'a [f32],
+    pub rows: usize,
+    pub w1: WeightShape<'a>,
+    pub w3: WeightShape<'a>,
+    pub w2: WeightShape<'a>,
+    pub y: &'a mut [f32],
+}
+
+/// Every routed expert of one layer, plus the shared expert's down projection `y = w x`
+/// (its gate and up already applied): the work between routing and the mix.
+pub struct ExpertsJob<'a> {
+    pub experts: Vec<ExpertJob<'a>>,
+    pub shared: WeightShape<'a>,
+    /// `[rows][shared.inp]`.
+    pub shared_x: &'a [f32],
+    /// `[rows][shared.out]`.
+    pub shared_y: &'a mut [f32],
+    pub rows: usize,
 }
 
 /// What an accelerator keeps beside one layer's attention cache or recurrent state, for
