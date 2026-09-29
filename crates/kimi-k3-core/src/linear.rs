@@ -45,11 +45,12 @@ use serde_json::Value;
 use crate::{
     io::ReadRequest,
     layer::{
-        Accel, AttentionJob, DenseAccel, DenseJob, DeviceCache, Matrix, Mxfp4Matrix, Shared,
-        WeightRef,
+        Accel, AttentionJob, DenseAccel, DenseJob, DeviceCache, Matrix, Mxfp4Matrix, RecurrenceJob,
+        Shared, WeightRef,
     },
     ops::{
-        kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid,
+        kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, select_experts,
+        shortconv_in_place, sigmoid,
     },
     safetensors::{DType, SafeTensorError, SafeTensorIndex},
 };
@@ -520,7 +521,10 @@ struct Mlp {
 enum Ffn {
     Dense(Mlp),
     Moe {
+        /// The router, as `f32` for the CPU reference and as the checkpoint's bf16 for
+        /// devices.
         gate: Vec<f32>,
+        router: Weight,
         bias: Vec<f32>,
         shared: Mlp,
     },
@@ -734,6 +738,7 @@ enum State {
     Kda {
         recurrent: Vec<f32>,
         conv: Vec<f32>,
+        device: DeviceCache,
     },
     Mla {
         kv: Vec<f32>,
@@ -767,9 +772,14 @@ impl LinearSession {
     pub fn reset(&mut self) {
         for state in &mut self.states {
             match state {
-                State::Kda { recurrent, conv } => {
+                State::Kda {
+                    recurrent,
+                    conv,
+                    device,
+                } => {
                     recurrent.fill(0.0);
                     conv.fill(0.0);
+                    device.0 = None;
                 }
                 State::Mla { device, .. } => device.0 = None,
             }
@@ -873,6 +883,7 @@ impl LinearModel {
                         &at("block_sparse_moe.gate.weight"),
                         c.num_experts * e,
                     )?,
+                    router: w(&at("block_sparse_moe.gate.weight"), c.num_experts, e)?,
                     bias: vector(
                         &index,
                         &at("block_sparse_moe.gate.e_score_correction_bias"),
@@ -1027,7 +1038,11 @@ impl LinearModel {
             };
             moved += attn.into_iter().map(|w| w.share(device)).sum::<usize>();
             let mlp = match &mut layer.ffn {
-                Ffn::Dense(m) | Ffn::Moe { shared: m, .. } => m,
+                Ffn::Dense(m) => m,
+                Ffn::Moe { shared, router, .. } => {
+                    moved += router.share(device);
+                    shared
+                }
             };
             for w in [&mut mlp.gate, &mut mlp.up, &mut mlp.down] {
                 moved += w.share(device);
@@ -1070,6 +1085,7 @@ impl LinearModel {
                     State::Kda {
                         recurrent: vec![0.0; c.kda_num_heads * c.kda_head_dim * c.kda_head_dim],
                         conv: vec![0.0; 3 * p * (c.short_conv_kernel_size - 1)],
+                        device: DeviceCache::default(),
                     }
                 }
             })
@@ -1184,8 +1200,15 @@ impl LinearModel {
                 rmsnorm(y, x, &layer.in_norm, c.rms_norm_eps);
             }
             match (&layer.attn, state) {
-                (Attn::Kda(w), State::Kda { recurrent, conv }) => {
-                    kda(&mut tmp, &hin, w, c, t, recurrent, conv, accel);
+                (
+                    Attn::Kda(w),
+                    State::Kda {
+                        recurrent,
+                        conv,
+                        device,
+                    },
+                ) => {
+                    kda(&mut tmp, &hin, w, c, t, (recurrent, conv, device), accel);
                 }
                 (Attn::Mla(w), State::Mla { kv, rope, device }) => {
                     let rows = cached + t;
@@ -1206,11 +1229,16 @@ impl LinearModel {
             }
             match &layer.ffn {
                 Ffn::Dense(m) => mlp(&mut tmp, &hin, m, t, accel),
-                Ffn::Moe { gate, bias, shared } => {
+                Ffn::Moe {
+                    gate,
+                    router,
+                    bias,
+                    shared,
+                } => {
                     moe(
                         &mut tmp,
                         &hin,
-                        (gate, bias, shared),
+                        (gate, router, bias, shared),
                         c,
                         l,
                         t,
@@ -1256,8 +1284,7 @@ fn kda(
     w: &Kda,
     c: &LinearConfig,
     t: usize,
-    recurrent: &mut [f32],
-    conv: &mut [f32],
+    (recurrent, conv, device): (&mut [f32], &mut [f32], &mut DeviceCache),
     accel: Accel<'_>,
 ) {
     let heads = c.kda_num_heads;
@@ -1332,6 +1359,54 @@ fn kda(
     }
     let qscale = 1.0_f32 / (d as f32).sqrt();
     let mut o = vec![0.0_f32; t * p];
+    let on_device = accel.is_some_and(|device_accel| {
+        let scaled: Vec<f32> = q.iter().map(|&x| x * qscale).collect();
+        let beta: Vec<f32> = bt.iter().map(|&b| sigmoid(b)).collect();
+        device_accel.recurrence(&mut RecurrenceJob {
+            q: &scaled,
+            k: &kk,
+            v: &v,
+            alpha: &alpha,
+            beta: &beta,
+            state: recurrent,
+            out: &mut o,
+            t,
+            heads,
+            dk: d,
+            dv: d,
+            device,
+        })
+    });
+    if !on_device {
+        // The state changes below without the accelerator: its copy is out of date.
+        device.0 = None;
+        kda_recurrence(
+            &mut o,
+            (&q, &kk, &v, &alpha, &bt),
+            recurrent,
+            heads,
+            d,
+            t,
+            qscale,
+        );
+    }
+    finish_kda(out, o, &gb, w, c, t, accel);
+}
+
+/// `q`, `k`, `v`, `alpha` and the pre-sigmoid `beta` of one KDA call.
+type KdaInputs<'a> = (&'a [f32], &'a [f32], &'a [f32], &'a [f32], &'a [f32]);
+
+/// The reference recurrence, head by head.
+fn kda_recurrence(
+    o: &mut [f32],
+    (q, kk, v, alpha, bt): KdaInputs<'_>,
+    recurrent: &mut [f32],
+    heads: usize,
+    d: usize,
+    t: usize,
+    qscale: f32,
+) {
+    let p = heads * d;
     let mut qh = vec![0.0_f32; d];
     for hh in 0..heads {
         let s = &mut recurrent[hh * d * d..(hh + 1) * d * d];
@@ -1353,6 +1428,21 @@ fn kda(
             );
         }
     }
+}
+
+/// Output: per-head `RMSNorm`, times sigmoid of the low-rank gate, then the projection.
+fn finish_kda(
+    out: &mut [f32],
+    mut o: Vec<f32>,
+    gb: &[f32],
+    w: &Kda,
+    c: &LinearConfig,
+    t: usize,
+    accel: Accel<'_>,
+) {
+    let heads = c.kda_num_heads;
+    let d = c.kda_head_dim;
+    let p = heads * d;
     // Output: per-head RMSNorm, times sigmoid of the low-rank gate g_b(g_a(x)).
     for step in 0..t {
         let row = &mut o[step * p..(step + 1) * p];
@@ -1537,7 +1627,7 @@ fn mlp(out: &mut [f32], x: &[f32], m: &Mlp, t: usize, accel: Accel<'_>) {
 fn moe(
     out: &mut [f32],
     x: &[f32],
-    (gate, bias, shared): (&[f32], &[f32], &Mlp),
+    (gate, router_w, bias, shared): (&[f32], &Weight, &[f32], &Mlp),
     c: &LinearConfig,
     layer: usize,
     t: usize,
@@ -1552,19 +1642,53 @@ fn moe(
     let mut wt = vec![0.0_f32; t * topk];
     let mut seen = vec![false; c.num_experts];
     let mut uniq = Vec::new();
-    for step in 0..t {
-        router(
-            &mut idx[step * topk..(step + 1) * topk],
-            &mut wt[step * topk..(step + 1) * topk],
-            &x[step * e..(step + 1) * e],
-            gate,
-            Some(bias),
-            e,
-            c.num_experts,
-            topk,
-            c.moe_renormalize,
-            c.routed_scaling_factor,
+    let mut sg = vec![0.0_f32; t * shared.inter];
+    let mut su = vec![0.0_f32; t * shared.inter];
+    // With a device, the router's logits come from it, in the same batch as the shared
+    // expert's gate and up (all three read `x`); the selection itself stays here. On the
+    // CPU the reference router accumulates in f64.
+    let routed_on_device = accel.is_some_and(DenseAccel::routes);
+    if routed_on_device {
+        let mut logits = vec![0.0_f32; t * c.num_experts];
+        products(
+            accel,
+            &mut [Mul {
+                x,
+                rows: t,
+                parts: vec![
+                    (router_w, &mut logits),
+                    (&shared.gate, &mut sg),
+                    (&shared.up, &mut su),
+                ],
+            }],
         );
+        for step in 0..t {
+            select_experts(
+                &mut idx[step * topk..(step + 1) * topk],
+                &mut wt[step * topk..(step + 1) * topk],
+                &logits[step * c.num_experts..(step + 1) * c.num_experts],
+                Some(bias),
+                topk,
+                c.moe_renormalize,
+                c.routed_scaling_factor,
+            );
+        }
+    }
+    for step in 0..t {
+        if !routed_on_device {
+            router(
+                &mut idx[step * topk..(step + 1) * topk],
+                &mut wt[step * topk..(step + 1) * topk],
+                &x[step * e..(step + 1) * e],
+                gate,
+                Some(bias),
+                e,
+                c.num_experts,
+                topk,
+                c.moe_renormalize,
+                c.routed_scaling_factor,
+            );
+        }
         for &expert in &idx[step * topk..(step + 1) * topk] {
             if !seen[expert] {
                 seen[expert] = true;
@@ -1596,14 +1720,15 @@ fn moe(
         slots.iter().map(|s| vec![0.0; s.len() * width]).collect()
     };
     let (mut g, mut u, mut ys) = (zeros(inter), zeros(inter), zeros(e));
-    let mut sg = vec![0.0_f32; t * shared.inter];
-    let mut su = vec![0.0_f32; t * shared.inter];
     let mut sdn = vec![0.0_f32; t * e];
-    let mut muls = vec![Mul {
-        x,
-        rows: t,
-        parts: vec![(&shared.gate, &mut sg), (&shared.up, &mut su)],
-    }];
+    let mut muls = Vec::new();
+    if !routed_on_device {
+        muls.push(Mul {
+            x,
+            rows: t,
+            parts: vec![(&shared.gate, &mut sg), (&shared.up, &mut su)],
+        });
+    }
     for (((z, gi), ui), &expert) in zs.iter().zip(&mut g).zip(&mut u).zip(&uniq) {
         let w = experts.get(layer, expert);
         muls.push(Mul {

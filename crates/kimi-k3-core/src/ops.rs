@@ -89,34 +89,45 @@ pub fn situ_glu(y: &mut [f32], x: &[f32], n: usize, b1: f32, b2: f32) {
 pub fn shortconv_in_place(
     v: &mut [f32],
     w: &[f32],
-    mut state: Option<&mut [f32]>,
+    state: Option<&mut [f32]>,
     channels: usize,
     k: usize,
     t: usize,
 ) {
     let hist = k - 1;
-    let mut buf = vec![0.0_f32; hist];
-    for c in 0..channels {
-        match state.as_deref() {
-            Some(s) => buf.copy_from_slice(&s[c * hist..(c + 1) * hist]),
-            None => buf.fill(0.0),
+    // History as `[hist][channels]`, oldest first, so each position's row is read
+    // contiguously (a channel-by-channel walk strides a whole row per step). Each
+    // channel's arithmetic, and its order, is unchanged.
+    let mut past = vec![0.0_f32; hist * channels];
+    if let Some(s) = state.as_deref() {
+        for c in 0..channels {
+            for h in 0..hist {
+                past[h * channels + c] = s[c * hist + h];
+            }
         }
-        let taps = &w[c * k..(c + 1) * k];
-        for step in 0..t {
-            let at = step * channels + c;
-            let cur = v[at];
+    }
+    for row in v[..t * channels].chunks_exact_mut(channels) {
+        for (c, x) in row.iter_mut().enumerate() {
+            let cur = *x;
+            let taps = &w[c * k..(c + 1) * k];
             let mut acc = taps[hist] * cur;
-            for (&tap, &past) in taps[..hist].iter().zip(&buf) {
-                acc += tap * past;
+            for (h, &tap) in taps[..hist].iter().enumerate() {
+                acc += tap * past[h * channels + c];
             }
             if hist > 0 {
-                buf.copy_within(1.., 0);
-                buf[hist - 1] = cur;
+                for h in 1..hist {
+                    past[(h - 1) * channels + c] = past[h * channels + c];
+                }
+                past[(hist - 1) * channels + c] = cur;
             }
-            v[at] = acc * sigmoid(acc);
+            *x = acc * sigmoid(acc);
         }
-        if let Some(s) = state.as_deref_mut() {
-            s[c * hist..(c + 1) * hist].copy_from_slice(&buf);
+    }
+    if let Some(s) = state {
+        for c in 0..channels {
+            for h in 0..hist {
+                s[c * hist + h] = past[h * channels + c];
+            }
         }
     }
 }
@@ -258,15 +269,35 @@ pub fn router(
     renorm: bool,
     routed_scale: f32,
 ) {
-    let mut score = vec![0.0_f32; n_experts];
-    let mut choice = vec![0.0_f32; n_experts];
-    for e in 0..n_experts {
+    let mut logits = vec![0.0_f32; n_experts];
+    for (e, logit) in logits.iter_mut().enumerate() {
         let row = &gate[e * hidden..(e + 1) * hidden];
         let mut acc = 0.0_f64;
         for (&r, &xi) in row.iter().zip(&x[..hidden]) {
             acc += f64::from(r) * f64::from(xi);
         }
-        score[e] = 1.0 / (1.0 + (-(acc as f32)).exp());
+        *logit = acc as f32;
+    }
+    select_experts(idx, wt, &logits, bias, topk, renorm, routed_scale);
+}
+
+/// The routing decision from one position's gate `logits` (one per expert): sigmoid
+/// scores, top `topk` by score plus `bias` (ties to the lower index), weights from the
+/// unbiased scores, optionally renormalized, then scaled.
+pub fn select_experts(
+    idx: &mut [usize],
+    wt: &mut [f32],
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    topk: usize,
+    renorm: bool,
+    routed_scale: f32,
+) {
+    let n_experts = logits.len();
+    let mut score = vec![0.0_f32; n_experts];
+    let mut choice = vec![0.0_f32; n_experts];
+    for e in 0..n_experts {
+        score[e] = 1.0 / (1.0 + (-logits[e]).exp());
         choice[e] = score[e] + bias.map_or(0.0, |b| b[e]);
     }
 
@@ -522,5 +553,77 @@ pub fn matmul_mxfp4(
             acc += sub * f64::from(e8m0_scale(sb));
         }
         *yr = acc as f32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The channel-by-channel form this replaced.
+    fn channel_major(
+        v: &mut [f32],
+        w: &[f32],
+        mut state: Option<&mut [f32]>,
+        channels: usize,
+        k: usize,
+        t: usize,
+    ) {
+        let hist = k - 1;
+        let mut buf = vec![0.0_f32; hist];
+        for c in 0..channels {
+            match state.as_deref() {
+                Some(s) => buf.copy_from_slice(&s[c * hist..(c + 1) * hist]),
+                None => buf.fill(0.0),
+            }
+            let taps = &w[c * k..(c + 1) * k];
+            for step in 0..t {
+                let at = step * channels + c;
+                let cur = v[at];
+                let mut acc = taps[hist] * cur;
+                for (&tap, &past) in taps[..hist].iter().zip(&buf) {
+                    acc += tap * past;
+                }
+                if hist > 0 {
+                    buf.copy_within(1.., 0);
+                    buf[hist - 1] = cur;
+                }
+                v[at] = acc * sigmoid(acc);
+            }
+            if let Some(s) = state.as_deref_mut() {
+                s[c * hist..(c + 1) * hist].copy_from_slice(&buf);
+            }
+        }
+    }
+
+    fn values(seed: u32, n: usize) -> Vec<f32> {
+        (0..n as u32)
+            .map(|i| {
+                (i.wrapping_mul(2_654_435_761).wrapping_add(seed) >> 8) as f32 / 8_388_608.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn bits(x: &[f32]) -> Vec<u32> {
+        x.iter().map(|f| f.to_bits()).collect()
+    }
+
+    #[test]
+    fn shortconv_matches_the_channel_major_form_bit_for_bit() {
+        for (channels, k, t) in [(37, 4, 1), (37, 4, 9), (64, 1, 5), (16, 3, 20)] {
+            let w = values(1, channels * k);
+            let v0 = values(2, channels * t);
+            let s0 = values(3, channels * (k - 1));
+            let (mut a, mut b) = (v0.clone(), v0.clone());
+            let (mut sa, mut sb) = (s0.clone(), s0.clone());
+            shortconv_in_place(&mut a, &w, Some(&mut sa), channels, k, t);
+            channel_major(&mut b, &w, Some(&mut sb), channels, k, t);
+            assert_eq!(bits(&a), bits(&b), "{channels} {k} {t} carried");
+            assert_eq!(bits(&sa), bits(&sb), "{channels} {k} {t} state");
+            let (mut a, mut b) = (v0.clone(), v0);
+            shortconv_in_place(&mut a, &w, None, channels, k, t);
+            channel_major(&mut b, &w, None, channels, k, t);
+            assert_eq!(bits(&a), bits(&b), "{channels} {k} {t} fresh");
+        }
     }
 }

@@ -117,10 +117,50 @@ pub trait DenseAccel {
     fn attention(&self, job: &mut AttentionJob<'_>) -> bool {
         false
     }
+
+    /// Whether mixture-of-experts router logits should be computed on this device through
+    /// [`Self::run_dense`]. They pick the experts, so a device answers true only if its
+    /// products accumulate in `f32` or better; the default keeps the `f64` CPU router.
+    fn routes(&self) -> bool {
+        false
+    }
+
+    /// The KDA recurrence (see [`RecurrenceJob`]). Returns false, with `out` and
+    /// `state` untouched, to decline; the caller then runs it on the CPU and empties
+    /// `job.device`.
+    #[allow(unused_variables)]
+    fn recurrence(&self, job: &mut RecurrenceJob<'_>) -> bool {
+        false
+    }
 }
 
-/// What an accelerator keeps beside one layer's attention cache, for example a copy of
-/// it in GPU memory. The session owns it. Cloning a session leaves it empty, so copies
+/// The delta-rule recurrence of Kimi Delta Attention, `t` steps in order. Per head,
+/// with state `S` `[dk][dv]`: `S = diag(alpha) S`, `u = S^T k`, `S += k (beta (v - u))^T`,
+/// `out = S^T q` (the order of [`crate::ops::kda_step`]).
+pub struct RecurrenceJob<'a> {
+    /// `[t][heads][dk]`, already scaled.
+    pub q: &'a [f32],
+    /// `[t][heads][dk]`.
+    pub k: &'a [f32],
+    /// `[t][heads][dv]`.
+    pub v: &'a [f32],
+    /// `[t][heads][dk]`: the decay per key channel.
+    pub alpha: &'a [f32],
+    /// `[t][heads]`: the write strength, after its sigmoid.
+    pub beta: &'a [f32],
+    /// `[heads][dk][dv]`: read, then left holding the state after the last step.
+    pub state: &'a mut [f32],
+    /// `[t][heads][dv]`.
+    pub out: &'a mut [f32],
+    pub t: usize,
+    pub heads: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub device: &'a mut DeviceCache,
+}
+
+/// What an accelerator keeps beside one layer's attention cache or recurrent state, for
+/// example a copy of it in GPU memory. The session owns it. Cloning a session leaves it empty, so copies
 /// never share it, and the session empties it whenever the cache changes without the
 /// accelerator (a reset, or attention computed on the CPU). While it is set, positions
 /// before `cached` are the ones the accelerator was last given.

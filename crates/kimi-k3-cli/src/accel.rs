@@ -217,9 +217,11 @@ mod ane {
 mod gpu {
     use super::DenseAccel;
     use super::ane::Ane;
-    use kimi_k3_core::layer::{AttentionJob, DenseJob, Shared, SharedWeight, WeightRef};
+    use kimi_k3_core::layer::{
+        AttentionJob, DenseJob, RecurrenceJob, Shared, SharedWeight, WeightRef,
+    };
     use loadngo_metal_compute::{
-        AttentionShape, Buffer, Completed, Dispatch, Gpu as Metal, Resident, Slice,
+        AttentionShape, Buffer, Completed, Dispatch, Gpu as Metal, RecurrenceShape, Resident, Slice,
     };
     use loadngo_proactor::{PlatformPort, Proactor, new_platform_proactor};
     use std::cell::{Cell, RefCell};
@@ -257,7 +259,14 @@ mod gpu {
         attention_gpu_s: f64,
         attention_wall_s: f64,
         attention_failed: u64,
+        recurrence: u64,
+        recurrence_gpu_s: f64,
+        recurrence_wall_s: f64,
+        recurrence_failed: u64,
     }
+
+    /// A KDA layer's recurrent state in GPU memory, equal to the session's own copy.
+    struct StateCopy(Buffer);
 
     /// One attention layer's cache copied into GPU memory: `len` positions valid, room
     /// for `capacity`. Kept in the session's [`kimi_k3_core::layer::DeviceCache`].
@@ -315,6 +324,13 @@ mod gpu {
                     v / s.attention as f64 * 1e3
                 }
             };
+            let recurrence_each = |v: f64| {
+                if s.recurrence == 0 {
+                    0.0
+                } else {
+                    v / s.recurrence as f64 * 1e3
+                }
+            };
             let per = |v: f64| {
                 if s.steps == 0 {
                     0.0
@@ -328,7 +344,8 @@ mod gpu {
                  ({:.2} ms encoding {:.0} dispatches, {:.2} ms to completion); \
                  {} steps to the ANE (weights not in GPU memory), {} GPU failures; \
                  attention {} layers on the GPU, {:.2} ms GPU, {:.2} ms wall each, \
-                 {} on the CPU after a GPU failure | {}",
+                 {} on the CPU after a GPU failure; KDA recurrence {} layers on the GPU, \
+                 {:.2} ms GPU, {:.2} ms wall each, {} on the CPU after a GPU failure | {}",
                 self.metal.name(),
                 s.shared_bytes as f64 / 1e9,
                 s.steps,
@@ -354,6 +371,10 @@ mod gpu {
                 attention_each(s.attention_gpu_s),
                 attention_each(s.attention_wall_s),
                 s.attention_failed,
+                s.recurrence,
+                recurrence_each(s.recurrence_gpu_s),
+                recurrence_each(s.recurrence_wall_s),
+                s.recurrence_failed,
                 self.ane.summary()
             )
         }
@@ -545,6 +566,73 @@ mod gpu {
             Ok(())
         }
 
+        /// The KDA recurrence on the GPU. The session's state stays authoritative: it is
+        /// copied in when the GPU copy is missing and copied back after every run.
+        fn recur(&self, job: &mut RecurrenceJob<'_>) -> Result<(), String> {
+            let start = Instant::now();
+            let state_len = job.state.len();
+            let state = match job
+                .device
+                .0
+                .take()
+                .and_then(|copy| copy.downcast::<StateCopy>().ok())
+            {
+                Some(copy) if copy.0.len() >= state_len * 4 => copy.0,
+                _ => {
+                    let mut buffer = self
+                        .metal
+                        .buffer(state_len * 4)
+                        .map_err(|e| e.to_string())?;
+                    buffer.as_f32_mut()[..state_len].copy_from_slice(job.state);
+                    buffer
+                }
+            };
+            let inputs = [job.q, job.k, job.v, job.alpha, job.beta];
+            let x_len: usize = inputs.iter().map(|x| align16(x.len() * 4)).sum();
+            let out_len = job.out.len() * 4;
+            let mut staging = self.take_staging(x_len, out_len)?;
+            let mut slices = Vec::with_capacity(inputs.len());
+            let mut at = 0;
+            for input in inputs {
+                staging[X].as_f32_mut()[at / 4..at / 4 + input.len()].copy_from_slice(input);
+                slices.push(Slice::new(X, at, input.len() * 4));
+                at += align16(input.len() * 4);
+            }
+            staging.push(state);
+            let mut batch = self
+                .metal
+                .batch(staging, Dispatch::Serial)
+                .map_err(|e| e.to_string())?;
+            batch
+                .delta_rule_recurrence(
+                    (slices[0], slices[1], slices[2], slices[3], slices[4]),
+                    Slice::new(2, 0, state_len * 4),
+                    Slice::new(Y, 0, out_len),
+                    RecurrenceShape {
+                        t: job.t,
+                        heads: job.heads,
+                        dk: job.dk,
+                        dv: job.dv,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let done = self.submit(batch)?;
+            let mut buffers = done.buffers;
+            let state = buffers.pop().ok_or("state buffer missing")?;
+            let gpu_time = done.gpu_time.map_err(|e| e.to_string())?;
+            job.out
+                .copy_from_slice(&buffers[Y].as_f32()[..job.out.len()]);
+            job.state.copy_from_slice(&state.as_f32()[..state_len]);
+            *self.staging.borrow_mut() = Some(buffers);
+            job.device.0 = Some(Box::new(StateCopy(state)));
+            self.update(|s| {
+                s.recurrence += 1;
+                s.recurrence_gpu_s += gpu_time.as_secs_f64();
+                s.recurrence_wall_s += start.elapsed().as_secs_f64();
+            });
+            Ok(())
+        }
+
         /// Commits `batch` and runs this device's proactor until its completion arrives.
         fn submit(&self, batch: loadngo_metal_compute::Batch<'_>) -> Result<Completed, String> {
             let slot: Arc<Mutex<Option<Completed>>> = Arc::default();
@@ -710,6 +798,24 @@ mod gpu {
 
         fn share_bytes(&self, bytes: &[u8]) -> Option<Shared> {
             self.share(self.metal.resident(bytes))
+        }
+
+        /// Router logits through the GPU's `f32` products.
+        fn routes(&self) -> bool {
+            true
+        }
+
+        fn recurrence(&self, job: &mut RecurrenceJob<'_>) -> bool {
+            match self.recur(job) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.update(|s| s.recurrence_failed += 1);
+                    if self.stats.get().recurrence_failed <= 3 {
+                        eprintln!("gpu: KDA recurrence computed on the CPU instead: {error}");
+                    }
+                    false
+                }
+            }
         }
 
         fn attention(&self, job: &mut AttentionJob<'_>) -> bool {

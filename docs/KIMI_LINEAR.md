@@ -301,7 +301,10 @@ a new token at that context takes 0.14 s instead of 0.27 s. The CPU reference is
 used when there is no GPU. CPU and GPU agree exactly on 453 tokens, whole-text and one
 position at a time: top-1 100%, KL 0.00000. Details and the check are in loadngo
 `docs/METAL_COMPUTE_PLAN.md`, "Attention on the GPU". The router and the KDA recurrence
-are still serial CPU work. The text below predates this change.
+were still serial CPU work then. Later the same day the router's logits, the KDA
+recurrence and a decoding attention kernel moved to the GPU too. The 3,895-token prompt
+now reads in 59.2 s, and a new token at that context takes 0.06 s. CPU and GPU still agree
+on 453 tokens: top-1 100%, KL 0.00000. The text below predates both changes.
 
 - **Prompt processing is CPU-bound.** A `sample` during the preamble put about 54% of
   the main thread in single-threaded model code (MLA attention, which is quadratic in
