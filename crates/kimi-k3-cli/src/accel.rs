@@ -217,8 +217,10 @@ mod ane {
 mod gpu {
     use super::DenseAccel;
     use super::ane::Ane;
-    use kimi_k3_core::layer::{DenseJob, Shared, SharedWeight, WeightRef};
-    use loadngo_metal_compute::{Buffer, Completed, Dispatch, Gpu as Metal, Resident, Slice};
+    use kimi_k3_core::layer::{AttentionJob, DenseJob, Shared, SharedWeight, WeightRef};
+    use loadngo_metal_compute::{
+        AttentionShape, Buffer, Completed, Dispatch, Gpu as Metal, Resident, Slice,
+    };
     use loadngo_proactor::{PlatformPort, Proactor, new_platform_proactor};
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -251,6 +253,19 @@ mod gpu {
         shared_bytes: u64,
         to_ane: u64,
         failed: u64,
+        attention: u64,
+        attention_gpu_s: f64,
+        attention_wall_s: f64,
+        attention_failed: u64,
+    }
+
+    /// One attention layer's cache copied into GPU memory: `len` positions valid, room
+    /// for `capacity`. Kept in the session's [`kimi_k3_core::layer::DeviceCache`].
+    struct CacheCopy {
+        kv: Buffer,
+        rope: Buffer,
+        len: usize,
+        capacity: usize,
     }
 
     /// Staging for one step's inputs and outputs, reused and grown as needed.
@@ -293,6 +308,13 @@ mod gpu {
         #[allow(clippy::cast_precision_loss)] // byte counts and rates shown to one decimal
         pub fn summary(&self) -> String {
             let s = self.stats.get();
+            let attention_each = |v: f64| {
+                if s.attention == 0 {
+                    0.0
+                } else {
+                    v / s.attention as f64 * 1e3
+                }
+            };
             let per = |v: f64| {
                 if s.steps == 0 {
                     0.0
@@ -304,7 +326,9 @@ mod gpu {
                 "gpu ({}): {:.1} GB of weights in GPU memory; {} steps, {} products, \
                  {:.1} GB read at {:.0} GB/s; per step {:.2} ms GPU, {:.2} ms wall \
                  ({:.2} ms encoding {:.0} dispatches, {:.2} ms to completion); \
-                 {} steps to the ANE (weights not in GPU memory), {} GPU failures | {}",
+                 {} steps to the ANE (weights not in GPU memory), {} GPU failures; \
+                 attention {} layers on the GPU, {:.2} ms GPU, {:.2} ms wall each, \
+                 {} on the CPU after a GPU failure | {}",
                 self.metal.name(),
                 s.shared_bytes as f64 / 1e9,
                 s.steps,
@@ -326,6 +350,10 @@ mod gpu {
                 per(s.wait_s),
                 s.to_ane,
                 s.failed,
+                s.attention,
+                attention_each(s.attention_gpu_s),
+                attention_each(s.attention_wall_s),
+                s.attention_failed,
                 self.ane.summary()
             )
         }
@@ -381,14 +409,7 @@ mod gpu {
                 .iter()
                 .flat_map(|j| j.parts.iter().map(|(_, out, _)| j.rows * align16(out * 4)))
                 .sum();
-            let mut staging = self.staging.borrow_mut().take().unwrap_or_default();
-            if staging.len() != 2 || staging[X].len() < x_len || staging[Y].len() < y_len {
-                let grow = |have: Option<&Buffer>, need: usize| {
-                    let size = need.max(have.map_or(0, Buffer::len)).max(1 << 20);
-                    self.metal.buffer(size).map_err(|e| e.to_string())
-                };
-                staging = vec![grow(staging.get(X), x_len)?, grow(staging.get(Y), y_len)?];
-            }
+            let mut staging = self.take_staging(x_len, y_len)?;
             let mut at = 0;
             for job in jobs {
                 let stride = align16(job.inp * 4);
@@ -398,6 +419,130 @@ mod gpu {
                 }
             }
             Ok(staging)
+        }
+
+        /// The staging pair, at least `x_len` and `y_len` bytes, taken out for one step.
+        fn take_staging(&self, x_len: usize, y_len: usize) -> Result<Vec<Buffer>, String> {
+            let mut staging = self.staging.borrow_mut().take().unwrap_or_default();
+            if staging.len() != 2 || staging[X].len() < x_len || staging[Y].len() < y_len {
+                let grow = |have: Option<&Buffer>, need: usize| {
+                    let size = need.max(have.map_or(0, Buffer::len)).max(1 << 20);
+                    self.metal.buffer(size).map_err(|e| e.to_string())
+                };
+                staging = vec![grow(staging.get(X), x_len)?, grow(staging.get(Y), y_len)?];
+            }
+            Ok(staging)
+        }
+
+        /// The layer's cache copy with room for `rows` positions: the session's own if it
+        /// fits, else a larger one holding what the old one had.
+        fn cache_copy(
+            &self,
+            job: &mut AttentionJob<'_>,
+            rows: usize,
+            (row, rope_row): (usize, usize),
+        ) -> Result<CacheCopy, String> {
+            let old = job
+                .device
+                .0
+                .take()
+                .and_then(|state| state.downcast::<CacheCopy>().ok())
+                .map(|copy| *copy);
+            match old {
+                Some(copy) if copy.capacity >= rows => Ok(copy),
+                old => {
+                    // Doubling keeps the copying of a growing conversation linear.
+                    let capacity = rows
+                        .max(old.as_ref().map_or(0, |c| c.capacity * 2))
+                        .max(1024);
+                    let buffer = |floats: usize| {
+                        self.metal
+                            .buffer(floats.max(1) * 4)
+                            .map_err(|e| e.to_string())
+                    };
+                    let mut grown = CacheCopy {
+                        kv: buffer(capacity * row)?,
+                        rope: buffer(capacity * rope_row)?,
+                        len: 0,
+                        capacity,
+                    };
+                    if let Some(old) = old {
+                        let keep = old.len.min(job.cached);
+                        grown.kv.as_f32_mut()[..keep * row]
+                            .copy_from_slice(&old.kv.as_f32()[..keep * row]);
+                        grown.rope.as_f32_mut()[..keep * rope_row]
+                            .copy_from_slice(&old.rope.as_f32()[..keep * rope_row]);
+                        grown.len = keep;
+                    }
+                    Ok(grown)
+                }
+            }
+        }
+
+        /// Attention on the GPU against the session's cache copy, brought up to date with
+        /// the rows it lacks. On success the copy goes back into the session.
+        fn attend(&self, job: &mut AttentionJob<'_>) -> Result<(), String> {
+            let start = Instant::now();
+            let row = job.heads * (job.qn + job.vh);
+            let rows = job.cached + job.t;
+            let mut copy = self.cache_copy(job, rows, (row, job.qr))?;
+            // Rows before `cached` that the copy lacks, then this call's new rows.
+            let from = copy.len.min(job.cached);
+            copy.kv.as_f32_mut()[from * row..rows * row]
+                .copy_from_slice(&job.kv[from * row..rows * row]);
+            copy.rope.as_f32_mut()[from * job.qr..rows * job.qr]
+                .copy_from_slice(&job.rope[from * job.qr..rows * job.qr]);
+            copy.len = rows;
+
+            let (q_len, out_len) = (job.q.len() * 4, job.out.len() * 4);
+            let mut staging = self.take_staging(q_len, out_len)?;
+            staging[X].as_f32_mut()[..job.q.len()].copy_from_slice(job.q);
+            let (kv_len, rope_len) = (rows * row * 4, rows * job.qr * 4);
+            staging.push(copy.kv);
+            staging.push(copy.rope);
+            let mut batch = self
+                .metal
+                .batch(staging, Dispatch::Serial)
+                .map_err(|e| e.to_string())?;
+            batch
+                .attention_split_key(
+                    Slice::new(X, 0, q_len),
+                    Slice::new(2, 0, kv_len),
+                    Slice::new(3, 0, rope_len),
+                    Slice::new(Y, 0, out_len),
+                    AttentionShape {
+                        t: job.t,
+                        cached: job.cached,
+                        heads: job.heads,
+                        qa: job.qn,
+                        qb: job.qr,
+                        dv: job.vh,
+                        scale: job.scale,
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            let done = self.submit(batch)?;
+            let mut buffers = done.buffers;
+            let (rope, kv) = (
+                buffers.pop().ok_or("rope buffer missing")?,
+                buffers.pop().ok_or("kv buffer missing")?,
+            );
+            let gpu_time = done.gpu_time.map_err(|e| e.to_string())?;
+            job.out
+                .copy_from_slice(&buffers[Y].as_f32()[..job.out.len()]);
+            *self.staging.borrow_mut() = Some(buffers);
+            job.device.0 = Some(Box::new(CacheCopy {
+                kv,
+                rope,
+                len: copy.len,
+                capacity: copy.capacity,
+            }));
+            self.update(|s| {
+                s.attention += 1;
+                s.attention_gpu_s += gpu_time.as_secs_f64();
+                s.attention_wall_s += start.elapsed().as_secs_f64();
+            });
+            Ok(())
         }
 
         /// Commits `batch` and runs this device's proactor until its completion arrives.
@@ -565,6 +710,20 @@ mod gpu {
 
         fn share_bytes(&self, bytes: &[u8]) -> Option<Shared> {
             self.share(self.metal.resident(bytes))
+        }
+
+        fn attention(&self, job: &mut AttentionJob<'_>) -> bool {
+            match self.attend(job) {
+                Ok(()) => true,
+                Err(error) => {
+                    // The caller computes it on the CPU and drops any cache copy.
+                    self.update(|s| s.attention_failed += 1);
+                    if self.stats.get().attention_failed <= 3 {
+                        eprintln!("gpu: attention computed on the CPU instead: {error}");
+                    }
+                    false
+                }
+            }
         }
     }
 }

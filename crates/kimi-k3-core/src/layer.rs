@@ -109,6 +109,51 @@ pub trait DenseAccel {
     fn share_bytes(&self, bytes: &[u8]) -> Option<Shared> {
         None
     }
+
+    /// Causal attention over an expanded multi-head latent attention cache (see
+    /// [`AttentionJob`]). Returns false, with `out` unspecified, to decline; the caller
+    /// then computes it on the CPU and empties `job.device`.
+    #[allow(unused_variables)]
+    fn attention(&self, job: &mut AttentionJob<'_>) -> bool {
+        false
+    }
+}
+
+/// What an accelerator keeps beside one layer's attention cache, for example a copy of
+/// it in GPU memory. The session owns it. Cloning a session leaves it empty, so copies
+/// never share it, and the session empties it whenever the cache changes without the
+/// accelerator (a reset, or attention computed on the CPU). While it is set, positions
+/// before `cached` are the ones the accelerator was last given.
+#[derive(Default)]
+pub struct DeviceCache(pub Option<Box<dyn std::any::Any + Send>>);
+
+impl Clone for DeviceCache {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+/// For each of `t` new positions `i` and head `h`, a softmax over cache positions
+/// `0..=cached + i` of `scale * (q[i][h][..qn] . kv[s][h][..qn] + q[i][h][qn..] . rope[s])`,
+/// weighting the values `kv[s][h][qn..qn + vh]`.
+pub struct AttentionJob<'a> {
+    /// `[t][heads][qn + qr]`.
+    pub q: &'a [f32],
+    /// `[cached + t][heads][qn + vh]`: per-head keys then values; rows from `cached` on
+    /// are new in this call.
+    pub kv: &'a [f32],
+    /// `[cached + t][qr]`: the rotary key part shared by every head.
+    pub rope: &'a [f32],
+    /// `[t][heads][vh]`.
+    pub out: &'a mut [f32],
+    pub t: usize,
+    pub cached: usize,
+    pub heads: usize,
+    pub qn: usize,
+    pub qr: usize,
+    pub vh: usize,
+    pub scale: f32,
+    pub device: &'a mut DeviceCache,
 }
 
 /// `None` computes every product on the CPU reference kernels.

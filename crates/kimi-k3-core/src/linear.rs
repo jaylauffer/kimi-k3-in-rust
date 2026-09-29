@@ -44,7 +44,10 @@ use serde_json::Value;
 
 use crate::{
     io::ReadRequest,
-    layer::{Accel, DenseAccel, DenseJob, Matrix, Mxfp4Matrix, Shared, WeightRef},
+    layer::{
+        Accel, AttentionJob, DenseAccel, DenseJob, DeviceCache, Matrix, Mxfp4Matrix, Shared,
+        WeightRef,
+    },
     ops::{
         kda_step, l2norm_in_place, rmsnorm, rmsnorm_in_place, router, shortconv_in_place, sigmoid,
     },
@@ -728,8 +731,15 @@ pub struct LinearModel {
 
 #[derive(Clone)]
 enum State {
-    Kda { recurrent: Vec<f32>, conv: Vec<f32> },
-    Mla { kv: Vec<f32>, rope: Vec<f32> },
+    Kda {
+        recurrent: Vec<f32>,
+        conv: Vec<f32>,
+    },
+    Mla {
+        kv: Vec<f32>,
+        rope: Vec<f32>,
+        device: DeviceCache,
+    },
 }
 
 /// Incremental decoding state: every layer's attention memory and the tokens consumed.
@@ -756,9 +766,12 @@ impl LinearSession {
     /// Forgets every consumed token. MLA cache rows are written before they are read.
     pub fn reset(&mut self) {
         for state in &mut self.states {
-            if let State::Kda { recurrent, conv } = state {
-                recurrent.fill(0.0);
-                conv.fill(0.0);
+            match state {
+                State::Kda { recurrent, conv } => {
+                    recurrent.fill(0.0);
+                    conv.fill(0.0);
+                }
+                State::Mla { device, .. } => device.0 = None,
             }
         }
         self.ids.clear();
@@ -1051,6 +1064,7 @@ impl LinearModel {
                     State::Mla {
                         kv: Vec::new(),
                         rope: Vec::new(),
+                        device: DeviceCache::default(),
                     }
                 } else {
                     State::Kda {
@@ -1173,14 +1187,14 @@ impl LinearModel {
                 (Attn::Kda(w), State::Kda { recurrent, conv }) => {
                     kda(&mut tmp, &hin, w, c, t, recurrent, conv, accel);
                 }
-                (Attn::Mla(w), State::Mla { kv, rope }) => {
+                (Attn::Mla(w), State::Mla { kv, rope, device }) => {
                     let rows = cached + t;
                     let kvd = c.qk_nope_head_dim + c.v_head_dim;
                     if kv.len() < rows * c.num_attention_heads * kvd {
                         kv.resize(rows * c.num_attention_heads * kvd, 0.0);
                         rope.resize(rows * c.qk_rope_head_dim, 0.0);
                     }
-                    mla(&mut tmp, &hin, w, c, t, kv, rope, cached, accel);
+                    mla(&mut tmp, &hin, w, c, t, (kv, rope, device), cached, accel);
                 }
                 _ => unreachable!("session states follow the layer map"),
             }
@@ -1365,8 +1379,7 @@ fn mla(
     w: &Mla,
     c: &LinearConfig,
     t: usize,
-    kv: &mut [f32],
-    rope: &mut [f32],
+    (kv, rope, device): (&mut [f32], &mut [f32], &mut DeviceCache),
     cached: usize,
     accel: Accel<'_>,
 ) {
@@ -1411,6 +1424,56 @@ fn mla(
     );
 
     let mut acc = vec![0.0_f32; t * heads * vh];
+    let rows = cached + t;
+    let on_device = accel.is_some_and(|device_accel| {
+        device_accel.attention(&mut AttentionJob {
+            q: &q,
+            kv: &kv[..rows * heads * kvd],
+            rope: &rope[..rows * qr],
+            out: &mut acc,
+            t,
+            cached,
+            heads,
+            qn,
+            qr,
+            vh,
+            scale,
+            device,
+        })
+    });
+    if !on_device {
+        // The cache changes below without the accelerator: its copy is out of date.
+        device.0 = None;
+        acc.fill(0.0);
+        cpu_attention(&mut acc, &q, kv, rope, c, t, cached);
+    }
+    products(
+        accel,
+        &mut [Mul {
+            x: &acc,
+            rows: t,
+            parts: vec![(&w.o, out)],
+        }],
+    );
+}
+
+/// The reference attention: scores and normalizer accumulated in `f64`.
+fn cpu_attention(
+    acc: &mut [f32],
+    q: &[f32],
+    kv: &[f32],
+    rope: &[f32],
+    c: &LinearConfig,
+    t: usize,
+    cached: usize,
+) {
+    let heads = c.num_attention_heads;
+    let qn = c.qk_nope_head_dim;
+    let qr = c.qk_rope_head_dim;
+    let vh = c.v_head_dim;
+    let qh = qn + qr;
+    let kvd = qn + vh;
+    let scale = 1.0_f32 / (qh as f32).sqrt();
     let mut sc = vec![0.0_f32; cached + t];
     for step in 0..t {
         let pos = cached + step;
@@ -1445,14 +1508,6 @@ fn mla(
             }
         }
     }
-    products(
-        accel,
-        &mut [Mul {
-            x: &acc,
-            rows: t,
-            parts: vec![(&w.o, out)],
-        }],
-    );
 }
 
 /// `down(SiLU(gate x) * up x)` for `t` rows.
