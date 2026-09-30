@@ -30,9 +30,10 @@ const HELP: &str = "Type a message and press Enter. Commands:
   /quit       exit (or Ctrl-D); Ctrl-C pauses a turn, and at the prompt quits
 One line per message. Chats are saved to ~/.loadngo/kimi/transcripts (--no-transcript
 turns that off); --resume latest picks the last one up. Kimi Linear can read local files and the
-signed CAS snapshot, and create/edit claimed workspace .rs, .md and .txt files (--no-tools
+signed CAS snapshot, and create/edit workspace UTF-8 text files (--no-tools
 disables these).
 File edits and terminal command side effects survive /undo and /reset.
+Only workspace-root AGENTS.md and CLAUDE.md are protected; repository copies are editable.
 Terminal tools run commands, read output, send stdin and stop sessions (no PTY).
 Kimi can also search and read public web pages (--no-web turns those tools off;
 terminal commands can still use the network).
@@ -446,8 +447,9 @@ everything else from your own knowledge. Before changing files, read applicable 
 and COLLABORATION.md and the board. Claim exact repo-relative paths via board_add_row \
 (Active claims, exact repo name, comma-separated paths, status in progress). text_read returns \
 a revision; text_edit uses that revision and one unique old_text/new_text replacement. \
-text_write creates a new file. Only .rs, .md and .txt files in a workspace Git repository \
-can be written. Paths start at the workspace. Never adopt another agent's \
+text_write creates a new UTF-8 text file anywhere in the workspace, including its root, \
+without requiring Git. Only workspace-root AGENTS.md and CLAUDE.md are protected; \
+repository-local instruction files are editable. Paths start at the workspace. Never adopt another agent's \
 dirty files. terminal_exec starts a shell command and returns a session id; terminal_read \
 reads output/status, terminal_write sends stdin or closes it, and terminal_stop cancels. \
 Use these to inspect repositories and run builds/tests. Read command exit status before \
@@ -456,7 +458,9 @@ including filesystem writes and network access: follow Jay's scope and shared-wo
 Never push, publish, delete user data, or alter another agent's work without Jay's authorization. \
 Prefer text_edit for claimed source changes. File edits and command side effects survive \
 /undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
-successful edit you may read the updated file again. When a search finds nothing, say so plainly.";
+successful edit you may read the updated file again. A failed edit did not change the file: \
+read its error, correct its path, revision or exact text, and retry only after fixing the cause. \
+Never repeat an unchanged failing write. When a search finds nothing, say so plainly.";
 
 /// Limits on the work one user message leads to: every reply and tool round, until Kimi
 /// answers without calling a tool. Checked after each reply, before its tool calls run, so
@@ -855,6 +859,7 @@ pub fn run_with(
         let mut turn_tokens = 0;
         let mut rounds = 0;
         let mut earlier_calls = Vec::new();
+        let mut failed_writes = Vec::new();
         let mut repeated_rounds = 0;
         let stop: Option<String> = loop {
             let mut calls = if let Some(calls) = run_held.take() {
@@ -980,6 +985,7 @@ pub fn run_with(
                 held = Some(calls);
                 break Some(spent);
             }
+            let mut write_failure_limit = false;
             while !calls.remaining.is_empty() && !cancel.load(Ordering::Relaxed) {
                 let (id, arguments) = calls.remaining.remove(0);
                 let name = tool_name(&id).to_string();
@@ -997,8 +1003,11 @@ pub fn run_with(
                     calls.done.push((id, name, REPEATED_CALL.to_string()));
                     continue;
                 }
-                let text = match tools.call(&name, &arguments) {
+                let (text, succeeded) = match tools.call(&name, &arguments) {
                     Ok(text) => {
+                        if matches!(name.as_str(), "text_write" | "text_edit") {
+                            failed_writes.clear();
+                        }
                         if matches!(
                             name.as_str(),
                             "text_write"
@@ -1023,9 +1032,23 @@ pub fn run_with(
                             });
                             repeated_rounds = 0;
                         }
-                        text
+                        if name == "board_add_row" {
+                            earlier_calls.retain(|(tool, _)| {
+                                !matches!(tool.as_str(), "board_read" | "board_sections")
+                            });
+                            repeated_rounds = 0;
+                        }
+                        (text, true)
                     }
-                    Err(error) => format!("error: {error}"),
+                    Err(error) => {
+                        if matches!(name.as_str(), "text_write" | "text_edit") {
+                            let failure = (key.clone(), error.clone());
+                            write_failure_limit |= failed_writes.contains(&failure);
+                            failed_writes.push(failure);
+                            write_failure_limit |= failed_writes.len() >= 3;
+                        }
+                        (format!("error: {error}"), false)
+                    }
                 };
                 writeln!(output, "[tool result {name}: {} bytes]", text.len())
                     .map_err(|e| e.to_string())?;
@@ -1033,9 +1056,16 @@ pub fn run_with(
                     transcript.tool_result(&name, &text);
                 }
                 calls.done.push((id, name, text));
-                earlier_calls.push(key);
+                // Failed calls may succeed after their prerequisites change. Cache
+                // successful mutations only, so an edit is never replayed.
+                if succeeded {
+                    earlier_calls.push(key);
+                }
+                if write_failure_limit {
+                    break;
+                }
             }
-            if !calls.remaining.is_empty() {
+            if !calls.remaining.is_empty() && !write_failure_limit {
                 writeln!(
                     output,
                     "[paused by Ctrl-C: {} tool call(s) not run. /continue runs them; a new \
@@ -1047,6 +1077,18 @@ pub fn run_with(
                 break Some("interrupted".into());
             }
             // Fit the results into what is left of the context, keeping room to answer.
+            if write_failure_limit {
+                for (id, _) in calls.remaining.drain(..) {
+                    let name = tool_name(&id).to_string();
+                    calls.done.push((id, name, NOT_RUN.to_string()));
+                }
+                // Hold results before opening a reply: /continue and a corrective
+                // user message can both consume them without an unfinished reply.
+                held = Some(calls);
+                writeln!(output, "[paused: repeated write failure or three failed writes. Fix the reported cause before /continue, or send a new instruction.]")
+                    .map_err(|e| e.to_string())?;
+                break Some("write failure limit".into());
+            }
             let mut results = calls.done;
             let mut prompt = format.tool_results(tokenizer, &results);
             let room = max_context.saturating_sub(session.tokens().len() + max_tokens.min(512));
@@ -1245,6 +1287,125 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One scripted regression checks recovery and pause.
+    fn failed_writes_can_recover_but_repeated_failures_pause() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+        struct WriteTool {
+            name: &'static str,
+            ready: Rc<Cell<bool>>,
+            writes: Rc<Cell<usize>>,
+        }
+        impl loadngo_inference::tools::Tool for WriteTool {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            fn description(&self) -> &'static str {
+                "test"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                json!({"type":"object"})
+            }
+            fn call(&self, _: &serde_json::Value) -> Result<String, String> {
+                if self.name == "repair" {
+                    self.ready.set(true);
+                    return Ok("fixed".into());
+                }
+                self.writes.set(self.writes.get() + 1);
+                if self.ready.get() {
+                    Ok("wrote".into())
+                } else {
+                    Err("fix prerequisite first".into())
+                }
+            }
+        }
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        for (recover, new_instruction) in [(false, false), (false, true), (true, false)] {
+            let ready = Rc::new(Cell::new(false));
+            let writes = Rc::new(Cell::new(0));
+            let mut tools = Toolbox::default();
+            for name in ["text_write", "repair"] {
+                tools.push(Box::new(WriteTool {
+                    name,
+                    ready: ready.clone(),
+                    writes: writes.clone(),
+                }));
+            }
+            let names = if recover {
+                vec!["text_write", "repair", "text_write"]
+            } else {
+                vec!["text_write", "text_write"]
+            };
+            let mut ids = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                ids.extend([t.section_begin, t.call_begin]);
+                ordinary(&mut ids, &tokenizer, &format!("functions.{name}:{i}"));
+                ids.push(t.argument_begin);
+                ordinary(&mut ids, &tokenizer, "{}");
+                ids.extend([t.call_end, t.section_end, t.end]);
+            }
+            ordinary(&mut ids, &tokenizer, "Done.");
+            ids.push(t.end);
+            let mut replies = ids.into_iter();
+            let contexts = RefCell::new(Vec::new());
+            let mut output = Vec::new();
+            run_with(
+                &format,
+                Some(&tools),
+                &tokenizer,
+                32_768,
+                200,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                if recover {
+                    &b"Write\n/quit\n"[..]
+                } else if new_instruction {
+                    &b"Write\n/stats\nUse a different path\n/quit\n"[..]
+                } else {
+                    &b"Write\n/stats\n/continue\n/quit\n"[..]
+                },
+                &mut output,
+                |ids| {
+                    contexts.borrow_mut().push(tokenizer.decode_lossy(ids));
+                    Ok(replies.next().expect("scripted reply"))
+                },
+                ChatOptions::default(),
+            )
+            .unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(writes.get(), 2);
+            assert!(!output.contains("tool call repeated"));
+            assert_eq!(output.contains("[paused: repeated write failure"), !recover);
+            assert!(output.contains("Done."));
+            if !recover {
+                assert!(output.contains("unfinished reply: false"));
+                assert!(
+                    contexts
+                        .borrow()
+                        .last()
+                        .unwrap()
+                        .matches("fix prerequisite first")
+                        .count()
+                        >= 2
+                );
+                if new_instruction {
+                    assert!(
+                        contexts
+                            .borrow()
+                            .last()
+                            .unwrap()
+                            .contains("Use a different path")
+                    );
+                }
+            }
+        }
     }
 
     #[test]

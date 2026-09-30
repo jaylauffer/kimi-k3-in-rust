@@ -37,7 +37,7 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
 }
 
-/// Local reads, claimed .rs/.md/.txt edits, and read-only Archive CAS access for chat.
+/// Local reads, workspace text edits, and read-only Archive CAS access for chat.
 fn toolbox(args: &Args) -> Toolbox {
     let mut tools = Toolbox::default();
     if args.no_tools {
@@ -67,7 +67,7 @@ fn toolbox(args: &Args) -> Toolbox {
     match crate::text_tools::tools(&base) {
         Ok(editors) => {
             eprintln!(
-                "File editing: claimed .rs, .md and .txt files under {} (text_read, text_write, text_edit)",
+                "File editing: workspace UTF-8 text under {}; root AGENTS.md/CLAUDE.md protected (text_read, text_write, text_edit)",
                 base.display()
             );
             for tool in editors {

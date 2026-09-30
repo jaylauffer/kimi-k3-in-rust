@@ -61,6 +61,13 @@ same read-only call made twice in a row ends the turn. Context is the other real
 bound: `--max-context` (32768 for Kimi Linear) holds every tool result, and a turn
 that fills it has to be undone or reset.
 
+Since 2026-10-01, failed writes can be retried after fixing the reported cause;
+they are not treated as successful duplicate mutations. The same write failing
+with the same error twice, or three write failures without a successful text
+mutation, pauses the turn. Results and calls marked not run are held with the
+saved chat. `/continue` gives the model another chance after the cause is
+fixed; a new instruction, `/undo`, and `/reset` remain available.
+
 ### Saved chats and resume
 
 Every chat is saved in `~/.loadngo/kimi/transcripts/` unless `--no-transcript` is

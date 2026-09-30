@@ -368,7 +368,7 @@ fn print_usage() {
          (generation stops at a safe layer/output boundary, a running terminal command is\n\
          stopped, and tool calls not yet run wait for /continue). At the prompt, Ctrl-C or\n\
          Ctrl-D exits; --resume latest carries the saved chat on.\n\
-         \x20 --fs-base DIR        optional: workspace for reads and claimed file edits\n\
+         \x20 --fs-base DIR        optional: workspace for reads and text edits (root AGENTS.md/CLAUDE.md protected)\n\
          \x20                      with relative paths starting here (default: current dir)\n\
          \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
          \x20                      on attached drives (cas_archives lists every archive)\n\

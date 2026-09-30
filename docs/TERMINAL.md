@@ -4,7 +4,19 @@ Kimi Linear chat on macOS and Linux exposes `terminal_exec`, `terminal_read`,
 `terminal_write`, and `terminal_stop` by default. `--no-tools` disables them with other tools.
 Restart through `../launch-kimi-k3.sh` to rebuild and use them.
 
-`terminal_exec` runs `/bin/sh -c` on Unix. Windows terminal tools are unavailable
+`terminal_exec` runs `/bin/sh -c` on Unix. On macOS it is launched through
+`/usr/bin/sandbox-exec`, with a narrow profile that denies writes, deletion and
+replacement of workspace-root `AGENTS.md` and `CLAUDE.md`. Reads are allowed;
+repository-local instruction files and other workspace files remain writable.
+The profile also prevents renaming workspace ancestors to change the protected
+paths. Child processes inherit it. A pre-existing hard-link alias of either
+protected file causes command launch to fail rather than leave a write bypass.
+If sandbox initialization fails, the command fails; no unprotected fallback runs.
+
+Linux terminal tools are unavailable when the workspace contains either protected
+root instruction file, pending equivalent OS protection. Text tools still work.
+Linux terminal sessions in workspaces without these files retain their existing
+lifecycle. Windows terminal tools are unavailable
 until process-tree ownership and pipe shutdown have a supported implementation;
 the rest of the CLI remains available there.
 Its `cwd` defaults to the workspace (`--fs-base`); relative and absolute
@@ -45,8 +57,9 @@ rerun after completion. Terminal activity invalidates cached file-read results.
 Each turn is bounded by its time and token budget, not a round count; see
 [CHAT.md](CHAT.md#turns-budgets-and-pauses-since-2026-09-30).
 
-Commands inherit Kimi's OS permissions and environment. The working
-directory is not a sandbox: commands can write files and access the network.
+Commands inherit Kimi's OS permissions and environment, subject to the two-file
+macOS protection. This is not a general filesystem or network sandbox: commands
+can write other files and access the network.
 `--no-web` disables dedicated web tools, not shell networking. Existing
 AGENTS.md, collaboration claims, preservation of other agents' changes,
 and Jay's authorization requirements for pushes/destructive work still

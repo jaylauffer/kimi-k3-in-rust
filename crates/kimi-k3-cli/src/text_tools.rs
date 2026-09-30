@@ -1,4 +1,4 @@
-//! Workspace-scoped editing of Rust, Markdown and plain-text files, with board claims,
+//! Workspace-scoped editing of UTF-8 text files, with peer-claim protection,
 //! revision checks and atomic writes.
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -15,14 +15,6 @@ use serde_json::{Value, json};
 const MAX_FILE: usize = 1024 * 1024;
 const MAX_CHANGE: usize = 64 * 1024;
 const MAX_WRITTEN: usize = 128;
-/// File types Kimi may create and edit: Rust source, Markdown and plain text.
-const EDITABLE: [&str; 3] = ["rs", "md", "txt"];
-
-fn editable(path: &Path) -> bool {
-    path.extension()
-        .is_some_and(|ext| EDITABLE.iter().any(|e| ext.eq_ignore_ascii_case(e)))
-}
-
 struct Workspace {
     root: PathBuf,
     written: RefCell<HashMap<PathBuf, CasHash>>,
@@ -77,9 +69,6 @@ fn valid_change(text: &str) -> Result<(), String> {
 impl Workspace {
     fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let relative = Path::new(path);
-        if !editable(relative) {
-            return Err("only .rs, .md and .txt files may be edited".into());
-        }
         let mut real = self.root.clone();
         let parts: Vec<_> = relative.components().collect();
         if parts.is_empty() {
@@ -113,52 +102,59 @@ impl Workspace {
     }
 
     fn authorize(&self, path: &Path, previous: Option<CasHash>) -> Result<(), String> {
+        let workspace_path = path.strip_prefix(&self.root).map_err(err)?;
+        let name = workspace_path.to_string_lossy().replace('\\', "/");
+        if ["AGENTS.md", "CLAUDE.md"]
+            .iter()
+            .any(|protected| name.eq_ignore_ascii_case(protected))
+        {
+            return Err("workspace-root AGENTS.md and CLAUDE.md are protected; repository-local instruction files are editable".into());
+        }
+        let (scope, claim_path) = name.split_once('/').unwrap_or((
+            self.root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("pudding"),
+            &name,
+        ));
+        let board_path = self.root.join("AGENT-BOARD.md");
+        if board_path.exists() {
+            check_conflicts(&read_board(&board_path)?, scope, claim_path)?;
+        }
         let parent = path.parent().ok_or("missing parent")?;
-        let output = Command::new("git")
-            .args(["-C"])
-            .arg(parent)
-            .args(["rev-parse", "--show-toplevel"])
-            .output()
-            .map_err(err)?;
-        if !output.status.success() {
-            return Err("writes require a Git repository inside the workspace".into());
-        }
-        let repo = PathBuf::from(String::from_utf8(output.stdout).map_err(err)?.trim())
-            .canonicalize()
-            .map_err(err)?;
-        let repo_name = repo.strip_prefix(&self.root).map_err(err)?;
-        if repo_name.components().count() != 1 {
-            return Err("use an immediate workspace Git repository".into());
-        }
-        let relative = path.strip_prefix(&repo).map_err(err)?;
-        let relative_text = relative.to_string_lossy().replace('\\', "/");
-        let board = read_board(&self.root.join("AGENT-BOARD.md"))?;
-        check_claims(&board, &repo_name.to_string_lossy(), &relative_text)?;
-        let ignored = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["check-ignore", "--quiet", "--no-index", "--"])
-            .arg(relative)
-            .status()
-            .map_err(err)?;
-        if ignored.code() != Some(1) {
-            return Err("ignored files cannot be edited (or Git ignore check failed)".into());
-        }
-        let owned = previous.is_some_and(|hash| self.written.borrow().get(path) == Some(&hash));
-        if !owned {
-            let status = Command::new("git")
-                .env("GIT_OPTIONAL_LOCKS", "0")
-                .arg("--literal-pathspecs")
+        let repo = parent
+            .ancestors()
+            .take_while(|p| p.starts_with(&self.root))
+            .find(|p| p.join(".git").exists());
+        if let Some(repo) = repo {
+            let relative = path.strip_prefix(repo).map_err(err)?;
+            let ignored = Command::new("git")
                 .arg("-C")
-                .arg(&repo)
-                .args(["status", "--porcelain=v1", "--untracked-files=all", "--"])
+                .arg(repo)
+                .args(["check-ignore", "--quiet", "--no-index", "--"])
                 .arg(relative)
-                .output()
+                .status()
                 .map_err(err)?;
-            if !status.status.success() || !status.stdout.is_empty() {
-                return Err(
-                    "file has pre-existing Git changes; do not adopt another agent's work".into(),
-                );
+            if ignored.code() != Some(1) {
+                return Err("ignored files cannot be edited (or Git ignore check failed)".into());
+            }
+            let owned = previous.is_some_and(|hash| self.written.borrow().get(path) == Some(&hash));
+            if !owned {
+                let status = Command::new("git")
+                    .env("GIT_OPTIONAL_LOCKS", "0")
+                    .arg("--literal-pathspecs")
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["status", "--porcelain=v1", "--untracked-files=all", "--"])
+                    .arg(relative)
+                    .output()
+                    .map_err(err)?;
+                if !status.status.success() || !status.stdout.is_empty() {
+                    return Err(
+                        "file has pre-existing Git changes; do not adopt another agent's work"
+                            .into(),
+                    );
+                }
             }
         }
         if self.written.borrow().len() >= MAX_WRITTEN && !self.written.borrow().contains_key(path) {
@@ -216,8 +212,9 @@ fn read_board(path: &Path) -> Result<String, String> {
     Ok(text)
 }
 
-/// Explicit Kimi claims only. Unparseable peer scope is conservatively repo-wide.
-fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
+/// Unparseable peer scope is conservatively repo-wide. Kimi's own claim text
+/// never blocks an authorized write; ownership is still checked against peers.
+fn check_conflicts(board: &str, repo: &str, path: &str) -> Result<(), String> {
     let active = board
         .split("## Active claims")
         .nth(1)
@@ -225,7 +222,6 @@ fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
         .split("\n## ")
         .next()
         .unwrap_or_default();
-    let mut claimed = false;
     for line in active.lines().filter(|line| line.starts_with('|')) {
         let escaped = line.replace("\\|", "\u{1f}");
         let cells: Vec<_> = escaped
@@ -233,13 +229,15 @@ fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
             .split('|')
             .map(str::trim)
             .collect();
-        if cells.len() < 3 || cells[1] == "Agent" || cells[1].starts_with('-') {
+        if cells.len() < 3 || cells[1] == "Kimi" || cells[1] == "Agent" || cells[1].starts_with('-')
+        {
             continue;
         }
         let scope = cells[2].replace('`', "");
-        if !scope
-            .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
-            .any(|s| s == repo)
+        if scope != repo
+            && !scope
+                .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+                .any(|s| s == repo)
         {
             continue;
         }
@@ -259,38 +257,23 @@ fn check_claims(board: &str, repo: &str, path: &str) -> Result<(), String> {
             .split(',')
             .map(|p| p.trim().trim_matches('`'))
             .collect();
-        if cells[1] == "Kimi" {
-            if scope == repo
-                && matches!(status.as_str(), "active" | "in progress")
-                && paths.contains(&path)
-            {
-                claimed = true;
-            }
-        } else {
-            let explicit = paths.iter().all(|p| {
-                !p.is_empty()
-                    && !p.contains(char::is_whitespace)
-                    && (Path::new(p).extension().is_some() || p.ends_with('/'))
-            });
-            if !explicit
-                || paths
-                    .iter()
-                    .any(|p| *p == path || (p.ends_with('/') && path.starts_with(p)))
-            {
-                return Err(format!(
-                    "overlapping or ambiguous active claim by {}; resolve it on the board first",
-                    cells[1]
-                ));
-            }
+        let explicit = paths.iter().all(|p| {
+            !p.is_empty()
+                && !p.contains(char::is_whitespace)
+                && (Path::new(p).extension().is_some() || p.ends_with('/'))
+        });
+        if !explicit
+            || paths
+                .iter()
+                .any(|p| *p == path || (p.ends_with('/') && path.starts_with(p)))
+        {
+            return Err(format!(
+                "overlapping or ambiguous active claim by {}; resolve it on the board first",
+                cells[1]
+            ));
         }
     }
-    if claimed {
-        Ok(())
-    } else {
-        Err(format!(
-            "claim {repo} / {path} first: board_add_row Active claims, exact repo and comma-separated paths, status in progress"
-        ))
-    }
+    Ok(())
 }
 
 struct TextRead(Rc<Workspace>);
@@ -302,7 +285,7 @@ impl Tool for TextRead {
         "text_read"
     }
     fn description(&self) -> &'static str {
-        "Read a workspace .rs, .md or .txt file and its revision before editing. Numbered text, at most 16 KiB."
+        "Read a workspace UTF-8 text file and its revision before editing. Numbered text, at most 16 KiB."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"line_start":{"type":"integer"},"line_count":{"type":"integer"}},"required":["path"]})
@@ -331,7 +314,7 @@ impl Tool for TextWrite {
         "text_write"
     }
     fn description(&self) -> &'static str {
-        "Create a new .rs, .md or .txt file in an existing workspace directory. Requires an exact active Kimi board claim. Never overwrites."
+        "Create a new UTF-8 text file anywhere in the workspace, including its root. Never overwrites. Only root AGENTS.md and CLAUDE.md are protected; respect peer claims."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
@@ -348,7 +331,7 @@ impl Tool for TextEdit {
         "text_edit"
     }
     fn description(&self) -> &'static str {
-        "Replace one unique exact string in a claimed .rs, .md or .txt file. Supply revision from text_read, old_text and new_text. Refuses stale or pre-existing dirty files."
+        "Edit a workspace UTF-8 text file, including root files. Supply revision from text_read and one exact old_text/new_text replacement. Root AGENTS.md/CLAUDE.md protected; refuses stale reads, peer conflicts and pre-existing Git changes."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"revision":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","revision","old_text","new_text"]})
@@ -443,6 +426,107 @@ mod tests {
     }
 
     #[test]
+    fn root_and_non_git_text_files_are_writable_without_claims() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("notes")).unwrap();
+        let mut toolbox = Toolbox::default();
+        for tool in tools(root.path()).unwrap() {
+            toolbox.push(tool);
+        }
+        for path in ["plan.md", "notes/config.toml", "notes/extensionless"] {
+            toolbox
+                .call(
+                    "text_write",
+                    &json!({"path":path,"content":"before\n"}).to_string(),
+                )
+                .unwrap();
+            toolbox.call("text_edit", &json!({"path":path,"revision":CasHash::digest(b"before\n").to_hex(),"old_text":"before","new_text":"after"}).to_string()).unwrap();
+            assert_eq!(
+                fs::read_to_string(root.path().join(path)).unwrap(),
+                "after\n"
+            );
+        }
+        // An existing root file is editable after reading its current revision.
+        fs::write(root.path().join("existing.md"), "old\n").unwrap();
+        toolbox.call("text_edit", &json!({"path":"existing.md","revision":CasHash::digest(b"old\n").to_hex(),"old_text":"old","new_text":"new"}).to_string()).unwrap();
+        assert!(toolbox.call("text_edit", &json!({"path":"existing.md","revision":CasHash::digest(b"old\n").to_hex(),"old_text":"new","new_text":"stale"}).to_string()).is_err());
+        assert_eq!(
+            fs::read_to_string(root.path().join("existing.md")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn only_root_instruction_files_are_protected_and_remain_readable() {
+        let (root, toolbox) = fixture();
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            fs::write(root.path().join(name), "keep\n").unwrap();
+            assert!(
+                toolbox
+                    .call("text_read", &json!({"path":name}).to_string())
+                    .is_ok()
+            );
+            for path in [name.to_string(), name.to_lowercase()] {
+                assert!(
+                    toolbox
+                        .call(
+                            "text_write",
+                            &json!({"path":path,"content":"overwrite"}).to_string()
+                        )
+                        .unwrap_err()
+                        .contains("protected")
+                );
+            }
+            assert!(toolbox.call("text_edit", &json!({"path":name,"revision":CasHash::digest(b"keep\n").to_hex(),"old_text":"keep","new_text":"changed"}).to_string()).unwrap_err().contains("protected"));
+            let local = format!("demo/{name}");
+            toolbox
+                .call(
+                    "text_write",
+                    &json!({"path":local,"content":"local\n"}).to_string(),
+                )
+                .unwrap();
+            toolbox.call("text_edit", &json!({"path":local,"revision":CasHash::digest(b"local\n").to_hex(),"old_text":"local","new_text":"editable"}).to_string()).unwrap();
+            assert_eq!(
+                fs::read_to_string(root.path().join(name)).unwrap(),
+                "keep\n"
+            );
+            assert_eq!(
+                fs::read_to_string(root.path().join(local)).unwrap(),
+                "editable\n"
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_own_claim_does_not_block_a_write_but_root_peer_claim_does() {
+        let (root, toolbox) = fixture();
+        fs::write(
+            root.path().join("AGENT-BOARD.md"),
+            board(
+                "Kimi",
+                "README.md documentation update - correct mobile build status",
+            ),
+        )
+        .unwrap();
+        toolbox
+            .call(
+                "text_write",
+                r#"{"path":"demo/README.md","content":"hello"}"#,
+            )
+            .unwrap();
+        let scope = root.path().file_name().unwrap().to_str().unwrap();
+        let root_board = board("Claude", "plan.md").replace("| demo |", &format!("| {scope} |"));
+        fs::write(root.path().join("AGENT-BOARD.md"), root_board).unwrap();
+        assert!(
+            toolbox
+                .call("text_write", r#"{"path":"plan.md","content":"hello"}"#)
+                .unwrap_err()
+                .contains("claim")
+        );
+        assert!(!root.path().join("plan.md").exists());
+    }
+
+    #[test]
     fn clean_claimed_file_can_be_read_edited_and_edited_again() {
         let (root, toolbox) = fixture();
         let read = toolbox
@@ -533,9 +617,9 @@ mod tests {
             "## Handoffs",
             "| today | Claude | demo | docs/PLAN.md | task | in progress |\n## Handoffs",
         );
-        assert!(check_claims(&rows, "demo", "README.md").is_ok());
+        assert!(check_conflicts(&rows, "demo", "README.md").is_ok());
         assert!(
-            check_claims(
+            check_conflicts(
                 &rows.replace("docs/PLAN.md", "README.md"),
                 "demo",
                 "README.md"
@@ -563,7 +647,7 @@ mod tests {
     }
 
     #[test]
-    fn claims_are_required_and_rechecked_after_each_write() {
+    fn peer_claims_are_rechecked_after_each_write() {
         let (root, toolbox) = fixture();
         let path = root.path().join("AGENT-BOARD.md");
         fs::write(&path, board("Claude", "src/lib.rs")).unwrap();
@@ -576,14 +660,14 @@ mod tests {
         edit(&toolbox, ORIGINAL, "1", "2").unwrap();
         fs::write(&path, board("Claude", "src/lib.rs")).unwrap();
         assert!(edit(&toolbox, &ORIGINAL.replace('1', "2"), "2", "3").is_err());
-        assert!(check_claims(&board("Kimi", "src/"), "demo", "src/lib.rs").is_err());
+        assert!(check_conflicts(&board("Kimi", "src/"), "demo", "src/lib.rs").is_ok());
         let rows = board("Kimi", "src/lib.rs").replace(
             "## Handoffs",
             "| today | Claude | demo | as listed | task | in progress |\n## Handoffs",
         );
-        assert!(check_claims(&rows, "demo", "src/lib.rs").is_err());
+        assert!(check_conflicts(&rows, "demo", "src/lib.rs").is_err());
         let split = rows.replace("as listed", "src/other.rs");
-        assert!(check_claims(&split, "demo", "src/lib.rs").is_ok());
+        assert!(check_conflicts(&split, "demo", "src/lib.rs").is_ok());
     }
 
     #[test]
@@ -592,7 +676,6 @@ mod tests {
         for path in [
             "../outside.rs",
             "/tmp/outside.rs",
-            "demo/src/no.json",
             "demo/.git/hooks/x.rs",
             "demo/target/x.rs",
             "demo/missing/x.rs",

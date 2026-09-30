@@ -159,9 +159,22 @@ struct Terminal {
     output: SharedOutput,
 }
 
+/// Register bounded command sessions for a workspace.
+///
+/// # Errors
+/// If the workspace cannot be resolved, or root instruction-file protection is
+/// required on a platform without a supported command sandbox.
 pub fn tools(root: &Path) -> Result<Vec<Box<dyn Tool>>, String> {
+    let root = root.canonicalize().map_err(|e| e.to_string())?;
+    #[cfg(not(target_os = "macos"))]
+    if ["AGENTS.md", "CLAUDE.md"]
+        .iter()
+        .any(|name| root.join(name).exists())
+    {
+        return Err("terminal commands in this workspace need root instruction-file protection, currently implemented only on macOS".into());
+    }
     let terminal = Rc::new(Terminal {
-        root: root.canonicalize().map_err(|e| e.to_string())?,
+        root,
         session: RefCell::new(None),
         next: Cell::new(1),
         output: Arc::new((
@@ -239,7 +252,7 @@ impl Terminal {
         slot.take();
         let proactor = new_platform_proactor().map_err(|e| e.to_string())?;
         let handle = proactor.handle();
-        let mut cmd = shell(command);
+        let mut cmd = shell(&self.root, command)?;
         cmd.current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -366,11 +379,65 @@ impl Terminal {
     }
 }
 
-#[cfg(unix)]
-fn shell(command: &str) -> Command {
+#[cfg(target_os = "macos")]
+fn shell(root: &Path, command: &str) -> Result<Command, String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut protected = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = root.join(name);
+        protected.push(path.clone());
+        match std::fs::metadata(&path) {
+            Ok(meta) => {
+                if meta.nlink() != 1 {
+                    return Err(format!(
+                        "{} has hard-link aliases; cannot protect terminal writes",
+                        path.display()
+                    ));
+                }
+                let real = path.canonicalize().map_err(|e| e.to_string())?;
+                if real != path {
+                    protected.push(real);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    let literals = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .map(|p| {
+                format!(
+                    "(literal {})",
+                    serde_json::to_string(&p.to_string_lossy()).expect("path string")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    // Prevent moving the workspace or an ancestor to give protected files new paths.
+    let ancestors = root.ancestors().map(Path::to_path_buf).collect::<Vec<_>>();
+    let profile = format!(
+        "(version 1)(allow default)(deny file-write* {})(deny file-write-unlink {})",
+        literals(&protected),
+        literals(&ancestors)
+    );
+    let mut shell = Command::new("/usr/bin/sandbox-exec");
+    shell.args(["-p", &profile, "/bin/sh", "-c", command]);
+    Ok(shell)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn shell(root: &Path, command: &str) -> Result<Command, String> {
+    if ["AGENTS.md", "CLAUDE.md"]
+        .iter()
+        .any(|name| root.join(name).exists())
+    {
+        return Err("root instruction-file protection for terminal commands is currently implemented only on macOS".into());
+    }
     let mut shell = Command::new("/bin/sh");
     shell.args(["-c", command]);
-    shell
+    Ok(shell)
 }
 
 struct TerminalTool(Rc<Terminal>, &'static str);
@@ -379,6 +446,53 @@ struct TerminalTool(Rc<Terminal>, &'static str);
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "run explicitly outside a nested sandbox to initialize sandbox-exec"]
+    fn shell_protects_root_instructions_and_allows_repo_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            std::fs::write(root.join(name), "keep\n").unwrap();
+        }
+        std::fs::create_dir(root.join("repo")).unwrap();
+        for command in [
+            "printf changed > AGENTS.md",
+            "printf changed > agents.md",
+            "rm CLAUDE.md",
+            "mv AGENTS.md moved.md",
+            "printf replacement > replacement.md; mv replacement.md AGENTS.md",
+            "ln -s AGENTS.md alias.md; printf changed > alias.md",
+            "ln CLAUDE.md hard.md && printf changed > hard.md",
+        ] {
+            let output = shell(&root, command)
+                .unwrap()
+                .current_dir(&root)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{command}: {output:?}");
+            for name in ["AGENTS.md", "CLAUDE.md"] {
+                assert_eq!(std::fs::read_to_string(root.join(name)).unwrap(), "keep\n");
+            }
+        }
+        let output = shell(&root, "printf allowed > ordinary.md; printf local > repo/AGENTS.md; printf local > repo/CLAUDE.md")
+            .unwrap().current_dir(&root).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("ordinary.md")).unwrap(),
+            "allowed"
+        );
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            assert_eq!(
+                std::fs::read_to_string(root.join("repo").join(name)).unwrap(),
+                "local"
+            );
+        }
+        // Refuse a pre-existing hard-link alias instead of leaving a bypass open.
+        std::fs::hard_link(root.join("AGENTS.md"), root.join("preexisting.md")).unwrap();
+        assert!(shell(&root, "true").unwrap_err().contains("hard-link"));
+    }
 
     #[allow(clippy::needless_pass_by_value)] // Inline json! keeps tool sequences legible.
     fn call(tools: &[Box<dyn Tool>], name: &str, args: Value) -> Value {
