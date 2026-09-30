@@ -23,8 +23,11 @@ For example:
 {"section":"Active claims","cells":["sng-mahjong","src/sim/mod.rs","Add pressed tile state","in progress"]}
 ```
 
-Then `text_read` returns numbered text and a BLAKE3 `revision`. Pass that revision,
-an exact unique `old_text` and the replacement `new_text` to `text_edit`.
+Then `text_read` returns numbered text and a BLAKE3 `revision`. Pass an exact unique
+`old_text` and the replacement `new_text` to `text_edit`. `revision` is optional:
+without it the edit checks the revision `text_read` last showed for that path, or the
+one Kimi's own last write produced, so an unread or since-changed file is still
+refused. (Kimi read a file, got its revision, then sent the edit without it.)
 `text_write` takes `path` and `content` and refuses to overwrite existing files.
 Paths are relative to the workspace, e.g. `sng-mahjong/src/sim/mod.rs`.
 
@@ -40,10 +43,9 @@ Non-Git files use revisions and peer claims without requiring Git status.
 Parents must exist. Symlink paths, dot directories, build output and ignored files
 are rejected. Reads/files are limited to 1 MiB, edit/create payloads to 64 KiB.
 Reads return at most 16 KiB; use line windows. A stale revision or a missing/nonunique
-old string fails without changing the file. Each error names its fix: a missing
-revision points to `text_read` (Kimi had read with `fs_read`, which shows none, and
-repeated the edit until the write-failure limit), and an old string says whether it
-occurs zero times or several. Writes stage in a unique sibling
+old string fails without changing the file. Each error names its fix: an unread or
+changed file points to `text_read` (`fs_read` does not count), and an old string says
+whether it occurs zero times or several. Writes stage in a unique sibling
 temporary file and publish atomically; existing permissions are preserved.
 The path, claims, Git status and revision are rechecked immediately before publish.
 These checks coordinate cooperative agents; they are not an OS sandbox against

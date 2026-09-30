@@ -18,6 +18,9 @@ const MAX_WRITTEN: usize = 128;
 struct Workspace {
     root: PathBuf,
     written: RefCell<HashMap<PathBuf, CasHash>>,
+    /// The revision `text_read` last showed, or a write produced, for each path: what
+    /// `text_edit` checks when the call carries no `revision`.
+    seen: RefCell<HashMap<PathBuf, CasHash>>,
 }
 
 /// No writes occur during registration. The board is checked at each mutation.
@@ -26,6 +29,7 @@ pub fn tools(root: &Path) -> Result<Vec<Box<dyn Tool>>, String> {
     let workspace = Rc::new(Workspace {
         root,
         written: RefCell::default(),
+        seen: RefCell::default(),
     });
     Ok(vec![
         Box::new(TextRead(Rc::clone(&workspace))),
@@ -67,6 +71,15 @@ fn valid_change(text: &str) -> Result<(), String> {
 }
 
 impl Workspace {
+    fn remember(&self, path: PathBuf, revision: CasHash) {
+        let mut seen = self.seen.borrow_mut();
+        if seen.len() >= MAX_WRITTEN && !seen.contains_key(&path) {
+            // Forgetting only costs a text_read, which the error asks for.
+            seen.clear();
+        }
+        seen.insert(path, revision);
+    }
+
     fn resolve(&self, path: &str) -> Result<PathBuf, String> {
         let relative = Path::new(path);
         let mut real = self.root.clone();
@@ -191,7 +204,8 @@ impl Workspace {
             temp.persist_noclobber(&path).map_err(err)?;
         }
         let hash = CasHash::digest(content.as_bytes());
-        self.written.borrow_mut().insert(path, hash);
+        self.written.borrow_mut().insert(path.clone(), hash);
+        self.remember(path, hash);
         Ok(format!(
             "wrote {name}: {} bytes, revision {hash}; not compiled or tested",
             content.len()
@@ -292,7 +306,10 @@ impl Tool for TextRead {
     }
     fn call(&self, args: &Value) -> Result<String, String> {
         let name = string(args, "path")?;
-        let text = read(&self.0.resolve(name)?)?;
+        let path = self.0.resolve(name)?;
+        let text = read(&path)?;
+        let revision = CasHash::digest(text.as_bytes());
+        self.0.remember(path, revision);
         let number = |key, default| {
             args.get(key)
                 .and_then(Value::as_u64)
@@ -301,9 +318,8 @@ impl Tool for TextRead {
                 .clamp(1, MAX_FILE)
         };
         Ok(format!(
-            "{name}: {} bytes, revision {}\n{}",
+            "{name}: {} bytes, revision {revision}\n{}",
             text.len(),
-            CasHash::digest(text.as_bytes()),
             numbered_lines(&text, number("line_start", 1), number("line_count", 100))
         ))
     }
@@ -331,27 +347,37 @@ impl Tool for TextEdit {
         "text_edit"
     }
     fn description(&self) -> &'static str {
-        "Edit a workspace UTF-8 text file, including root files. Supply revision from text_read and one exact old_text/new_text replacement. Root AGENTS.md/CLAUDE.md protected; refuses stale reads, peer conflicts and pre-existing Git changes."
+        "Edit a workspace UTF-8 text file, including root files, with one exact old_text/new_text replacement. text_read the file first; revision is optional and defaults to the one text_read last showed. Root AGENTS.md/CLAUDE.md protected; refuses stale reads, peer conflicts and pre-existing Git changes."
     }
     fn parameters(&self) -> Value {
-        json!({"type":"object","properties":{"path":{"type":"string"},"revision":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","revision","old_text","new_text"]})
+        json!({"type":"object","properties":{"path":{"type":"string"},"revision":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]})
     }
     fn call(&self, args: &Value) -> Result<String, String> {
         let name = string(args, "path")?;
-        let text = read(&self.0.resolve(name)?)?;
-        // Kimi has read files with fs_read, which shows no revision, then repeated the
-        // same edit; the error names the call that supplies one.
-        let revision = args
-            .get("revision")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "missing `revision`: call text_read on {name} and copy the revision from \
-                 its first line (fs_read shows none), then retry this edit"
-                )
-            })?;
-        if revision != CasHash::digest(text.as_bytes()).to_hex() {
-            return Err("stale revision; text_read again".into());
+        let path = self.0.resolve(name)?;
+        let text = read(&path)?;
+        let current = CasHash::digest(text.as_bytes());
+        // Kimi text_read the file, got its revision, then sent the edit without it. The
+        // revision only proves she saw the current text, which the tools already know.
+        let revision = match args.get("revision").and_then(Value::as_str) {
+            Some(given) => given.to_string(),
+            None => self
+                .0
+                .seen
+                .borrow()
+                .get(&path)
+                .map(|seen| seen.to_hex())
+                .ok_or_else(|| {
+                    format!(
+                        "{name} has not been read with text_read in this chat (fs_read does \
+                         not count): text_read it, then retry this edit"
+                    )
+                })?,
+        };
+        if revision != current.to_hex() {
+            return Err(format!(
+                "{name} changed since you read it: text_read it again, then retry this edit"
+            ));
         }
         let old = string(args, "old_text")?;
         let new = string(args, "new_text")?;
@@ -459,14 +485,49 @@ mod tests {
         }
         let edit = |args: Value| toolbox.call("text_edit", &args.to_string()).unwrap_err();
         let revision = CasHash::digest(b"twice\ntwice\nonce\n").to_hex();
-        let missing = edit(json!({"path":"plan.md","old_text":"once","new_text":"x"}));
-        assert!(missing.contains("call text_read on plan.md"), "{missing}");
+        let unread = edit(json!({"path":"plan.md","old_text":"once","new_text":"x"}));
+        assert!(unread.contains("text_read it, then retry"), "{unread}");
         let absent =
             edit(json!({"path":"plan.md","revision":revision,"old_text":"thrice","new_text":"x"}));
         assert!(absent.contains("not in plan.md"), "{absent}");
         let repeated =
             edit(json!({"path":"plan.md","revision":revision,"old_text":"twice","new_text":"x"}));
         assert!(repeated.contains("occurs 2 times"), "{repeated}");
+    }
+
+    #[test]
+    fn an_edit_without_revision_uses_the_last_one_text_read_showed() {
+        // Kimi's 2026-10-01 session: text_read, then the same edit without `revision`.
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Cargo.toml"), "[dependencies]\na = 1\n").unwrap();
+        let mut toolbox = Toolbox::default();
+        for tool in tools(root.path()).unwrap() {
+            toolbox.push(tool);
+        }
+        let edit = |old: &str, new: &str| {
+            toolbox.call(
+                "text_edit",
+                &json!({"path":"Cargo.toml","old_text":old,"new_text":new}).to_string(),
+            )
+        };
+        toolbox
+            .call("text_read", r#"{"path":"Cargo.toml"}"#)
+            .unwrap();
+        edit("a = 1", "a = 2").unwrap();
+        // Her own write counts as seen, so a second edit needs no new read.
+        edit("a = 2", "a = 3").unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("Cargo.toml")).unwrap(),
+            "[dependencies]\na = 3\n"
+        );
+        // A change she has not seen is still refused.
+        fs::write(root.path().join("Cargo.toml"), "[dependencies]\na = 9\n").unwrap();
+        let stale = edit("a = 9", "a = 4").unwrap_err();
+        assert!(stale.contains("changed since you read it"), "{stale}");
+        assert_eq!(
+            fs::read_to_string(root.path().join("Cargo.toml")).unwrap(),
+            "[dependencies]\na = 9\n"
+        );
     }
 
     #[test]
@@ -678,7 +739,7 @@ mod tests {
         assert!(
             edit(&toolbox, "stale", "{ 1 }", "{ 2 }")
                 .unwrap_err()
-                .contains("stale")
+                .contains("changed since you read it")
         );
         for old in ["", "not present", "u"] {
             assert!(edit(&toolbox, ORIGINAL, old, "x").is_err());
