@@ -339,15 +339,39 @@ impl Tool for TextEdit {
     fn call(&self, args: &Value) -> Result<String, String> {
         let name = string(args, "path")?;
         let text = read(&self.0.resolve(name)?)?;
-        if string(args, "revision")? != CasHash::digest(text.as_bytes()).to_hex() {
+        // Kimi has read files with fs_read, which shows no revision, then repeated the
+        // same edit; the error names the call that supplies one.
+        let revision = args
+            .get("revision")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "missing `revision`: call text_read on {name} and copy the revision from \
+                 its first line (fs_read shows none), then retry this edit"
+                )
+            })?;
+        if revision != CasHash::digest(text.as_bytes()).to_hex() {
             return Err("stale revision; text_read again".into());
         }
         let old = string(args, "old_text")?;
         let new = string(args, "new_text")?;
         valid_change(old)?;
         valid_change(new)?;
-        if old.is_empty() || text.find(old).is_none() || text.find(old) != text.rfind(old) {
-            return Err("old_text must be nonempty and match exactly once".into());
+        match (old.is_empty(), text.matches(old).count()) {
+            (true, _) => return Err("old_text must be nonempty".into()),
+            (false, 0) => {
+                return Err(format!(
+                    "old_text is not in {name}: text_read the lines you mean to change and \
+                     copy them exactly, including indentation"
+                ));
+            }
+            (false, 1) => {}
+            (false, n) => {
+                return Err(format!(
+                    "old_text occurs {n} times in {name}; include surrounding lines so it \
+                     matches once"
+                ));
+            }
         }
         self.0
             .publish(name, &text.replacen(old, new, 1), Some(&text))
@@ -423,6 +447,26 @@ mod tests {
             "old_text":old,"new_text":new})
             .to_string(),
         )
+    }
+
+    #[test]
+    fn edit_errors_say_which_call_fixes_them() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("plan.md"), "twice\ntwice\nonce\n").unwrap();
+        let mut toolbox = Toolbox::default();
+        for tool in tools(root.path()).unwrap() {
+            toolbox.push(tool);
+        }
+        let edit = |args: Value| toolbox.call("text_edit", &args.to_string()).unwrap_err();
+        let revision = CasHash::digest(b"twice\ntwice\nonce\n").to_hex();
+        let missing = edit(json!({"path":"plan.md","old_text":"once","new_text":"x"}));
+        assert!(missing.contains("call text_read on plan.md"), "{missing}");
+        let absent =
+            edit(json!({"path":"plan.md","revision":revision,"old_text":"thrice","new_text":"x"}));
+        assert!(absent.contains("not in plan.md"), "{absent}");
+        let repeated =
+            edit(json!({"path":"plan.md","revision":revision,"old_text":"twice","new_text":"x"}));
+        assert!(repeated.contains("occurs 2 times"), "{repeated}");
     }
 
     #[test]

@@ -40,7 +40,10 @@ Non-Git files use revisions and peer claims without requiring Git status.
 Parents must exist. Symlink paths, dot directories, build output and ignored files
 are rejected. Reads/files are limited to 1 MiB, edit/create payloads to 64 KiB.
 Reads return at most 16 KiB; use line windows. A stale revision or a missing/nonunique
-old string fails without changing the file. Writes stage in a unique sibling
+old string fails without changing the file. Each error names its fix: a missing
+revision points to `text_read` (Kimi had read with `fs_read`, which shows none, and
+repeated the edit until the write-failure limit), and an old string says whether it
+occurs zero times or several. Writes stage in a unique sibling
 temporary file and publish atomically; existing permissions are preserved.
 The path, claims, Git status and revision are rechecked immediately before publish.
 These checks coordinate cooperative agents; they are not an OS sandbox against
