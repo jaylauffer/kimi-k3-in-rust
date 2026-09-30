@@ -42,6 +42,20 @@ progress always finishes. A paused turn keeps its waiting tool calls:
   goes on from there;
 - `/undo` or `/reset` drops them.
 
+`/undo` removes the last user message and every reply and tool-result round that
+followed it, including an unfinished reply. One invocation removes one whole user
+turn; it preserves earlier user turns. This also applies to older saved chats.
+File changes and board rows are not reversed by `/undo` or `/reset`.
+
+Before the 2026-10-01 fix, tool-result prompts were incorrectly treated as user
+turns by `/undo`. It removed only the last round, potentially leaving a tool call
+without its result in the conversation. Regression tests cover multiple rounds,
+unfinished replies, resumed state, and a new message after undo.
+Validation on macOS: `cargo test --workspace --all-features --offline --locked`,
+`cargo clippy --workspace --all-targets --all-features --offline --locked -- -D warnings`,
+`cargo fmt --all --check`, and the offline locked release CLI build passed.
+The tests use scripted replies; the running model was not restarted for validation.
+
 The guards against a stuck model stay: a reply repeating one block is ended, and the
 same read-only call made twice in a row ends the turn. Context is the other real
 bound: `--max-context` (32768 for Kimi Linear) holds every tool result, and a turn

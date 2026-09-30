@@ -23,7 +23,7 @@ const EOS: u32 = 163_585;
 const HELP: &str = "Type a message and press Enter. Commands:
   /continue   resume a truncated or cancelled reply, or a turn paused at its budget or by
               Ctrl-C (waiting tool calls run, with a fresh budget)
-  /undo       remove the last user/reply pair (including an unfinished reply)
+  /undo       remove the last user turn, including all tool rounds and unfinished replies
   /reset      clear conversation history
   /stats      show context usage
   /help       show these commands
@@ -133,6 +133,31 @@ fn single(tokenizer: &Tokenizer, text: &str) -> Result<u32, String> {
 }
 
 impl ChatFormat {
+    /// Session boundaries include tool-result prompts. Find the last actual user
+    /// prompt before removing its entire exchange, including in older saved chats.
+    fn undo_user_turn(&self, session: &mut Session) -> bool {
+        let Self::KimiLinear(t) = self else {
+            return session.undo();
+        };
+        let start = session.turn_starts().iter().rev().copied().find(|&start| {
+            // Inspect only the prompt, before its assistant header, so generated
+            // control tokens cannot masquerade as another user turn.
+            session.tokens()[start..]
+                .iter()
+                .take_while(|&&id| id != t.assistant)
+                .any(|&id| id == t.user)
+        });
+        let Some(start) = start else {
+            return false;
+        };
+        while session.tokens().len() > start {
+            if !session.undo() {
+                break;
+            }
+        }
+        true
+    }
+
     /// # Errors
     /// When the tokenizer lacks one of the `<|im_*|>` control tokens as a single id.
     pub fn kimi_linear(tokenizer: &Tokenizer, eos: u32) -> Result<Self, String> {
@@ -772,7 +797,7 @@ pub fn run_with(
                 continue;
             }
             "/undo" => {
-                let removed = session.undo();
+                let removed = format.undo_user_turn(&mut session);
                 (reply_start, held) = (session.tokens().len(), None);
                 display = Display::default();
                 log(&mut transcript, json!({"event": "command", "text": text}));
@@ -1109,6 +1134,117 @@ mod tests {
             eos: [200_004; 2],
             note: None,
         })
+    }
+
+    #[test]
+    fn undo_removes_all_tool_rounds_from_restored_completed_or_partial_turns() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let cancel = AtomicBool::new(false);
+        for partial in [false, true] {
+            let mut session = Session::new(32_768).unwrap();
+            session
+                .begin_turn(&format.prompt(&tokenizer, "Keep this", true, None))
+                .unwrap();
+            session
+                .generate(1, &[t.end], &cancel, |_| Ok(t.end), |_| Ok(()))
+                .unwrap();
+            let kept = session.tokens().to_vec();
+            session
+                .begin_turn(&format.prompt(&tokenizer, "Remove this", false, None))
+                .unwrap();
+            for round in 0..3 {
+                session
+                    .generate(1, &[t.end], &cancel, |_| Ok(t.end), |_| Ok(()))
+                    .unwrap();
+                session
+                    .begin_turn(&format.tool_results(
+                        &tokenizer,
+                        &[(
+                            format!("functions.fs_read:{round}"),
+                            "fs_read".into(),
+                            "read".into(),
+                        )],
+                    ))
+                    .unwrap();
+            }
+            // A generated user control must not count as a new user prompt.
+            let mut reply = [t.user, t.end].into_iter();
+            session
+                .generate(
+                    if partial { 1 } else { 2 },
+                    &[t.end],
+                    &cancel,
+                    |_| Ok(reply.next().unwrap()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let mut restored = Session::restore(
+                session.max_context(),
+                session.tokens().to_vec(),
+                session.turn_starts().to_vec(),
+                session.is_pending(),
+            )
+            .unwrap();
+            assert!(format.undo_user_turn(&mut restored));
+            assert_eq!(restored.tokens(), kept);
+            assert_eq!(restored.turn_starts(), [0]);
+            assert!(!restored.is_pending());
+            assert!(format.undo_user_turn(&mut restored));
+            assert!(restored.tokens().is_empty());
+            assert!(!format.undo_user_turn(&mut restored));
+        }
+    }
+
+    #[test]
+    fn one_undo_after_tool_work_preserves_prior_turn_and_accepts_a_new_message() {
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let mut replies = stepping_replies(&tokenizer, t, 0, 1)
+            .chain(stepping_replies(&tokenizer, t, 3, 1))
+            .chain(stepping_replies(&tokenizer, t, 0, 1));
+        let mut output = Vec::new();
+        let mut checked = false;
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            32_768,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Keep this\nRemove this\n/undo\nAfter undo\n/quit\n"[..],
+            &mut output,
+            |ids| {
+                let text = tokenizer.decode_lossy(ids);
+                if text.contains("After undo") {
+                    assert!(text.contains("Keep this"));
+                    assert!(!text.contains("Remove this"));
+                    assert!(!ids.contains(&t.section_begin));
+                    assert!(!ids.contains(&t.call_begin));
+                    checked = true;
+                }
+                Ok(replies.next().expect("scripted reply"))
+            },
+            ChatOptions::default(),
+        )
+        .unwrap();
+        assert!(checked);
+        assert_eq!(ran.borrow().len(), 3);
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("Last turn removed.")
+                .count(),
+            1
+        );
     }
 
     #[test]
