@@ -747,9 +747,11 @@ impl Flow {
 
 /// The typed questions asked about a turn when its context is compacted. The state is
 /// what a loadngo Task submitter would hold: the request (`TaskRequest.summary`) and the
-/// worker's latest status note (`TaskStatus.note`, here the handoff). `state` is the
-/// value `TaskStatus.state` carries, as a type instead of free text; `complete` is the
-/// claim a `TaskResult` makes, which only the submitter's `TaskAck` settles.
+/// worker's latest status note (`TaskStatus.note`, here the handoff). `state` chooses
+/// among the assignment states recommended for `TaskStatus.state` in loadngo
+/// `docs/TASK_CHECKPOINT_RECOMMENDATIONS.md` and `stuck`, which a worker does not report
+/// and a reader of its notes may conclude. `complete` is the claim a `TaskResult` makes,
+/// which only the submitter's `TaskAck` settles.
 fn checkpoint_request(request: &str, handoff: &str) -> Request {
     let options = |list: &[(&str, &str)]| {
         list.iter()
@@ -770,13 +772,28 @@ fn checkpoint_request(request: &str, handoff: &str) -> Request {
                              from what already failed",
                         ),
                         (
-                            "blocked",
-                            "The work cannot go on without something from Jay, or the same \
-                             step keeps failing",
+                            "paused",
+                            "The work stopped for a reason that has nothing to do with the \
+                             task, and can simply be resumed",
                         ),
+                        (
+                            "needs-input",
+                            "The work cannot go on without a decision, an answer or access \
+                             from Jay",
+                        ),
+                        (
+                            "needs-help",
+                            "The work needs expertise or a capability the worker does not have",
+                        ),
+                        ("withdrawn", "The worker has given the task up"),
                         (
                             "complete",
                             "Everything Jay asked for is finished and checked",
+                        ),
+                        (
+                            "stuck",
+                            "The same step keeps failing, or the notes show effort without \
+                             progress",
                         ),
                     ]),
                 },
@@ -2492,7 +2509,10 @@ mod tests {
             .collect();
         assert_eq!(saved.len(), compactions);
         assert_eq!(saved[0]["mode"], "shadow");
-        assert!(saved[0]["answers"]["state"]["blocked"].is_number());
+        let states = saved[0]["answers"]["state"].as_object().unwrap();
+        assert!(
+            states.len() == 7 && states["needs-help"].is_number() && states["stuck"].is_number()
+        );
         assert_eq!(saved[0]["observed"]["identical_calls"], 0);
     }
 

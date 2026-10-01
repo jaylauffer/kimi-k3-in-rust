@@ -99,9 +99,14 @@ answer is a probability per option, read from one forward pass.
 
 | Question | Type | Options |
 |---|---|---|
-| `state` | choice | `in-progress`, `blocked`, `complete` |
+| `state` | choice | `in-progress`, `paused`, `needs-input`, `needs-help`, `withdrawn`, `complete`, `stuck` |
 | `repeating` | true/false | the notes show the same action failing more than once |
 | `progress` | score | 0 nothing done, 1 only read, 2 partly changed, 3 changed and checked |
+
+The `state` options are the assignment states recommended for `TaskStatus.state` in
+loadngo `docs/TASK_CHECKPOINT_RECOMMENDATIONS.md`, plus `stuck`, which a worker does not
+report about itself. Until 2026-10-02 (`c96309b` and before) the options were
+`in-progress`, `blocked`, `complete`; saved events from then carry those names.
 
 The answers are shown on one line and saved as a `checkpoint` event (`request`,
 `handoff`, `answers`, `observed`, `seconds`). **Nothing acts on them**: the turn goes on
@@ -127,7 +132,7 @@ Run on the model 2026-10-02 (Mac mini, `--accel gpu`), on a copy of that chat wi
 127-word handoff, the context went 32768 -> 6656 tokens and the turn went on; about
 2.5 minutes in all, the checkpoint 2.0 s of it. The handoff named the task and the
 next step but no paths or line numbers, and called five failed `sed` calls an "initial
-attempt". The checkpoint, reading only that handoff, answered `blocked` 53% /
+attempt". The checkpoint, reading only that handoff, answered (with the three options of that day) `blocked` 53% /
 `in-progress` 46%, `repeating` false 67% and `progress` 2 at 93%; in fact the same
 call had failed repeatedly and nothing had been changed (progress 1). Her next reply
 carried on with the shell approach.
