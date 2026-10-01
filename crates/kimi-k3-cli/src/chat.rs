@@ -685,7 +685,8 @@ impl Display {
 }
 
 /// What Kimi is asked when her context is nearly full. Her answer is the handoff.
-const FLOW_REQUEST: &str = "Your context is nearly full and is about to be cleared. Only the \
+const FLOW_REQUEST: &str = "[Automatic message from the chat program, not from Jay.] Stop \
+working for one reply. Your context is nearly full and is about to be cleared. Only the \
 handoff you write now, Jay's messages and your most recent tool rounds are carried over; \
 everything else you have read is gone afterwards. Do not call tools in this reply. Write a \
 handoff to yourself in plain text under these headings. TASK: what Jay asked for, in his \
@@ -694,6 +695,9 @@ handoff. DONE: what is finished and checked, with paths. FACTS: the exact paths,
 names, commands and results you will need. FAILED: what you tried that did not work and why, \
 so you do not repeat it. FILES CHANGED: every file you created or modified, temporary ones \
 included. NEXT: the single next step. Be specific and brief, and say so where you are unsure.";
+
+/// How every handoff begins; the program writes it, so the reply starts as text.
+const HANDOFF_OPENING: &str = "TASK:";
 
 /// Opens the system message that carries a handoff into the rebuilt context.
 const FLOW_NOTE: &str = "The earlier conversation was cleared to free context. Before that you \
@@ -912,11 +916,16 @@ fn compact(
 
     // The handoff is written at the end of the existing context where there is room, so
     // nothing is read twice; otherwise the newest turns are left out until there is.
-    let mut request = Vec::new();
-    t.message(&mut request, tokenizer, "system", FLOW_REQUEST);
-    request.push(t.assistant);
+    // Asked as a user message, with the reply already begun: on the model, a system
+    // message after a run of tool rounds was answered with one more tool call.
+    let mut request = vec![t.user];
+    ordinary(&mut request, tokenizer, "user");
+    request.push(t.middle);
+    ordinary(&mut request, tokenizer, FLOW_REQUEST);
+    request.extend([t.end, t.assistant]);
     ordinary(&mut request, tokenizer, "assistant");
     request.push(t.middle);
+    ordinary(&mut request, tokenizer, HANDOFF_OPENING);
     let need = request.len() + flow.handoff_tokens() + 1;
     let cut_at = |kept: usize| turns.get(kept).copied().unwrap_or(tokens.len());
     let mut kept = if pending { last } else { turns.len() };
@@ -937,7 +946,7 @@ fn compact(
         write!(
             output,
             "\n[context {}/{}: Kimi writes a handoff, then the context is rebuilt from it]\n\
-             Kimi (handoff)> ",
+             Kimi (handoff)> {HANDOFF_OPENING}",
             tokens.len(),
             session.max_context()
         )
@@ -967,7 +976,10 @@ fn compact(
             .iter()
             .position(|id| *id == t.section_begin || format.stops().contains(id))
             .map_or(written, |stop| &written[..stop]);
-        handoff = tokenizer.decode_lossy(text).trim().to_string();
+        let text = tokenizer.decode_lossy(text);
+        if !text.trim().is_empty() {
+            handoff = format!("{HANDOFF_OPENING}{}", text.trim_end());
+        }
     }
 
     let request = said.last().map(|(_, text)| text.clone());
@@ -2347,8 +2359,9 @@ mod tests {
             if self.queue.is_empty() {
                 let text = self.tokenizer.decode_lossy(context);
                 let mut ids = Vec::new();
-                if text.ends_with(&format!("{FLOW_REQUEST}assistant")) {
-                    ordinary(&mut ids, self.tokenizer, HANDOFF);
+                if text.ends_with(&format!("{FLOW_REQUEST}assistant{HANDOFF_OPENING}")) {
+                    let rest = HANDOFF.strip_prefix(HANDOFF_OPENING).unwrap();
+                    ordinary(&mut ids, self.tokenizer, rest);
                 } else {
                     if context.len() < self.shown && text.contains(FLOW_NOTE) {
                         self.rebuilt.push(text);
@@ -3002,7 +3015,7 @@ mod tests {
         let ChatFormat::KimiLinear(t) = &format else {
             unreachable!()
         };
-        let mut handoff = tokenizer.encode_ordinary(HANDOFF);
+        let mut handoff = tokenizer.encode_ordinary(HANDOFF.strip_prefix(HANDOFF_OPENING).unwrap());
         handoff.push(t.end);
         let mut handoff = handoff.into_iter();
         let mut read = 0;

@@ -65,8 +65,9 @@ same read-only call made twice in a row ends the turn.
 passes three quarters of it, Kimi writes a handoff to herself and the context is
 rebuilt from it, and the turn goes on:
 
-1. A system message asks for the handoff (TASK, STANDING, DONE, FACTS, FAILED, FILES
-   CHANGED, NEXT; no tools). It is written at the end of the existing context, so
+1. A message marked as automatic asks for the handoff (TASK, STANDING, DONE, FACTS,
+   FAILED, FILES CHANGED, NEXT; no tools), and her reply is begun for her with `TASK:`.
+   (Asked as a system message, the model answered with one more tool call.) It is written at the end of the existing context, so
    nothing is read twice. It is limited to 1/32 of the context (1024 tokens).
 2. The new context is the opening (tool declarations, guidance, memory), a system
    message holding the handoff and Jay's earlier messages word for word (the newest
@@ -119,9 +120,17 @@ context runs every call once across several compactions and never fills; a chat 
 at the limit mid-reply continues after `/continue`; a new message into a crowded
 context starts from a handoff. Kimi's saved 2026-10-02 chat (32768/32768, mid-reply)
 rebuilds to 3438 tokens plus the tool declarations, with the real tokenizer and a
-fixed handoff line. The checkpoint is asked once per compaction, over the request and
-the handoff, and saved (scripted answers). Neither the handoffs the model writes nor
-its checkpoint answers have been run on the model yet.
+fixed handoff line.
+
+Run on the model 2026-10-02 (Mac mini, `--accel gpu`), on a copy of that chat with
+`--turn-tokens 1` so no tool ran: `/continue` re-read the history, she wrote a
+127-word handoff, the context went 32768 -> 6656 tokens and the turn went on; about
+2.5 minutes in all, the checkpoint 2.0 s of it. The handoff named the task and the
+next step but no paths or line numbers, and called five failed `sed` calls an "initial
+attempt". The checkpoint, reading only that handoff, answered `blocked` 53% /
+`in-progress` 46%, `repeating` false 67% and `progress` 2 at 93%; in fact the same
+call had failed repeatedly and nothing had been changed (progress 1). Her next reply
+carried on with the shell approach.
 
 Since 2026-10-01, failed writes can be retried after fixing the reported cause;
 they are not treated as successful duplicate mutations. The same write failing
