@@ -57,9 +57,44 @@ Validation on macOS: `cargo test --workspace --all-features --offline --locked`,
 The tests use scripted replies; the running model was not restarted for validation.
 
 The guards against a stuck model stay: a reply repeating one block is ended, and the
-same read-only call made twice in a row ends the turn. Context is the other real
-bound: `--max-context` (32768 for Kimi Linear) holds every tool result, and a turn
-that fills it has to be undone or reset.
+same read-only call made twice in a row ends the turn.
+
+## Context flow (Kimi Linear, 2026-10-02)
+
+`--max-context` (32768 for Kimi Linear) no longer ends a turn. When the context
+passes three quarters of it, Kimi writes a handoff to herself and the context is
+rebuilt from it, and the turn goes on:
+
+1. A system message asks for the handoff (TASK, STANDING, DONE, FACTS, FAILED, FILES
+   CHANGED, NEXT; no tools). It is written at the end of the existing context, so
+   nothing is read twice. It is limited to 1/32 of the context (1024 tokens).
+2. The new context is the opening (tool declarations, guidance, memory), a system
+   message holding the handoff and Jay's earlier messages word for word (the newest
+   2 KiB of them), Jay's latest message as he typed it, and the newest tool rounds
+   that fit an eighth of the context (4096 tokens), tool results included.
+3. The model reads the new context once (a few thousand tokens) and carries on.
+
+It happens at three points: before tool results that would cross the line are added;
+when a reply runs into the end of the context (the cut-off reply is dropped and
+written again); and before a new message from Jay that would cross the line. A saved
+chat that stopped at the limit resumes the same way: `--resume latest`, then
+`/continue`. Another compaction waits until the context has grown by an eighth since
+the last, so a context that cannot be made smaller stops as before ("Context full").
+
+What is kept by the program and what by Kimi: Jay's words and the newest rounds are
+copied by the program; everything else survives only if her handoff says it. Reads
+made before a compaction may be made again after it. Each compaction is a
+`compaction` event in the transcript (`before`, `after`, `handoff`), and the handoff
+is shown on the terminal as she writes it. `/undo` after a compaction removes the
+whole rebuilt turn; file changes are not reversed. K3 chats (512 tokens) are not
+compacted.
+
+Checked 2026-10-02 on macOS with scripted replies: a 200-round turn in an 8192-token
+context runs every call once across several compactions and never fills; a chat saved
+at the limit mid-reply continues after `/continue`; a new message into a crowded
+context starts from a handoff. Kimi's saved 2026-10-02 chat (32768/32768, mid-reply)
+rebuilds to 3438 tokens plus the tool declarations, with the real tokenizer and a
+fixed handoff line. The handoffs the model itself writes have not been judged yet.
 
 Since 2026-10-01, failed writes can be retried after fixing the reported cause;
 they are not treated as successful duplicate mutations. The same write failing
@@ -91,7 +126,8 @@ snapshot is only resumed by the same chat format (Kimi Linear or K3), and needs 
 `--gen` limits each generation/continuation, including thinking and structure tokens.
 A truncated/cancelled response remains **unfinished**. Use `/continue` or discard it
 with `/undo` or `/reset`; do not append a new user message into half a K3 message.
-`--max-context` bounds the entire token history. There is no silent eviction.
+`--max-context` bounds the entire token history. Nothing is dropped silently: a Kimi
+Linear chat is compacted through a handoff she writes (see Context flow above).
 `--layers` is forbidden in chat: a diagnostic subset is not a working chatbot.
 Memory defaults remain conservative: two pinned layers, two ring slots, 4 GiB expert
 cache. These settings are not a guarantee against memory pressure with long prompts.

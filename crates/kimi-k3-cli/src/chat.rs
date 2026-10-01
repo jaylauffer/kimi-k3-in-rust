@@ -37,6 +37,8 @@ Only workspace-root AGENTS.md and CLAUDE.md are protected; repository copies are
 Terminal tools run commands, read output, send stdin and stop sessions (no PTY).
 Kimi can also search and read public web pages (--no-web turns those tools off;
 terminal commands can still use the network).
+When a Kimi Linear chat's context is nearly full, Kimi writes a handoff and the context is
+rebuilt from it; the turn goes on. A chat saved at the limit continues with /continue.
 ";
 
 fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
@@ -578,6 +580,18 @@ fn call_key(name: &str, arguments: &str) -> (String, serde_json::Value) {
 
 // Session reads consume output, and writes/stops can legitimately repeat. Never cache
 // them as immutable lookups. Commands can change files asynchronously too.
+/// Drops the read-only calls from a turn's record of calls already made, when their
+/// results may have changed or are no longer in the context. Mutations stay, so an edit
+/// is never replayed.
+fn forget_reads(earlier_calls: &mut Vec<(String, serde_json::Value)>) {
+    earlier_calls.retain(|(tool, _)| {
+        !matches!(
+            tool.as_str(),
+            "text_read" | "fs_read" | "fs_list" | "fs_find" | "fs_grep" | "terminal_exec"
+        )
+    });
+}
+
 fn repeatable_tool(name: &str) -> bool {
     matches!(
         name,
@@ -661,6 +675,307 @@ impl Display {
     }
 }
 
+/// What Kimi is asked when her context is nearly full. Her answer is the handoff.
+const FLOW_REQUEST: &str = "Your context is nearly full and is about to be cleared. Only the \
+handoff you write now, Jay's messages and your most recent tool rounds are carried over; \
+everything else you have read is gone afterwards. Do not call tools in this reply. Write a \
+handoff to yourself in plain text under these headings. TASK: what Jay asked for, in his \
+terms. STANDING: anything Jay asked you to remember or keep doing, including from an earlier \
+handoff. DONE: what is finished and checked, with paths. FACTS: the exact paths, line numbers, \
+names, commands and results you will need. FAILED: what you tried that did not work and why, \
+so you do not repeat it. FILES CHANGED: every file you created or modified, temporary ones \
+included. NEXT: the single next step. Be specific and brief, and say so where you are unsure.";
+
+/// Opens the system message that carries a handoff into the rebuilt context.
+const FLOW_NOTE: &str = "The earlier conversation was cleared to free context. Before that you \
+wrote the handoff below: it is your own notes. Carry on with the work from it without asking \
+Jay to repeat himself. Details that are not in it are gone, so read files again instead of \
+guessing.";
+
+/// Most bytes of Jay's earlier messages repeated word for word after a compaction.
+const EARLIER_MESSAGES_BYTES: usize = 2048;
+
+/// Context flow: when a Kimi Linear chat's context is nearly full, Kimi writes a handoff,
+/// the context is rebuilt from it and the turn goes on. All sizes follow the context size.
+#[derive(Clone, Copy, Debug)]
+struct Flow {
+    enabled: bool,
+    max_context: usize,
+    /// The context length right after the latest compaction.
+    compacted_len: usize,
+}
+
+impl Flow {
+    /// The context length a compaction keeps the chat under.
+    const fn limit(&self) -> usize {
+        self.max_context - self.max_context / 4
+    }
+
+    /// The longest handoff.
+    fn handoff_tokens(&self) -> usize {
+        (self.max_context / 32).clamp(64, 1024)
+    }
+
+    /// How much of the latest tool rounds is carried over word for word.
+    const fn tail_tokens(&self) -> usize {
+        self.max_context / 8
+    }
+
+    /// Whether the chat has grown enough since the latest compaction for another to help.
+    const fn progressed(&self, len: usize) -> bool {
+        self.enabled && len >= self.compacted_len + self.max_context / 8
+    }
+
+    /// Whether adding `adding` tokens to a context of `len` calls for a compaction first.
+    const fn due(&self, len: usize, adding: usize) -> bool {
+        self.progressed(len) && len + adding > self.limit()
+    }
+}
+
+struct Compacted {
+    session: Session,
+    handoff: String,
+    /// Tokens Kimi generated for the handoff.
+    generated: usize,
+}
+
+/// Has Kimi write a handoff and builds the context that replaces `session`'s: the opening,
+/// the handoff, Jay's earlier messages and, when a turn is in progress (`in_turn`), his
+/// latest message and the newest tool rounds that fit [`Flow::tail_tokens`]. An unfinished
+/// reply is dropped: the rebuilt context ends where it began, ready to be written again.
+/// `session` itself is not changed, so a failure leaves the chat as it was.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn compact(
+    format: &ChatFormat,
+    tools: Option<&Toolbox>,
+    tokenizer: &Tokenizer,
+    session: &Session,
+    in_turn: bool,
+    flow: Flow,
+    cancel: &AtomicBool,
+    next: &mut impl FnMut(&[u32]) -> Result<u32, String>,
+    output: &mut impl Write,
+) -> Result<Compacted, String> {
+    let ChatFormat::KimiLinear(t) = format else {
+        return Err("only Kimi Linear chats are compacted".into());
+    };
+    let (tokens, turns) = (session.tokens(), session.turn_starts());
+    let Some(last) = turns.len().checked_sub(1) else {
+        return Err("there is no conversation yet".into());
+    };
+    let turn_end = |turn: usize| turns.get(turn + 1).copied().unwrap_or(tokens.len());
+    // Where a turn's reply begins: just past its prompt's assistant header.
+    let reply_start = |turn: usize| {
+        let span = &tokens[turns[turn]..turn_end(turn)];
+        let header = span.iter().position(|&id| id == t.assistant)?;
+        let middle = span[header..].iter().position(|&id| id == t.middle)?;
+        Some(turns[turn] + header + middle + 1)
+    };
+    // Jay's messages, word for word: Kimi's summary of a request is not the request.
+    let mut said: Vec<(usize, String)> = Vec::new();
+    for turn in 0..turns.len() {
+        let prompt = &tokens[turns[turn]..reply_start(turn).unwrap_or_else(|| turn_end(turn))];
+        let Some(user) = prompt.iter().rposition(|&id| id == t.user) else {
+            continue;
+        };
+        let body = &prompt[user..];
+        let Some(from) = body.iter().position(|&id| id == t.middle) else {
+            continue;
+        };
+        let to = body[from..]
+            .iter()
+            .position(|&id| id == t.end)
+            .map_or(body.len(), |end| from + end);
+        said.push((turn, tokenizer.decode_lossy(&body[from + 1..to])));
+    }
+    let pending = session.is_pending();
+    // The end of what is carried over.
+    let end = if pending {
+        reply_start(last).ok_or("the unfinished reply has no start")?
+    } else {
+        tokens.len()
+    };
+
+    // The handoff is written at the end of the existing context where there is room, so
+    // nothing is read twice; otherwise the newest turns are left out until there is.
+    let mut request = Vec::new();
+    t.message(&mut request, tokenizer, "system", FLOW_REQUEST);
+    request.push(t.assistant);
+    ordinary(&mut request, tokenizer, "assistant");
+    request.push(t.middle);
+    let need = request.len() + flow.handoff_tokens() + 1;
+    let cut_at = |kept: usize| turns.get(kept).copied().unwrap_or(tokens.len());
+    let mut kept = if pending { last } else { turns.len() };
+    while kept > 0 && cut_at(kept) + need > session.max_context() {
+        kept -= 1;
+    }
+    let (mut handoff, mut generated) = (String::new(), 0);
+    if kept > 0 {
+        let cut = cut_at(kept);
+        let mut scratch = Session::restore(
+            session.max_context(),
+            tokens[..cut].to_vec(),
+            turns[..kept].to_vec(),
+            false,
+        )
+        .and_then(|mut scratch| scratch.begin_turn(&request).map(|()| scratch))
+        .map_err(|e| e.to_string())?;
+        write!(
+            output,
+            "\n[context {}/{}: Kimi writes a handoff, then the context is rebuilt from it]\n\
+             Kimi (handoff)> ",
+            tokens.len(),
+            session.max_context()
+        )
+        .and_then(|()| output.flush())
+        .map_err(|e| e.to_string())?;
+        let mut display = Display::default();
+        let done = scratch
+            .generate(
+                flow.handoff_tokens(),
+                &format.stops(),
+                cancel,
+                &mut *next,
+                |token| {
+                    write!(output, "{}", format.push(&mut display, tokenizer, token))
+                        .and_then(|()| output.flush())
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        writeln!(output, "{}", terminal_text(&display.utf8.finish())).map_err(|e| e.to_string())?;
+        if done.reason == StopReason::Cancelled {
+            return Err("interrupted while the handoff was being written".into());
+        }
+        generated = done.tokens;
+        let written = &scratch.tokens()[cut + request.len()..];
+        let text = written
+            .iter()
+            .position(|id| *id == t.section_begin || format.stops().contains(id))
+            .map_or(written, |stop| &written[..stop]);
+        handoff = tokenizer.decode_lossy(text).trim().to_string();
+    }
+
+    let latest = if in_turn {
+        Some(
+            said.pop()
+                .ok_or("the turn in progress has no message from Jay")?,
+        )
+    } else {
+        None
+    };
+    let mut note = format!(
+        "{FLOW_NOTE}\n\n## Handoff\n{}",
+        if handoff.is_empty() {
+            "(You wrote no handoff.)"
+        } else {
+            &handoff
+        }
+    );
+    let mut earlier = Vec::new();
+    let mut bytes = 0;
+    for (_, text) in said.iter().rev() {
+        bytes += text.len();
+        if bytes > EARLIER_MESSAGES_BYTES {
+            break;
+        }
+        earlier.push(text.as_str());
+    }
+    if !earlier.is_empty() {
+        note.push_str("\n\n## Jay's earlier messages, oldest first");
+        for text in earlier.iter().rev() {
+            note.push_str("\n- ");
+            note.push_str(text);
+        }
+    }
+    let mut ids = format.preamble(tokenizer, tools);
+    t.message(&mut ids, tokenizer, "system", &note);
+    let mut new_turns = vec![0];
+    if let Some((user_turn, text)) = latest {
+        ids.extend(format.prompt(tokenizer, &text, false, tools));
+        // The newest rounds that fit, starting at a reply so the history stays well formed.
+        // A finished reply whose tool results are about to follow is always kept.
+        let starts = (user_turn..=last)
+            .map(|turn| reply_start(turn).map(|start| (turn, start)))
+            .collect::<Option<Vec<_>>>()
+            .ok_or("a turn has no reply")?;
+        let (turn, start) = starts
+            .iter()
+            .copied()
+            .find(|&(_, start)| start <= end && end - start <= flow.tail_tokens())
+            .or(starts.last().copied().filter(|_| !pending))
+            .ok_or("the newest reply cannot be found")?;
+        let base = ids.len();
+        new_turns.extend(
+            turns[turn + 1..]
+                .iter()
+                .filter(|&&s| s < end)
+                .map(|s| base + s - start),
+        );
+        ids.extend_from_slice(&tokens[start..end]);
+    }
+    if ids.len() >= flow.limit() {
+        return Err(format!(
+            "what must be kept is {} tokens, too much for a context of {}",
+            ids.len(),
+            session.max_context()
+        ));
+    }
+    let session = Session::restore(session.max_context(), ids, new_turns, in_turn && pending)
+        .map_err(|e| e.to_string())?;
+    Ok(Compacted {
+        session,
+        handoff,
+        generated,
+    })
+}
+
+/// Compacts `session` in place and says so; on failure the chat is left as it was and the
+/// reason is shown. Returns the tokens Kimi generated for the handoff.
+#[allow(clippy::too_many_arguments)]
+fn flow_now(
+    format: &ChatFormat,
+    tools: Option<&Toolbox>,
+    tokenizer: &Tokenizer,
+    session: &mut Session,
+    in_turn: bool,
+    flow: &mut Flow,
+    cancel: &AtomicBool,
+    next: &mut impl FnMut(&[u32]) -> Result<u32, String>,
+    output: &mut impl Write,
+    transcript: &mut Option<Transcript>,
+) -> Option<usize> {
+    let before = session.tokens().len();
+    match compact(
+        format, tools, tokenizer, session, in_turn, *flow, cancel, next, output,
+    ) {
+        Ok(compacted) => {
+            *session = compacted.session;
+            flow.compacted_len = session.tokens().len();
+            log(
+                transcript,
+                json!({
+                    "event": "compaction",
+                    "before": before,
+                    "after": session.tokens().len(),
+                    "in_turn": in_turn,
+                    "handoff": compacted.handoff,
+                }),
+            );
+            let _ = writeln!(
+                output,
+                "[context rebuilt from the handoff: {before} -> {} tokens]",
+                session.tokens().len()
+            );
+            Some(compacted.generated)
+        }
+        Err(error) => {
+            let _ = writeln!(output, "[context not compacted: {error}]");
+            None
+        }
+    }
+}
+
 /// Blocking K3 terminal frontend; see [`run_with`].
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -725,6 +1040,11 @@ pub fn run_with(
             0,
             None,
         ),
+    };
+    let mut flow = Flow {
+        enabled: matches!(format, ChatFormat::KimiLinear(_)),
+        max_context,
+        compacted_len: 0,
     };
     let mut display = Display::default();
     // The reply being generated, for the repetition check; reused across replies.
@@ -795,6 +1115,7 @@ pub fn run_with(
             "/reset" => {
                 session.reset();
                 (reply_start, held) = (0, None);
+                flow.compacted_len = 0;
                 display = Display::default();
                 log(&mut transcript, json!({"event": "command", "text": text}));
                 writeln!(output, "Conversation cleared.").map_err(|e| e.to_string())?;
@@ -803,6 +1124,7 @@ pub fn run_with(
             "/undo" => {
                 let removed = format.undo_user_turn(&mut session);
                 (reply_start, held) = (session.tokens().len(), None);
+                flow.compacted_len = flow.compacted_len.min(session.tokens().len());
                 display = Display::default();
                 log(&mut transcript, json!({"event": "command", "text": text}));
                 writeln!(
@@ -838,6 +1160,26 @@ pub fn run_with(
                     format.tool_messages(tokenizer, &held.abandoned())
                 });
                 ids.extend(format.prompt(tokenizer, text, session.tokens().is_empty(), tools));
+                // A message that would crowd the context starts from a handoff instead.
+                if held.is_none()
+                    && !session.is_pending()
+                    && flow.due(session.tokens().len(), ids.len())
+                    && flow_now(
+                        format,
+                        tools,
+                        tokenizer,
+                        &mut session,
+                        false,
+                        &mut flow,
+                        cancel,
+                        &mut next,
+                        &mut output,
+                        &mut transcript,
+                    )
+                    .is_some()
+                {
+                    ids = format.prompt(tokenizer, text, session.tokens().is_empty(), tools);
+                }
                 if let Err(error) = session.begin_turn(&ids) {
                     writeln!(output, "{error}").map_err(|e| e.to_string())?;
                     continue;
@@ -929,6 +1271,37 @@ pub fn run_with(
                         "context": session.tokens().len(),
                     }),
                 );
+                // A reply that ran into the end of the context is dropped and written again
+                // in a context rebuilt from her handoff; the turn goes on.
+                if done.reason == StopReason::ContextLimit
+                    && flow.progressed(session.tokens().len())
+                    && let Some(spent) = flow_now(
+                        format,
+                        tools,
+                        tokenizer,
+                        &mut session,
+                        true,
+                        &mut flow,
+                        cancel,
+                        &mut next,
+                        &mut output,
+                        &mut transcript,
+                    )
+                {
+                    turn_tokens += spent;
+                    forget_reads(&mut earlier_calls);
+                    repeated_rounds = 0;
+                    reply_start = session.tokens().len();
+                    reply.clear();
+                    if let Some(transcript) = &mut transcript {
+                        transcript.save_state(&session, reply_start, None);
+                    }
+                    display = Display::default();
+                    write!(output, "{}", format.opening())
+                        .and_then(|()| output.flush())
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
                 if session.is_pending() {
                     let why = if done.reason == StopReason::ContextLimit {
                         "Context full. Use /undo or /reset."
@@ -1019,17 +1392,7 @@ pub fn run_with(
                         ) {
                             // Files changed: previous reads/finds may now have different
                             // results. Keep text mutation keys so an edit is never replayed.
-                            earlier_calls.retain(|(tool, _)| {
-                                !matches!(
-                                    tool.as_str(),
-                                    "text_read"
-                                        | "fs_read"
-                                        | "fs_list"
-                                        | "fs_find"
-                                        | "fs_grep"
-                                        | "terminal_exec"
-                                )
-                            });
+                            forget_reads(&mut earlier_calls);
                             repeated_rounds = 0;
                         }
                         if name == "board_add_row" {
@@ -1091,6 +1454,25 @@ pub fn run_with(
             }
             let mut results = calls.done;
             let mut prompt = format.tool_results(tokenizer, &results);
+            // Results that would crowd the context go into one rebuilt from her handoff.
+            if flow.due(session.tokens().len(), prompt.len())
+                && let Some(spent) = flow_now(
+                    format,
+                    Some(tools),
+                    tokenizer,
+                    &mut session,
+                    true,
+                    &mut flow,
+                    cancel,
+                    &mut next,
+                    &mut output,
+                    &mut transcript,
+                )
+            {
+                turn_tokens += spent;
+                forget_reads(&mut earlier_calls);
+                repeated_rounds = 0;
+            }
             let room = max_context.saturating_sub(session.tokens().len() + max_tokens.min(512));
             while prompt.len() > room && results.iter().any(|(_, _, t)| t.len() > 200) {
                 for (_, _, text) in results.iter_mut().filter(|(_, _, t)| t.len() > 200) {
@@ -1795,6 +2177,284 @@ mod tests {
         assert!(saw_note, "{}", String::from_utf8(output).unwrap());
     }
 
+    /// A scripted Kimi for context-flow tests: writes `HANDOFF` when asked for one, calls
+    /// `fs_read` on a new path for each of `rounds` rounds, then answers `Done.`. Records
+    /// the first context it was shown after each compaction.
+    struct FlowScript<'a> {
+        tokenizer: &'a Tokenizer,
+        t: &'a LinearTokens,
+        rounds: usize,
+        called: usize,
+        queue: std::collections::VecDeque<u32>,
+        longest: usize,
+        /// The length of the context last shown; a shorter one follows a compaction.
+        shown: usize,
+        rebuilt: Vec<String>,
+    }
+
+    const HANDOFF: &str = "TASK: read every path. NEXT: the next path.";
+
+    impl FlowScript<'_> {
+        fn next(&mut self, context: &[u32]) -> u32 {
+            self.longest = self.longest.max(context.len());
+            if self.queue.is_empty() {
+                let text = self.tokenizer.decode_lossy(context);
+                let mut ids = Vec::new();
+                if text.ends_with(&format!("{FLOW_REQUEST}assistant")) {
+                    ordinary(&mut ids, self.tokenizer, HANDOFF);
+                } else {
+                    if context.len() < self.shown && text.contains(FLOW_NOTE) {
+                        self.rebuilt.push(text);
+                    }
+                    if self.called < self.rounds {
+                        ids.extend([self.t.section_begin, self.t.call_begin]);
+                        ordinary(
+                            &mut ids,
+                            self.tokenizer,
+                            &format!("functions.fs_read:{}", self.called),
+                        );
+                        ids.push(self.t.argument_begin);
+                        ordinary(
+                            &mut ids,
+                            self.tokenizer,
+                            &format!("{{\"path\": \"file-{}\"}}", self.called),
+                        );
+                        ids.extend([self.t.call_end, self.t.section_end]);
+                        self.called += 1;
+                    } else {
+                        ordinary(&mut ids, self.tokenizer, "Done.");
+                    }
+                }
+                ids.push(self.t.end);
+                self.queue = ids.into();
+            }
+            self.shown = context.len();
+            self.queue.pop_front().unwrap()
+        }
+    }
+
+    #[test]
+    fn a_long_turn_flows_through_handoffs_instead_of_filling_the_context() {
+        const CONTEXT: usize = 8192;
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let mut script = FlowScript {
+            tokenizer: &tokenizer,
+            t,
+            rounds: 200,
+            called: 0,
+            queue: std::collections::VecDeque::default(),
+            longest: 0,
+            shown: 0,
+            rebuilt: Vec::new(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let transcript =
+            Transcript::create(dir.path(), "kimi-linear", std::path::Path::new("/m")).unwrap();
+        let log = transcript.log_path().to_path_buf();
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            CONTEXT,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"Read every path for me\n/quit\n"[..],
+            &mut output,
+            |context| Ok(script.next(context)),
+            ChatOptions {
+                budget: TurnBudget {
+                    time: None,
+                    tokens: None,
+                },
+                transcript: Some(transcript),
+                resumed: None,
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        // Every call ran exactly once, in order, across several compactions.
+        let expected: Vec<String> = (0..200).map(|n| format!("\"file-{n}\"")).collect();
+        assert_eq!(*ran.borrow(), expected);
+        assert!(output.contains("Done."));
+        assert!(!output.contains("Context full"));
+        let compactions = output.matches("[context rebuilt from the handoff").count();
+        assert!(compactions >= 2, "{compactions} compactions");
+        // Only a handoff is ever written above the compaction line; the context never fills.
+        assert!(script.longest < CONTEXT, "{}", script.longest);
+        assert!(!script.rebuilt.is_empty());
+        for context in &script.rebuilt {
+            assert!(context.contains(HANDOFF));
+            assert!(context.contains("Read every path for me"));
+            // The reply whose results were still to come was carried over.
+            assert!(context.contains("functions.fs_read:"), "{context}");
+        }
+        let log = std::fs::read_to_string(log).unwrap();
+        assert_eq!(log.matches("\"event\":\"compaction\"").count(), compactions);
+    }
+
+    #[test]
+    fn a_saved_chat_stopped_at_the_context_limit_resumes_through_a_handoff() {
+        const CONTEXT: usize = 8192;
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let (tools, ran) = stepping_tools(None);
+        let cancel = AtomicBool::new(false);
+        // Jay's request, one tool round whose result nearly fills the context, and a reply
+        // cut off by the limit after five tokens: how Kimi's 2026-10-02 turn was saved.
+        let mut session = Session::new(CONTEXT).unwrap();
+        session
+            .begin_turn(&format.prompt(&tokenizer, "Add the waves", true, Some(&tools)))
+            .unwrap();
+        let mut call = stepping_replies(&tokenizer, t, 1, 1);
+        session
+            .generate(
+                200,
+                &[t.end],
+                &cancel,
+                |_| Ok(call.next().unwrap()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let result = |text: String| {
+            format.tool_results(
+                &tokenizer,
+                &[("functions.fs_read:00".into(), "fs_read".into(), text)],
+            )
+        };
+        let filler = CONTEXT - 5 - session.tokens().len() - result(String::new()).len();
+        session.begin_turn(&result("x".repeat(filler))).unwrap();
+        let reply_start = session.tokens().len();
+        let stop = session
+            .generate(200, &[t.end], &cancel, |_| Ok(u32::from(b'L')), |_| Ok(()))
+            .unwrap();
+        assert_eq!(stop.reason, StopReason::ContextLimit);
+
+        let mut script = FlowScript {
+            tokenizer: &tokenizer,
+            t,
+            rounds: 1,
+            called: 0,
+            queue: std::collections::VecDeque::default(),
+            longest: 0,
+            shown: 0,
+            rebuilt: Vec::new(),
+        };
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            Some(&tools),
+            &tokenizer,
+            CONTEXT,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"/continue\n/stats\n/quit\n"[..],
+            &mut output,
+            |context| Ok(script.next(context)),
+            ChatOptions {
+                resumed: Some(Resumed {
+                    session,
+                    reply_start,
+                    held: None,
+                }),
+                ..ChatOptions::default()
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("[context rebuilt from the handoff: 8192 ->"),
+            "{output}"
+        );
+        assert!(!output.contains("Context full"), "{output}");
+        assert!(output.contains("Done."), "{output}");
+        assert_eq!(*ran.borrow(), ["\"file-0\""]);
+        // The rebuilt context opens the reply again: the request and the handoff, without
+        // the cut-off reply or the result too large to carry.
+        let rebuilt = &script.rebuilt[0];
+        assert!(rebuilt.contains(HANDOFF) && rebuilt.contains("Add the waves"));
+        assert!(rebuilt.ends_with("assistant") && !rebuilt.contains("LLLLL"));
+        assert!(!rebuilt.contains("xxxx"));
+    }
+
+    #[test]
+    fn a_new_message_into_a_crowded_context_starts_from_a_handoff() {
+        const CONTEXT: usize = 8192;
+        let tokenizer = tiny_tokenizer();
+        let format = tiny_linear_format();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = Session::new(CONTEXT).unwrap();
+        session
+            .begin_turn(&format.prompt(&tokenizer, "Remember the blue door", true, None))
+            .unwrap();
+        let mut long = std::iter::repeat_n(u32::from(b'y'), 6200).chain([t.end]);
+        session
+            .generate(
+                7000,
+                &[t.end],
+                &cancel,
+                |_| Ok(long.next().unwrap()),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let reply_start = session.tokens().len();
+        let mut script = FlowScript {
+            tokenizer: &tokenizer,
+            t,
+            rounds: 0,
+            called: 0,
+            queue: std::collections::VecDeque::default(),
+            longest: 0,
+            shown: 0,
+            rebuilt: Vec::new(),
+        };
+        let mut output = Vec::new();
+        run_with(
+            &format,
+            None,
+            &tokenizer,
+            CONTEXT,
+            200,
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            &b"And now?\n/undo\n/quit\n"[..],
+            &mut output,
+            |context| Ok(script.next(context)),
+            ChatOptions {
+                resumed: Some(Resumed {
+                    session,
+                    reply_start,
+                    held: None,
+                }),
+                ..ChatOptions::default()
+            },
+        )
+        .unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(
+            output.contains("[context rebuilt from the handoff"),
+            "{output}"
+        );
+        assert!(output.contains("Last turn removed."), "{output}");
+        let rebuilt = &script.rebuilt[0];
+        assert!(rebuilt.contains(HANDOFF));
+        assert!(rebuilt.contains("- Remember the blue door"), "{rebuilt}");
+        assert!(rebuilt.contains("And now?") && !rebuilt.contains("yyyy"));
+    }
+
     fn reference_segments_match(tokenizer: &Tokenizer) {
         let fixtures: serde_json::Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/tokenizer/chat_segments.json"
@@ -2125,6 +2785,74 @@ mod tests {
             terminal_text("a\x1b]52;secret\x07\nb"),
             "a\\u{1b}]52;secret\\u{7}\nb"
         );
+    }
+
+    /// Compacts a real saved chat with the real tokenizer and prints what the rebuilt
+    /// context holds. No weights are read: the handoff is a fixed line.
+    /// `KIMI_FLOW_STATE=<chat>.state.json cargo test -p kimi-k3-cli -- --ignored --nocapture a_real_saved_chat`
+    #[test]
+    #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files and KIMI_FLOW_STATE"]
+    fn a_real_saved_chat_compacts_within_the_context() {
+        let dir = std::env::var("KIMI_LINEAR_CHECKPOINT").expect("set checkpoint directory");
+        let tokenizer = Tokenizer::load(dir).unwrap();
+        let state = std::env::var("KIMI_FLOW_STATE").expect("set a .state.json path");
+        let state: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state).unwrap()).unwrap();
+        let numbers = |key: &str| -> Vec<usize> {
+            let list = state[key].as_array().unwrap().iter();
+            list.map(|n| usize::try_from(n.as_u64().unwrap()).unwrap())
+                .collect()
+        };
+        let max_context = numbers("tokens").len().max(32_768);
+        let session = Session::restore(
+            max_context,
+            numbers("tokens")
+                .into_iter()
+                .map(|n| u32::try_from(n).unwrap())
+                .collect(),
+            numbers("turns"),
+            state["pending"].as_bool().unwrap(),
+        )
+        .unwrap();
+        let format = ChatFormat::kimi_linear(&tokenizer, 0).unwrap();
+        let ChatFormat::KimiLinear(t) = &format else {
+            unreachable!()
+        };
+        let mut handoff = tokenizer.encode_ordinary(HANDOFF);
+        handoff.push(t.end);
+        let mut handoff = handoff.into_iter();
+        let mut read = 0;
+        let flow = Flow {
+            enabled: true,
+            max_context,
+            compacted_len: 0,
+        };
+        let compacted = compact(
+            &format,
+            None,
+            &tokenizer,
+            &session,
+            true,
+            flow,
+            &AtomicBool::new(false),
+            &mut |context: &[u32]| {
+                read = context.len();
+                Ok(handoff.next().unwrap())
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let rebuilt = compacted.session;
+        println!(
+            "{} tokens -> {} (handoff written after reading {read}); pending {}; turns {:?}\n{}",
+            session.tokens().len(),
+            rebuilt.tokens().len(),
+            rebuilt.is_pending(),
+            rebuilt.turn_starts(),
+            tokenizer.decode_lossy(rebuilt.tokens())
+        );
+        assert!(rebuilt.tokens().len() < flow.limit());
+        assert_eq!(rebuilt.is_pending(), session.is_pending());
     }
 
     // Hardware-independent mechanics are covered in loadngo-inference. This
