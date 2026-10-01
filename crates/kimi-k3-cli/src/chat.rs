@@ -1582,7 +1582,6 @@ pub fn run_with(
                             let failure = (key.clone(), error.clone());
                             write_failure_limit |= failed_writes.contains(&failure);
                             failed_writes.push(failure);
-                            write_failure_limit |= failed_writes.len() >= 3;
                         }
                         (format!("error: {error}"), false)
                     }
@@ -1622,7 +1621,7 @@ pub fn run_with(
                 // Hold results before opening a reply: /continue and a corrective
                 // user message can both consume them without an unfinished reply.
                 held = Some(calls);
-                writeln!(output, "[paused: repeated write failure or three failed writes. Fix the reported cause before /continue, or send a new instruction.]")
+                writeln!(output, "[paused: repeated write failure, the same write failing twice with the same error. Fix the reported cause before /continue, or send a new instruction.]")
                     .map_err(|e| e.to_string())?;
                 break Some("write failure limit".into());
             }

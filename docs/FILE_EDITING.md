@@ -59,8 +59,9 @@ handoff; the existing board tool adds rows but cannot remove an old claim.
 
 Failed writes are not cached as successful calls: the same arguments can be retried
 after their prerequisites change. Read the error and fix the cause first. A second
-identical write failure, or three failed writes without a successful text mutation,
-pauses the turn with all results preserved. `/continue` resumes after Jay addresses
+identical write failure (the same arguments and the same error) pauses the turn with
+all results preserved. Until 2026-10-02 three failed writes of any kind also paused it;
+that stopped Kimi while she was working past each failure (below). `/continue` resumes after Jay addresses
 the cause; a new instruction or `/undo` is also available. Successful writes retain
 duplicate-call protection so a completed mutation is never blindly replayed.
 
@@ -123,3 +124,19 @@ peer claims and files with someone else's Git changes are refused as before.
 `terminal_exec` waits up to a second for the command to exit, so a quick command
 returns its whole output and exit status in one call (it used to return at the first
 output with `running: true` and no status).
+
+## Indentation (2026-10-02)
+
+In her 06:32 turn Kimi made eight `text_edit` calls on `encounters.ron`. Five failed
+with "old_text is not in ...": each time her `old_text` was the file's lines indented
+two columns too deep. `text_read` showed lines as a right-aligned number, two spaces,
+then the text, and she copied the two spaces as indentation. She got it right only
+after `sed -n` showed her the bare lines, and the third failure paused the turn.
+
+- Lines are now shown as `number|text`, with nothing between the bar and the text
+  (loadngo `numbered_lines`, so `fs_read` and `cas_read` too).
+- When `old_text` is not in the file, `text_edit` looks for it ignoring indentation:
+  whole lines, in exactly one place, every nonblank line off by the same number of
+  columns. It then edits that place, shifts `new_text` by the same amount, and says
+  so. Two candidate places, uneven offsets, a fragment of a line, or a `new_text` that
+  cannot be shifted are refused as before.

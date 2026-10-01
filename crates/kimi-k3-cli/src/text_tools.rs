@@ -344,6 +344,75 @@ fn check_conflicts(board: &str, repo: &str, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Where `old` is in `text` when only indentation differs: whole lines that match once
+/// leading and trailing whitespace is ignored, in exactly one place, every nonblank line
+/// off by the same number of columns. Returns the byte range to replace, `new` shifted
+/// by that many columns, and the shift (file minus `old`).
+fn reindented(text: &str, old: &str, new: &str) -> Option<(std::ops::Range<usize>, String, isize)> {
+    let ends_line = old.ends_with('\n');
+    let wanted: Vec<&str> = old.strip_suffix('\n').unwrap_or(old).split('\n').collect();
+    if wanted.iter().all(|line| line.trim().is_empty()) {
+        return None;
+    }
+    // Each file line: where it starts, and its text without the line ending.
+    let mut lines = Vec::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        lines.push((at, line.trim_end_matches(['\n', '\r'])));
+        at += line.len();
+    }
+    let mut places = (0..(lines.len() + 1).saturating_sub(wanted.len())).filter(|&first| {
+        wanted
+            .iter()
+            .zip(&lines[first..])
+            .all(|(want, (_, have))| want.trim() == have.trim())
+    });
+    let first = places.next()?;
+    if places.next().is_some() {
+        return None;
+    }
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let signed = |columns: usize| isize::try_from(columns).unwrap_or(isize::MAX);
+    let mut shifts = wanted
+        .iter()
+        .zip(&lines[first..])
+        .filter(|(want, _)| !want.trim().is_empty())
+        .map(|(want, (_, have))| signed(indent(have)) - signed(indent(want)));
+    let by = shifts.next()?;
+    if shifts.any(|shift| shift != by) {
+        return None;
+    }
+    let pad = lines[first..first + wanted.len()]
+        .iter()
+        .find_map(|(_, have)| have.chars().next().filter(|c| c.is_whitespace()))
+        .unwrap_or(' ');
+    let mut shifted = String::with_capacity(new.len());
+    for line in new.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            shifted.push_str(line);
+        } else if by >= 0 {
+            shifted.extend(std::iter::repeat_n(pad, by.unsigned_abs()));
+            shifted.push_str(line);
+        } else {
+            // A line of new_text with less indentation than is to be removed cannot be
+            // placed; the edit is refused instead of guessed.
+            let cut = by.unsigned_abs();
+            if indent(line) < cut || !line.is_char_boundary(cut) {
+                return None;
+            }
+            shifted.push_str(&line[cut..]);
+        }
+    }
+    let (last_start, last) = lines[first + wanted.len() - 1];
+    let mut end = last_start + last.len();
+    if ends_line {
+        end = lines
+            .get(first + wanted.len())
+            .map_or(text.len(), |next| next.0);
+    }
+    Some((lines[first].0..end, shifted, by))
+}
+
 struct TextRead(Rc<Workspace>);
 struct TextWrite(Rc<Workspace>);
 struct TextEdit(Rc<Workspace>);
@@ -353,7 +422,7 @@ impl Tool for TextRead {
         "text_read"
     }
     fn description(&self) -> &'static str {
-        "Read a workspace UTF-8 text file and its revision before editing. Numbered text, at most 16 KiB."
+        "Read a workspace UTF-8 text file and its revision before editing. Each line is shown as number|text; the text, with its indentation, starts right after the bar. At most 16 KiB."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"line_start":{"type":"integer"},"line_count":{"type":"integer"}},"required":["path"]})
@@ -401,7 +470,7 @@ impl Tool for TextEdit {
         "text_edit"
     }
     fn description(&self) -> &'static str {
-        "Edit a workspace UTF-8 text file, including root files, with one exact old_text/new_text replacement. text_read the file first; revision is optional and defaults to the one text_read last showed. Root AGENTS.md/CLAUDE.md protected; refuses stale reads, peer conflicts and pre-existing Git changes."
+        "Edit a workspace UTF-8 text file, including root files, with one old_text/new_text replacement. old_text is whole text copied from the file, without line numbers; if only its indentation differs and it matches one place, the edit is applied there and new_text is shifted to fit. text_read the file first; revision is optional and defaults to the one text_read last showed. Root AGENTS.md/CLAUDE.md protected; refuses stale reads, peer conflicts and pre-existing Git changes."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"revision":{"type":"string"},"old_text":{"type":"string"},"new_text":{"type":"string"}},"required":["path","old_text","new_text"]})
@@ -440,6 +509,19 @@ impl Tool for TextEdit {
         match (old.is_empty(), text.matches(old).count()) {
             (true, _) => return Err("old_text must be nonempty".into()),
             (false, 0) => {
+                if let Some((range, shifted, by)) = reindented(&text, old, new) {
+                    let mut edited = text.clone();
+                    edited.replace_range(range, &shifted);
+                    return self.0.publish(name, &edited, Some(&text)).map(|done| {
+                        format!(
+                            "{done}. old_text matched one place once indentation was \
+                             ignored (the file's is {by} column(s) {}); new_text was shifted \
+                             to fit",
+                            if by < 0 { "shallower" } else { "deeper" },
+                            by = by.abs()
+                        )
+                    });
+                }
                 return Err(format!(
                     "old_text is not in {name}: text_read the lines you mean to change and \
                      copy them exactly, including indentation"
@@ -692,7 +774,7 @@ mod tests {
             .call("text_read", r#"{"path":"demo/src/lib.rs"}"#)
             .unwrap();
         assert!(read.contains(&CasHash::digest(ORIGINAL.as_bytes()).to_hex()));
-        assert!(read.contains("1  pub fn value"));
+        assert!(read.contains("1|pub fn value"));
         edit(&toolbox, ORIGINAL, "{ 1 }", "{ 2 }").unwrap();
         let next = ORIGINAL.replace("{ 1 }", "{ 2 }");
         edit(&toolbox, &next, "{ 2 }", "{ 3 }").unwrap();
@@ -827,6 +909,57 @@ mod tests {
         assert!(check_conflicts(&rows, "demo", "src/lib.rs").is_err());
         let split = rows.replace("as listed", "src/other.rs");
         assert!(check_conflicts(&split, "demo", "src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn old_text_with_the_wrong_indentation_is_placed_and_new_text_shifted_to_fit() {
+        // Kimi's 2026-10-02 edit: the file's lines, each copied two columns too deep.
+        let file = "formations: [\n    enemies: [\n        (rusher),\n        (ranged),\n    ],\n    waves: [\n    ],\n]\n";
+        let old = "      enemies: [\n          (rusher),\n          (ranged),\n      ],";
+        let new = "      enemies: [\n          (ranged),\n          (rusher),\n\n          (rusher),\n      ],";
+        let (range, shifted, by) = reindented(file, old, new).unwrap();
+        assert_eq!(by, -2);
+        assert_eq!(
+            &file[range.clone()],
+            "    enemies: [\n        (rusher),\n        (ranged),\n    ],"
+        );
+        assert_eq!(
+            shifted,
+            "    enemies: [\n        (ranged),\n        (rusher),\n\n        (rusher),\n    ],"
+        );
+        // Too shallow works the same way, and a trailing newline takes the line ending.
+        let (range, shifted, by) = reindented(file, "waves: [\n],\n", "waves: [],\n").unwrap();
+        assert_eq!((by, shifted.as_str()), (4, "    waves: [],\n"));
+        assert_eq!(&file[range], "    waves: [\n    ],\n");
+        // Refused: two places, lines off by different amounts, a fragment of a line,
+        // and new_text that cannot lose the indentation.
+        assert!(reindented("  a\n  b\n  a\n", "a", "c").is_none());
+        assert!(reindented(file, "  enemies: [\n          (rusher),", "x").is_none());
+        assert!(reindented(file, "  (rusher", "x").is_none());
+        assert!(reindented(file, old, "enemies: []").is_none());
+
+        let (root, toolbox) = fixture();
+        let path = root.path().join("demo/src/lib.rs");
+        fs::write(&path, "fn a() {\n    one();\n}\n").unwrap();
+        git(
+            &root.path().join("demo"),
+            &["commit", "--quiet", "-am", "indented"],
+        );
+        toolbox
+            .call("text_read", &json!({"path":"demo/src/lib.rs"}).to_string())
+            .unwrap();
+        let done = toolbox
+            .call(
+                "text_edit",
+                &json!({"path":"demo/src/lib.rs","old_text":"      one();","new_text":"      two();"})
+                    .to_string(),
+            )
+            .unwrap();
+        assert!(done.contains("2 column(s) shallower"), "{done}");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "fn a() {\n    two();\n}\n"
+        );
     }
 
     #[test]
