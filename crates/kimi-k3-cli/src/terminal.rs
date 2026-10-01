@@ -347,10 +347,17 @@ impl Terminal {
             proactor: handle,
         });
         drop(slot);
-        self.read(id, 1000)
+        // A command that finishes within a second returns its whole output and status at
+        // once; a longer one returns what it has printed so far.
+        self.read_until(id, 1000, true)
     }
 
     fn read(&self, id: u64, wait_ms: u64) -> Result<String, String> {
+        self.read_until(id, wait_ms, false)
+    }
+
+    /// Waits up to `wait_ms` for output or exit, or with `for_exit` for exit alone.
+    fn read_until(&self, id: u64, wait_ms: u64, for_exit: bool) -> Result<String, String> {
         let slot = self.session.borrow();
         let session = slot
             .as_ref()
@@ -360,7 +367,7 @@ impl Terminal {
         let state = lock.lock().map_err(|e| e.to_string())?;
         let (mut state, _) = changed
             .wait_timeout_while(state, Duration::from_millis(wait_ms), |s| {
-                s.bytes.is_empty() && s.exit.is_none()
+                (for_exit || s.bytes.is_empty()) && s.exit.is_none()
             })
             .map_err(|e| e.to_string())?;
         let count = PAGE.min(state.bytes.len());
@@ -525,6 +532,20 @@ mod tests {
                 json!({"session_id":result["session_id"],"wait_ms":100}),
             );
         }
+    }
+
+    #[test]
+    fn a_quick_command_returns_its_output_and_exit_status_in_one_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tools(dir.path()).unwrap();
+        let done = call(
+            &tools,
+            "terminal_exec",
+            json!({"command":"printf 'bad flag\\n' >&2; sleep 0.2; exit 3"}),
+        );
+        assert_eq!(done["running"], false, "{done}");
+        assert_eq!(done["output"], "bad flag\n");
+        assert!(done["status"].as_str().unwrap().contains('3'), "{done}");
     }
 
     #[test]

@@ -103,6 +103,7 @@ struct Args {
     locale: String,
     budget: chat::TurnBudget,
     no_transcript: bool,
+    no_checkpoint: bool,
     resume: Option<String>,
 }
 
@@ -142,6 +143,7 @@ impl Args {
         let mut locale = String::from("en-US");
         let mut budget = chat::TurnBudget::default();
         let mut no_transcript = false;
+        let mut no_checkpoint = false;
         let mut resume = None;
 
         if env::args().len() <= 1 {
@@ -211,6 +213,7 @@ impl Args {
                     budget.tokens = (tokens > 0).then_some(tokens);
                 }
                 "--no-transcript" => no_transcript = true,
+                "--no-checkpoint" => no_checkpoint = true,
                 "--resume" => resume = Some(next_value(&mut raw, "--resume")?),
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
@@ -285,6 +288,7 @@ impl Args {
             locale,
             budget,
             no_transcript,
+            no_checkpoint,
             resume,
         })
     }
@@ -295,7 +299,7 @@ fn chat_options(
     args: &Args,
     format: &'static str,
     max_context: usize,
-) -> Result<chat::ChatOptions, String> {
+) -> Result<chat::ChatOptions<'static>, String> {
     let mut options = chat::ChatOptions {
         budget: args.budget,
         ..chat::ChatOptions::default()
@@ -404,6 +408,10 @@ fn print_usage() {
          \x20                      review, with a resume snapshot beside it (<time>.state.json)\n\
          \x20 --resume latest|PATH optional, chat: carry on a saved chat (the newest, or a\n\
          \x20                      .jsonl/.state.json path) from its exact history\n\
+         \x20 --no-checkpoint      optional, Kimi Linear chat: when the context is rebuilt from\n\
+         \x20                      Kimi's handoff, do not ask the typed System One questions\n\
+         \x20                      about where the turn stands (they are shown and saved; nothing\n\
+         \x20                      acts on them yet)\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\

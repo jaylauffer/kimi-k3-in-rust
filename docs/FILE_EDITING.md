@@ -107,3 +107,19 @@ directory ending in `/`; anything else is treated as the whole repository.
 Validation of `.md`/`.txt` (2026-09-29, Claude Code): a new test creates, reads and
 edits one file of each type, and checks that a peer claim naming a Markdown file
 blocks only that file. fmt, strict Clippy and the workspace tests pass on macOS.
+
+## Paths (2026-10-02)
+
+`text_read`, `text_edit` and `text_write` take a workspace path in any of the forms the
+other tools show: `sng-roguelite/crates/x.rs`, `./sng-roguelite/crates/x.rs`,
+`/Users/jay/pudding/sng-roguelite/crates/x.rs`, and `..` that stays inside the
+workspace. Before this an absolute path that `fs_read` had just accepted was refused,
+and Kimi fell back to `sed` (five failed calls in her 2026-10-02 turn). A path outside
+the workspace is refused by name. A path that does not exist says so and, when a
+repository holds a file at that path, names it (`src/lib.rs` -> "Did you mean
+demo/src/lib.rs?"). Hidden and build directories, symlinks, root `AGENTS.md`/`CLAUDE.md`,
+peer claims and files with someone else's Git changes are refused as before.
+
+`terminal_exec` waits up to a second for the command to exit, so a quick command
+returns its whole output and exit status in one call (it used to return at the first
+output with `running: true` and no status).

@@ -80,18 +80,33 @@ impl Workspace {
         seen.insert(path, revision);
     }
 
+    /// The file a tool's `path` names. Paths start at the workspace; an absolute path
+    /// inside it (what `fs_read` and `fs_find` show) and `.`/`..` that stay inside it
+    /// mean the same file.
     fn resolve(&self, path: &str) -> Result<PathBuf, String> {
-        let relative = Path::new(path);
+        let given = Path::new(path);
+        let relative = given.strip_prefix(&self.root).unwrap_or(given);
         let mut real = self.root.clone();
-        let parts: Vec<_> = relative.components().collect();
+        let mut parts = Vec::new();
+        for part in relative.components() {
+            match part {
+                Component::CurDir => {}
+                Component::Normal(name) => parts.push(name),
+                Component::ParentDir if parts.pop().is_some() => {}
+                _ => {
+                    return Err(format!(
+                        "{path} is outside the workspace {}; these tools only reach files \
+                         inside it",
+                        self.root.display()
+                    ));
+                }
+            }
+        }
         if parts.is_empty() {
             return Err("empty path".into());
         }
         for (index, part) in parts.iter().enumerate() {
-            let Component::Normal(name) = part else {
-                return Err("use a workspace-relative path without .. or absolute prefixes".into());
-            };
-            let name = name.to_string_lossy();
+            let name = part.to_string_lossy();
             if name.starts_with('.') || matches!(name.as_ref(), "target" | "node_modules") {
                 return Err("hidden and build directories are not writable".into());
             }
@@ -108,10 +123,49 @@ impl Workspace {
                 }
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound && index + 1 == parts.len() => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(self.missing(path, &parts.iter().collect::<PathBuf>()));
+                }
                 Err(e) => return Err(err(e)),
             }
         }
         Ok(real)
+    }
+
+    /// Says that `path` does not exist and, when a repository directly under the
+    /// workspace has a file at that path, where it is: a path copied from inside a
+    /// repository lacks the repository's name.
+    fn missing(&self, path: &str, relative: &Path) -> String {
+        let mut found: Vec<String> = fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+            .map(|entry| Path::new(&entry.file_name()).join(relative))
+            .filter(|candidate| self.root.join(candidate).is_file())
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        if found.is_empty() {
+            format!(
+                "{path} does not exist; paths start at the workspace, with the repository's name first"
+            )
+        } else {
+            format!(
+                "{path} does not exist; paths start at the workspace. Did you mean {}?",
+                found.join(" or ")
+            )
+        }
+    }
+
+    /// [`Self::resolve`] for a file that must already exist.
+    fn existing(&self, path: &str) -> Result<PathBuf, String> {
+        let real = self.resolve(path)?;
+        if real.exists() {
+            Ok(real)
+        } else {
+            Err(self.missing(path, real.strip_prefix(&self.root).unwrap_or(&real)))
+        }
     }
 
     fn authorize(&self, path: &Path, previous: Option<CasHash>) -> Result<(), String> {
@@ -306,7 +360,7 @@ impl Tool for TextRead {
     }
     fn call(&self, args: &Value) -> Result<String, String> {
         let name = string(args, "path")?;
-        let path = self.0.resolve(name)?;
+        let path = self.0.existing(name)?;
         let text = read(&path)?;
         let revision = CasHash::digest(text.as_bytes());
         self.0.remember(path, revision);
@@ -354,7 +408,7 @@ impl Tool for TextEdit {
     }
     fn call(&self, args: &Value) -> Result<String, String> {
         let name = string(args, "path")?;
-        let path = self.0.resolve(name)?;
+        let path = self.0.existing(name)?;
         let text = read(&path)?;
         let current = CasHash::digest(text.as_bytes());
         // Kimi text_read the file, got its revision, then sent the edit without it. The
@@ -773,6 +827,44 @@ mod tests {
         assert!(check_conflicts(&rows, "demo", "src/lib.rs").is_err());
         let split = rows.replace("as listed", "src/other.rs");
         assert!(check_conflicts(&split, "demo", "src/lib.rs").is_ok());
+    }
+
+    #[test]
+    fn a_path_inside_the_workspace_works_in_any_form_and_a_missing_one_says_where_it_is() {
+        let (root, toolbox) = fixture();
+        let absolute = root.path().canonicalize().unwrap().join("demo/src/lib.rs");
+        for path in [
+            absolute.to_str().unwrap(),
+            "./demo/src/lib.rs",
+            "demo/src/../src/lib.rs",
+        ] {
+            let shown = toolbox
+                .call("text_read", &json!({"path": path}).to_string())
+                .unwrap();
+            assert!(shown.contains("pub fn value"), "{path}: {shown}");
+        }
+        // Read by its absolute path, edited without a revision by its relative one.
+        toolbox
+            .call(
+                "text_edit",
+                &json!({"path":"demo/src/lib.rs","old_text":"1","new_text":"2"}).to_string(),
+            )
+            .unwrap();
+        // The path as a command run inside the repository shows it.
+        for (tool, arguments) in [
+            ("text_read", json!({"path":"src/lib.rs"})),
+            (
+                "text_edit",
+                json!({"path":"src/lib.rs","old_text":"2","new_text":"3"}),
+            ),
+        ] {
+            let error = toolbox.call(tool, &arguments.to_string()).unwrap_err();
+            assert!(error.contains("Did you mean demo/src/lib.rs?"), "{error}");
+        }
+        let error = toolbox
+            .call("text_read", &json!({"path":"/etc/hosts"}).to_string())
+            .unwrap_err();
+        assert!(error.contains("outside the workspace"), "{error}");
     }
 
     #[test]

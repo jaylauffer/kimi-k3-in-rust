@@ -89,12 +89,39 @@ is shown on the terminal as she writes it. `/undo` after a compaction removes th
 whole rebuilt turn; file changes are not reversed. K3 chats (512 tokens) are not
 compacted.
 
+### Checkpoint (System One, shadow mode)
+
+After each compaction the same model is asked three typed questions about Jay's
+request and the handoff she just wrote (loadngo `system_one`; see loadngo
+`docs/SYSTEM_ONE.md`, "Checkpoints and the Task model"). Nothing is generated: each
+answer is a probability per option, read from one forward pass.
+
+| Question | Type | Options |
+|---|---|---|
+| `state` | choice | `in-progress`, `blocked`, `complete` |
+| `repeating` | true/false | the notes show the same action failing more than once |
+| `progress` | score | 0 nothing done, 1 only read, 2 partly changed, 3 changed and checked |
+
+The answers are shown on one line and saved as a `checkpoint` event (`request`,
+`handoff`, `answers`, `observed`, `seconds`). **Nothing acts on them**: the turn goes on
+whatever they say. `observed.identical_calls` is counted by the program (calls made
+with a name and arguments already used since the last checkpoint), so `repeating` can
+be compared with what happened without anyone labelling it. `--no-checkpoint` turns
+the questions off.
+
+It is in shadow mode because the probabilities have not been measured on this kind of
+decision, and because the model is judging notes it wrote itself. A wrong `blocked`
+would stop good work; a wrong `in-progress` would be false comfort. The saved events
+are what a threshold will be set from.
+
 Checked 2026-10-02 on macOS with scripted replies: a 200-round turn in an 8192-token
 context runs every call once across several compactions and never fills; a chat saved
 at the limit mid-reply continues after `/continue`; a new message into a crowded
 context starts from a handoff. Kimi's saved 2026-10-02 chat (32768/32768, mid-reply)
 rebuilds to 3438 tokens plus the tool declarations, with the real tokenizer and a
-fixed handoff line. The handoffs the model itself writes have not been judged yet.
+fixed handoff line. The checkpoint is asked once per compaction, over the request and
+the handoff, and saved (scripted answers). Neither the handoffs the model writes nor
+its checkpoint answers have been run on the model yet.
 
 Since 2026-10-01, failed writes can be retried after fixing the reported cause;
 they are not treated as successful duplicate mutations. The same write failing

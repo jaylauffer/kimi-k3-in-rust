@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kimi_k3_core::tokenizer::Tokenizer;
+use loadngo_inference::system_one::{Answer, Question, Request};
 use loadngo_inference::{Session, StopReason, Utf8Stream, tools::Toolbox};
 use serde_json::json;
 
@@ -458,7 +459,8 @@ Use these to inspect repositories and run builds/tests. Read command exit status
 claiming success; report checks not run. Commands run with your OS user's permissions, \
 including filesystem writes and network access: follow Jay's scope and shared-work claims. \
 Never push, publish, delete user data, or alter another agent's work without Jay's authorization. \
-Prefer text_edit for claimed source changes. File edits and command side effects survive \
+Change source with text_read and text_edit, not shell commands: they take the same \
+paths fs_read shows. This Mac's sed, grep and find are the BSD ones. File edits and command side effects survive \
 /undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
 successful edit you may read the updated file again. A failed edit did not change the file: \
 read its error, correct its path, revision or exact text, and retry only after fixing the cause. \
@@ -539,14 +541,21 @@ impl Held {
     }
 }
 
+/// Answers a System One request about the turn: a probability for every option of every
+/// question, read from the model without generating anything.
+pub type Decide<'a> = Box<dyn FnMut(&Request) -> Result<Vec<(String, Answer)>, String> + 'a>;
+
 /// How a chat is budgeted, saved and started.
 #[derive(Default)]
-pub struct ChatOptions {
+pub struct ChatOptions<'a> {
     pub budget: TurnBudget,
     /// Where the chat is saved; `None` keeps it in memory only.
     pub transcript: Option<Transcript>,
     /// A saved chat to carry on from.
     pub resumed: Option<Resumed>,
+    /// Asked where the turn stands at each compaction (shadow mode: the answers are shown
+    /// and saved, and nothing acts on them). `None` asks nothing.
+    pub checkpoint: Option<Decide<'a>>,
 }
 
 /// A reply is ending in a loop once its last tokens are at least this many copies of one
@@ -732,9 +741,114 @@ impl Flow {
     }
 }
 
+/// The typed questions asked about a turn when its context is compacted. The state is
+/// what a loadngo Task submitter would hold: the request (`TaskRequest.summary`) and the
+/// worker's latest status note (`TaskStatus.note`, here the handoff). `state` is the
+/// value `TaskStatus.state` carries, as a type instead of free text; `complete` is the
+/// claim a `TaskResult` makes, which only the submitter's `TaskAck` settles.
+fn checkpoint_request(request: &str, handoff: &str) -> Request {
+    let options = |list: &[(&str, &str)]| {
+        list.iter()
+            .map(|(label, text)| ((*label).to_string(), (*text).to_string()))
+            .collect()
+    };
+    Request {
+        state: format!("Request from Jay:\n{request}\n\nThe worker's status notes:\n{handoff}"),
+        questions: vec![
+            (
+                "state".into(),
+                Question::Choice {
+                    instructions: Some("Where does the work on Jay's request stand?".into()),
+                    criteria: options(&[
+                        (
+                            "in-progress",
+                            "Work is under way, and the notes name a next step that differs \
+                             from what already failed",
+                        ),
+                        (
+                            "blocked",
+                            "The work cannot go on without something from Jay, or the same \
+                             step keeps failing",
+                        ),
+                        (
+                            "complete",
+                            "Everything Jay asked for is finished and checked",
+                        ),
+                    ]),
+                },
+            ),
+            (
+                "repeating".into(),
+                Question::Noul {
+                    instructions: "The notes show the same action failing more than once.".into(),
+                },
+            ),
+            (
+                "progress".into(),
+                Question::Score {
+                    instructions: Some("How far has the work on Jay's request come?".into()),
+                    criteria: options(&[
+                        ("0", "Nothing towards the request has been done"),
+                        ("1", "Files were read or explored, and nothing was changed"),
+                        ("2", "Part of the requested change has been made"),
+                        ("3", "The requested change has been made and checked"),
+                    ]),
+                },
+            ),
+        ],
+    }
+}
+
+/// Asks `decide` where the turn stands, shows the answers and saves them with what the
+/// program itself counted (`identical_calls`), which later tells how well they held up.
+fn checkpoint(
+    decide: &mut Decide<'_>,
+    request: &str,
+    handoff: &str,
+    identical_calls: usize,
+    output: &mut impl Write,
+    transcript: &mut Option<Transcript>,
+) {
+    let started = Instant::now();
+    match decide(&checkpoint_request(request, handoff)) {
+        Ok(answers) => {
+            let shown: Vec<String> = answers
+                .iter()
+                .map(|(id, answer)| {
+                    let (best, p) = answer.best();
+                    format!("{id} {best} {:.0}%", p * 100.0)
+                })
+                .collect();
+            let _ = writeln!(
+                output,
+                "[checkpoint, shadow: {}; {identical_calls} identical call(s) counted; \
+                 nothing acts on this]",
+                shown.join(", ")
+            );
+            log(
+                transcript,
+                json!({
+                    "event": "checkpoint",
+                    "mode": "shadow",
+                    "request": request,
+                    "handoff": handoff,
+                    "answers": loadngo_inference::system_one::response_json(&answers)["answers"],
+                    "observed": {"identical_calls": identical_calls},
+                    "seconds": started.elapsed().as_secs_f64(),
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = writeln!(output, "[checkpoint not answered: {error}]");
+        }
+    }
+}
+
 struct Compacted {
     session: Session,
     handoff: String,
+    /// Jay's latest message, word for word.
+    request: Option<String>,
     /// Tokens Kimi generated for the handoff.
     generated: usize,
 }
@@ -856,6 +970,7 @@ fn compact(
         handoff = tokenizer.decode_lossy(text).trim().to_string();
     }
 
+    let request = said.last().map(|(_, text)| text.clone());
     let latest = if in_turn {
         Some(
             said.pop()
@@ -926,6 +1041,7 @@ fn compact(
     Ok(Compacted {
         session,
         handoff,
+        request,
         generated,
     })
 }
@@ -944,6 +1060,8 @@ fn flow_now(
     next: &mut impl FnMut(&[u32]) -> Result<u32, String>,
     output: &mut impl Write,
     transcript: &mut Option<Transcript>,
+    decide: &mut Option<Decide<'_>>,
+    identical_calls: &mut usize,
 ) -> Option<usize> {
     let before = session.tokens().len();
     match compact(
@@ -967,6 +1085,18 @@ fn flow_now(
                 "[context rebuilt from the handoff: {before} -> {} tokens]",
                 session.tokens().len()
             );
+            if let (Some(decide), Some(request)) = (decide, &compacted.request)
+                && !compacted.handoff.is_empty()
+            {
+                checkpoint(
+                    decide,
+                    request,
+                    &compacted.handoff,
+                    std::mem::take(identical_calls),
+                    output,
+                    transcript,
+                );
+            }
             Some(compacted.generated)
         }
         Err(error) => {
@@ -987,7 +1117,7 @@ pub fn run(
     input: impl BufRead,
     output: impl Write,
     next: impl FnMut(&[u32]) -> Result<u32, String>,
-    options: ChatOptions,
+    options: ChatOptions<'_>,
 ) -> Result<(), String> {
     validate(tokenizer)?;
     run_with(
@@ -1023,13 +1153,18 @@ pub fn run_with(
     mut input: impl BufRead,
     mut output: impl Write,
     mut next: impl FnMut(&[u32]) -> Result<u32, String>,
-    options: ChatOptions,
+    options: ChatOptions<'_>,
 ) -> Result<(), String> {
     let ChatOptions {
         budget,
         mut transcript,
         resumed,
+        checkpoint: mut decide,
     } = options;
+    // Calls Kimi made with a name and arguments she had already used since the last
+    // checkpoint: what the program can count itself to hold the checkpoint's answers to.
+    let mut identical_calls = 0;
+    let mut calls_made: Vec<(String, serde_json::Value)> = Vec::new();
     let was_resumed = resumed.is_some();
     // `reply_start`: where the latest assistant message begins, so a reply continued
     // after a pause is read for tool calls as a whole. `held`: calls not yet run.
@@ -1175,6 +1310,8 @@ pub fn run_with(
                         &mut next,
                         &mut output,
                         &mut transcript,
+                        &mut decide,
+                        &mut identical_calls,
                     )
                     .is_some()
                 {
@@ -1185,6 +1322,7 @@ pub fn run_with(
                     continue;
                 }
                 held = None;
+                (identical_calls, calls_made) = (0, Vec::new());
                 reply_start = session.tokens().len();
                 reply.clear();
                 log(&mut transcript, json!({"event": "user", "text": text}));
@@ -1286,6 +1424,8 @@ pub fn run_with(
                         &mut next,
                         &mut output,
                         &mut transcript,
+                        &mut decide,
+                        &mut identical_calls,
                     )
                 {
                     turn_tokens += spent;
@@ -1363,6 +1503,11 @@ pub fn run_with(
                 let (id, arguments) = calls.remaining.remove(0);
                 let name = tool_name(&id).to_string();
                 let key = call_key(&name, &arguments);
+                if calls_made.contains(&key) {
+                    identical_calls += 1;
+                } else {
+                    calls_made.push(key.clone());
+                }
                 log(
                     &mut transcript,
                     json!({"event": "tool_call", "name": name, "arguments": arguments}),
@@ -1467,6 +1612,8 @@ pub fn run_with(
                     &mut next,
                     &mut output,
                     &mut transcript,
+                    &mut decide,
+                    &mut identical_calls,
                 )
             {
                 turn_tokens += spent;
@@ -2016,7 +2163,7 @@ mod tests {
                 tokens: Some(1),
             },
             transcript: Some(transcript),
-            resumed: None,
+            ..ChatOptions::default()
         };
         let mut output = Vec::new();
         run_with(
@@ -2256,6 +2403,7 @@ mod tests {
         let transcript =
             Transcript::create(dir.path(), "kimi-linear", std::path::Path::new("/m")).unwrap();
         let log = transcript.log_path().to_path_buf();
+        let asked = std::cell::RefCell::new(Vec::new());
         let mut output = Vec::new();
         run_with(
             &format,
@@ -2275,6 +2423,20 @@ mod tests {
                 },
                 transcript: Some(transcript),
                 resumed: None,
+                // A scripted System One model: sure of everything it is asked.
+                checkpoint: Some(Box::new(|request| {
+                    asked.borrow_mut().push(request.state.clone());
+                    Ok(request
+                        .questions
+                        .iter()
+                        .map(|(id, question)| {
+                            let mut options = question.options().into_iter();
+                            let mut probabilities = vec![(options.next().unwrap().0, 0.9)];
+                            probabilities.extend(options.map(|(label, _)| (label, 0.0)));
+                            (id.clone(), Answer { probabilities })
+                        })
+                        .collect())
+                })),
             },
         )
         .unwrap();
@@ -2297,6 +2459,28 @@ mod tests {
         }
         let log = std::fs::read_to_string(log).unwrap();
         assert_eq!(log.matches("\"event\":\"compaction\"").count(), compactions);
+        // Each compaction was followed by a checkpoint over Jay's request and her handoff,
+        // shown and saved, and the turn went on whatever it said.
+        assert_eq!(asked.borrow().len(), compactions);
+        for state in asked.borrow().iter() {
+            assert!(state.contains("Read every path for me") && state.contains(HANDOFF));
+        }
+        assert_eq!(
+            output
+                .matches("[checkpoint, shadow: state in-progress 90%, repeating true 90%, progress 0 90%; 0 identical call(s) counted")
+                .count(),
+            compactions,
+            "{output}"
+        );
+        let saved: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|event: &serde_json::Value| event["event"] == "checkpoint")
+            .collect();
+        assert_eq!(saved.len(), compactions);
+        assert_eq!(saved[0]["mode"], "shadow");
+        assert!(saved[0]["answers"]["state"]["blocked"].is_number());
+        assert_eq!(saved[0]["observed"]["identical_calls"], 0);
     }
 
     #[test]

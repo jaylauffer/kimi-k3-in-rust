@@ -261,7 +261,7 @@ pub fn run(
         if args.voice {
             format = format.with_note(VOICE_NOTE);
         }
-        let options = crate::chat_options(args, format.name(), max_context)?;
+        let mut options = crate::chat_options(args, format.name(), max_context)?;
         let tools = toolbox(args);
         let tools = Some(&tools).filter(|t| !t.is_empty());
         // Every conversation opens with the same tool declarations (~800 tokens, about a
@@ -293,6 +293,26 @@ pub fn run(
         );
         let mut last: Option<Vec<f32>> = None;
         let (input, output) = chat_io(args)?;
+        // The chat and its checkpoints take turns with the one model; a checkpoint reads
+        // its state in a session of its own, so the chat's session is not disturbed.
+        let model = std::cell::RefCell::new(&mut model);
+        if !args.no_checkpoint {
+            options.checkpoint = Some(Box::new(|request| {
+                let mut model = model.borrow_mut();
+                let mut labels = system_one::KimiLabels::new(
+                    &mut model,
+                    tokenizer,
+                    &format,
+                    device.accel(),
+                    cancel,
+                );
+                loadngo_inference::system_one::answer(
+                    &mut labels,
+                    request,
+                    loadngo_inference::system_one::Calibration::default(),
+                )
+            }));
+        }
         return chat::run_with(
             &format,
             tools,
@@ -320,6 +340,7 @@ pub fn run(
                     last.clone().ok_or("empty context")?
                 } else {
                     model
+                        .borrow_mut()
                         .feed(&mut session, new, device.accel(), keep)
                         .map_err(|e| e.to_string())?
                 };
