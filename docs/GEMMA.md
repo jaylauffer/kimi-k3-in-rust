@@ -155,6 +155,10 @@ conversion; not yet separated.
 
 ## Next
 
+Paused 2026-10-04: Jay found Gemma too slow to use, and this work would not change
+that. The assessment and the proposed direction for the local model are in
+[`ORCHESTRATION.md`](ORCHESTRATION.md). The list stays for reference:
+
 1. One GPU submission per layer, the GELU on the GPU inside it (now about 5
    submissions per layer, each ~0.4-1.3 ms of overhead when decoding).
 2. Prompt products are about 4.3 TFLOPS of fp32; the remaining CPU work in a pass
