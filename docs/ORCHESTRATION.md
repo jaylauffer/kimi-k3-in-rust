@@ -164,15 +164,14 @@ exist):
 - **Devstral Small** (24B dense, Apache 2.0): trained for coding-agent work. Dense, so
   slower to decode than the others.
 
-gpt-oss-20b is already on this Mac, in two GGUF copies (llama.cpp's format). Both have
-complete headers: 459 tensors, 24 layers, 32 experts, file type `MXFP4_MOE`.
+gpt-oss-20b is already on this Mac, as one GGUF (llama.cpp's format): 459 tensors, 24
+layers, 32 experts, file type `MXFP4_MOE`, 12.1 GB.
 
-- `~/pudding/loadngo/models/gpt-oss-20b-MXFP4_MOE.gguf`: 12.1 GB, April 19.
-  `models/` is ignored by git.
-- `~/Downloads/gpt-oss-20b-mxfp4.gguf`: 12.1 GB, April 27. It is the default model of
-  loadngo's `network/src/model_service.rs`, which runs it under `llama-server` (the
-  Zhoenus talking-head work, 2026-05-01).
-- A partial download of the same GGUF (1.7 GB, unfinished) is in the Hugging Face cache.
+- The local copy is `~/.loadngo/models/56fcc05c….gguf`, read-only. It is the verified
+  cache of loadngo's model service, which now takes its model from the Archive CAS by
+  hash (loadngo `977deb1b`, `docs/ZHOENUS_HEAD_MODEL_RUNNER.md`).
+- The newer chat template from the deleted Downloads copy is kept in this repository,
+  `tests/fixtures/gpt-oss/chat_template.jinja`.
 
 Deduplication check (2026-10-04, BLAKE3 over both files):
 
