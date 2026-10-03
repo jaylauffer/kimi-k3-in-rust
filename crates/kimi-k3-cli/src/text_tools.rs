@@ -143,7 +143,8 @@ impl Workspace {
             .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
             .map(|entry| Path::new(&entry.file_name()).join(relative))
             .filter(|candidate| self.root.join(candidate).is_file())
-            .map(|candidate| candidate.to_string_lossy().into_owned())
+            // Shown as the tools take paths, with `/` on Windows too.
+            .map(|candidate| candidate.to_string_lossy().replace('\\', "/"))
             .collect();
         found.sort();
         if found.is_empty() {
