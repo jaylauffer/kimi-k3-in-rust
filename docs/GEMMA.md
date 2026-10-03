@@ -121,14 +121,20 @@ conversions (for example `--quantize all` against `--quantize mlp`).
 
 ## The Neural Engine
 
-Nothing in this path uses it. With `--accel gpu` every weight is in GPU memory, so the
-GPU never hands work to the Neural Engine. `--accel ane` would run the products there
-through `loadngo-coreml`'s `DenseEngine`, whose predictions are synchronous, not
-proactor completions. Decoding a dense 31B reads every weight per token, and that
-engine reads weights at 24-29 GB/s against the GPU's ~180-228 GB/s, so the Neural
-Engine is a poor fit for decoding. It might suit prompts (compute-bound, each weight
-read once per 512 positions) beside GPU decoding; that needs Core ML's asynchronous
-predictions delivered as proactor work in `loadngo-coreml`, which is not built.
+Nothing in this path uses it yet. With `--accel gpu` every weight is in GPU memory, so
+the GPU never hands work to the Neural Engine. Decoding a dense 31B reads every weight
+for every token, and `loadngo-coreml`'s weight-streaming engine reads at 24-29 GB/s
+against the GPU's ~180-228 GB/s, so the Neural Engine is a poor fit for decoding.
+
+A prototype for attention exists (2026-10-03, at Jay's request): loadngo-coreml's
+`AttentionEngine` runs Gemma's grouped attention on the Neural Engine, with each
+prediction's completion delivered through the loadngo proactor. On a full window
+(a 512-position pass over the 1,536-slot ring), it takes 9.75 ms against the GPU kernel's
+21.9 ms. It runs concurrently with GPU work: 79 ms together against 141-144 ms in
+sequence. Errors are fp16-sized (RMS ~1.5e-3). Single tokens are slower than on the
+GPU. Figures and the four steps an integration would take are in loadngo
+`docs/NPU_ACCELERATION.md`, "Grouped-query attention on the Neural Engine, through the
+proactor".
 
 ## Next
 
