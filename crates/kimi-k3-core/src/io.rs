@@ -23,6 +23,10 @@ use std::{
 
 use loadngo_proactor::{IoBuf, IoResult, PlatformPort, Proactor, RawFdCompat};
 
+/// The largest range read in one operation; larger ones are split (see
+/// [`ShardFiles::read_batch`]).
+const MAX_READ: usize = 1 << 30;
+
 /// One positioned read: exactly `buffer.len()` bytes from `offset` in `shard`.
 ///
 /// The buffer's allocation travels with the read and comes back filled, so a caller
@@ -122,7 +126,50 @@ impl ShardFiles {
     /// completed before a submission error is returned, so no buffer is left with the
     /// kernel.
     pub fn read_batch(&self, requests: Vec<ReadRequest>) -> Result<Vec<Vec<u8>>, ShardIoError> {
-        self.wait_batch(self.submit_batch(requests)?)
+        if requests.iter().all(|r| r.buffer.len() <= MAX_READ) {
+            return self.wait_batch(self.submit_batch(requests)?);
+        }
+        // macOS refuses one read of more than 2 GiB (EINVAL), and Gemma 4's embedding
+        // alone is 2.8 GB: split such ranges into pieces, read them in the same batch,
+        // and join each request's pieces in order.
+        let mut pieces = Vec::new();
+        let mut counts = Vec::with_capacity(requests.len());
+        for request in requests {
+            let len = request.buffer.len();
+            if len <= MAX_READ {
+                counts.push(1);
+                pieces.push(request);
+                continue;
+            }
+            let mut at = 0;
+            let mut count = 0;
+            while at < len {
+                let n = MAX_READ.min(len - at);
+                pieces.push(ReadRequest {
+                    shard: request.shard,
+                    offset: request.offset + at as u64,
+                    buffer: vec![0; n],
+                });
+                at += n;
+                count += 1;
+            }
+            counts.push(count);
+        }
+        let mut read = self.wait_batch(self.submit_batch(pieces)?)?.into_iter();
+        Ok(counts
+            .into_iter()
+            .map(|count| {
+                if count == 1 {
+                    return read.next().unwrap_or_default();
+                }
+                let parts: Vec<Vec<u8>> = read.by_ref().take(count).collect();
+                let mut joined = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+                for part in parts {
+                    joined.extend_from_slice(&part);
+                }
+                joined
+            })
+            .collect())
     }
 
     /// Submits every request without waiting for any completion, so the operating
