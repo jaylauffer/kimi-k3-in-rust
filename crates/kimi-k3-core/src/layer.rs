@@ -149,6 +149,14 @@ pub trait DenseAccel {
         false
     }
 
+    /// Causal grouped-query attention over a ring of keys and values (see
+    /// [`GroupedJob`]). Returns false, with `out` unspecified, to decline; the caller then
+    /// computes it on the CPU and empties `job.device`.
+    #[allow(unused_variables)]
+    fn grouped_attention(&self, job: &mut GroupedJob<'_>) -> bool {
+        false
+    }
+
     /// The KDA recurrence (see [`RecurrenceJob`]). Returns false, with `out` and
     /// `state` untouched, to decline; the caller then runs it on the CPU and empties
     /// `job.device`.
@@ -313,6 +321,32 @@ pub struct AttentionJob<'a> {
     pub qn: usize,
     pub qr: usize,
     pub vh: usize,
+    pub scale: f32,
+    pub device: &'a mut DeviceCache,
+}
+
+/// Causal grouped-query attention (Gemma 4): new position `i` (absolute `start + i`)
+/// and head `h` take a softmax over positions `max(0, start + i + 1 - window)..=start + i`
+/// of `scale * q[i][h] . k[s % slots][h / (heads / kv_heads)]`, weighting the values in
+/// the same rows. The session's keys and values are authoritative; a device may keep a
+/// copy in `device` and take only the rows of positions from `start` on when its copy
+/// holds every earlier one.
+pub struct GroupedJob<'a> {
+    /// `[t][heads][dim]`.
+    pub q: &'a [f32],
+    /// `[min(slots, start + t)][kv_heads][dim]`, this call's positions already written.
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    /// `[t][heads][dim]`.
+    pub out: &'a mut [f32],
+    pub t: usize,
+    pub start: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub dim: usize,
+    /// Positions each query sees, its own included; `usize::MAX` for every one.
+    pub window: usize,
+    pub slots: usize,
     pub scale: f32,
     pub device: &'a mut DeviceCache,
 }

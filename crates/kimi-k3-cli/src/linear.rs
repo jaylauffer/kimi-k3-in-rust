@@ -38,7 +38,7 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
 }
 
 /// Local reads, workspace text edits, and read-only Archive CAS access for chat.
-fn toolbox(args: &Args) -> Toolbox {
+pub(crate) fn toolbox(args: &Args) -> Toolbox {
     let mut tools = Toolbox::default();
     if args.no_tools {
         eprintln!("file tools: off (--no-tools)");
@@ -300,7 +300,7 @@ pub fn run(
             options.checkpoint = Some(Box::new(|request| {
                 let mut model = model.borrow_mut();
                 let mut labels = system_one::KimiLabels::new(
-                    &mut model,
+                    &mut **model,
                     tokenizer,
                     &format,
                     device.accel(),
@@ -413,7 +413,7 @@ pub fn run(
 }
 
 /// Kimi's memory file, unless tools or memory are off.
-fn memory_store(args: &Args) -> Option<loadngo_inference::memory_tools::MemoryStore> {
+pub(crate) fn memory_store(args: &Args) -> Option<loadngo_inference::memory_tools::MemoryStore> {
     if args.no_tools || args.no_memory {
         return None;
     }
@@ -424,7 +424,7 @@ fn memory_store(args: &Args) -> Option<loadngo_inference::memory_tools::MemorySt
 }
 
 /// What opens each conversation about her memory: the newest notes that fit in 4 KB.
-fn memory_note(memory: &loadngo_inference::memory_tools::MemoryStore) -> String {
+pub(crate) fn memory_note(memory: &loadngo_inference::memory_tools::MemoryStore) -> String {
     let intro = "You have a memory that lasts across sessions. Save facts, decisions and \
 the state of ongoing work with memory_save when they will matter later; look things up with \
 memory_search; drop wrong or outdated notes with memory_forget.";
@@ -450,7 +450,7 @@ fn date(format: &str) -> Option<String> {
 }
 
 /// How to answer when replies are spoken aloud (`--voice`).
-const VOICE_NOTE: &str = "Your replies are spoken aloud by a text-to-speech voice, and Jay is \
+pub(crate) const VOICE_NOTE: &str = "Your replies are spoken aloud by a text-to-speech voice, and Jay is \
 listening, not reading. Answer in one to three short, plain sentences. No lists, headings, code \
 or markdown unless he asks for them.";
 
@@ -458,7 +458,7 @@ or markdown unless he asks for them.";
 type ChatIo = (Box<dyn io::BufRead>, Box<dyn io::Write>);
 
 /// The chat's input and output: the terminal, or speech with `--voice`.
-fn chat_io(args: &Args) -> Result<ChatIo, String> {
+pub(crate) fn chat_io(args: &Args) -> Result<ChatIo, String> {
     if !args.voice {
         return Ok((Box::new(io::stdin().lock()), Box::new(io::stdout().lock())));
     }

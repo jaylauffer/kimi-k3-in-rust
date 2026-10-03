@@ -43,6 +43,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::spm_bpe::SpmBpe;
+
 fn in_ranges(ranges: &[Range], cp: u32) -> bool {
     ranges
         .binary_search_by(|&(lo, hi)| {
@@ -268,6 +270,9 @@ pub struct Tokenizer {
     id_added: Vec<bool>,
     /// Longest-first, so a longer special always wins over a prefix of it.
     specials: Vec<Special>,
+    /// A `tokenizer.json` SentencePiece-style BPE (Gemma 4) in place of everything
+    /// above, which is then empty.
+    spm: Option<Box<SpmBpe>>,
 }
 
 /// A tokenizer could not be loaded from the checkpoint's files.
@@ -340,8 +345,19 @@ impl Tokenizer {
     ///
     /// Never in practice: every rank is checked against `VOCAB_SIZE` before it
     /// is converted to `u32`.
+    #[allow(clippy::too_many_lines)] // two formats, each read top to bottom
     pub fn load(files_dir: impl AsRef<Path>) -> Result<Self, TokenizerError> {
         let files_dir = files_dir.as_ref();
+        if crate::spm_bpe::present(files_dir) {
+            return Ok(Self {
+                byte_level: ByteLevel::build(),
+                vocab: HashMap::new(),
+                id2str: Vec::new(),
+                id_added: Vec::new(),
+                specials: Vec::new(),
+                spm: Some(Box::new(SpmBpe::load(files_dir)?)),
+            });
+        }
         let byte_level = ByteLevel::build();
 
         let ranks_path = files_dir.join("tiktoken.model");
@@ -445,6 +461,7 @@ impl Tokenizer {
             id2str,
             id_added,
             specials,
+            spm: None,
         })
     }
 
@@ -453,6 +470,9 @@ impl Tokenizer {
     /// between them. Ported from C's `tok_encode`.
     #[must_use]
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        if let Some(spm) = &self.spm {
+            return spm.encode(text);
+        }
         let bytes = text.as_bytes();
         let mut out = Vec::new();
         let mut i = 0;
@@ -486,6 +506,9 @@ impl Tokenizer {
     /// otherwise a pasted marker can change the conversation structure.
     #[must_use]
     pub fn encode_ordinary(&self, text: &str) -> Vec<u32> {
+        if let Some(spm) = &self.spm {
+            return spm.encode_ordinary(text);
+        }
         let mut out = Vec::new();
         self.pretokenize_and_encode(text.as_bytes(), &mut out);
         out
@@ -496,6 +519,9 @@ impl Tokenizer {
     /// original bytes. Ported from C's `tok_decode`.
     #[must_use]
     pub fn decode(&self, ids: &[u32]) -> Vec<u8> {
+        if let Some(spm) = &self.spm {
+            return spm.decode(ids);
+        }
         let mut out = Vec::new();
         for &id in ids {
             let id = id as usize;

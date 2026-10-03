@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 mod accel;
 mod board;
 mod chat;
+mod chat_gemma;
 mod convert;
+mod gemma;
 mod linear;
 mod quality;
 mod system_one;
@@ -97,6 +99,10 @@ struct Args {
     compare: Option<quality::Comparison>,
     convert_experts: Option<PathBuf>,
     mxfp4_experts: Option<PathBuf>,
+    convert_mxfp4: Option<PathBuf>,
+    quantize: gemma::Quantize,
+    mxfp4: Option<PathBuf>,
+    compare_with: Option<PathBuf>,
     system_one: Option<PathBuf>,
     temperature: f32,
     voice: bool,
@@ -137,6 +143,10 @@ impl Args {
         let mut compare = None;
         let mut convert_experts = None;
         let mut mxfp4_experts = None;
+        let mut convert_mxfp4 = None;
+        let mut quantize = gemma::Quantize::All;
+        let mut mxfp4 = None;
+        let mut compare_with = None;
         let mut system_one = None;
         let mut temperature = 1.0_f32;
         let mut voice = false;
@@ -191,6 +201,16 @@ impl Args {
                         &mut raw,
                         "--convert-experts-mxfp4",
                     )?));
+                }
+                "--convert-mxfp4" => {
+                    convert_mxfp4 = Some(PathBuf::from(next_value(&mut raw, "--convert-mxfp4")?));
+                }
+                "--quantize" => {
+                    quantize = gemma::Quantize::parse(&next_value(&mut raw, "--quantize")?)?;
+                }
+                "--mxfp4" => mxfp4 = Some(PathBuf::from(next_value(&mut raw, "--mxfp4")?)),
+                "--compare-with" => {
+                    compare_with = Some(PathBuf::from(next_value(&mut raw, "--compare-with")?));
                 }
                 "--compare" => {
                     compare = Some(quality::Comparison::parse(&next_value(
@@ -282,6 +302,10 @@ impl Args {
             compare,
             convert_experts,
             mxfp4_experts,
+            convert_mxfp4,
+            quantize,
+            mxfp4,
+            compare_with,
             system_one,
             temperature,
             voice,
@@ -482,6 +506,9 @@ fn run() -> Result<(), String> {
     })
     .map_err(|error| format!("cannot install Ctrl-C handler: {error}"))?;
 
+    if kimi_k3_core::gemma::GemmaConfig::detect(&config_path) {
+        return gemma::run(&args, &tokenizer, prompt.as_deref(), &cancel, &generating);
+    }
     if kimi_k3_core::linear::LinearConfig::detect(&config_path) {
         return linear::run(&args, &tokenizer, prompt.as_deref(), &cancel, &generating);
     }

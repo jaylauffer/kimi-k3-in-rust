@@ -37,7 +37,7 @@ pub fn layer_file(layer: usize) -> String {
 }
 
 /// Quantizes one bf16 `[rows][cols]` matrix into `blocks` and `scales`.
-fn quantize(raw: &[u8], cols: usize, blocks: &mut Vec<u8>, scales: &mut Vec<u8>) {
+pub(crate) fn quantize(raw: &[u8], cols: usize, blocks: &mut Vec<u8>, scales: &mut Vec<u8>) {
     let mut values = [0.0_f32; BLOCK_SIZE];
     let mut packed = [0_u8; BLOCK_SIZE / 2];
     for row in raw.chunks_exact(cols * 2) {

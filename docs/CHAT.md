@@ -4,7 +4,9 @@
 
 Since 2026-09-24 the root launcher chats with **Kimi Linear 48B-A3B** by default (about
 one token per second here; see [KIMI_LINEAR.md](KIMI_LINEAR.md)); `--k3` as its first
-argument selects the full K3. The same CLI and chat commands serve both.
+argument selects the full K3, and since 2026-10-03 `--gemma` selects Google's Gemma 4
+31B-it on the GPU (see [GEMMA.md](GEMMA.md)). The same CLI and chat commands serve all
+three; Gemma's chat uses its own template and tool-call syntax (`chat_gemma.rs`).
 
 The Rust CLI now defaults to a terminal conversation when given a model directory
 without a one-shot prompt. Model weights/index/cache are loaded once per process.

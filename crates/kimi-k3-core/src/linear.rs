@@ -256,7 +256,7 @@ pub enum LinearError {
 impl fmt::Display for LinearError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Config(detail) => write!(f, "kimi_linear config: {detail}"),
+            Self::Config(detail) => write!(f, "model config: {detail}"),
             Self::Missing(name) => write!(f, "checkpoint has no tensor `{name}`"),
             Self::Tensor { name, detail } => write!(f, "tensor `{name}`: {detail}"),
             Self::Read(error) => write!(f, "{error}"),
@@ -287,7 +287,7 @@ impl From<SafeTensorError> for LinearError {
 }
 
 /// Little-endian bytes to bf16 words.
-fn to_words(raw: &[u8]) -> Vec<u16> {
+pub(crate) fn to_words(raw: &[u8]) -> Vec<u16> {
     let mut words = Vec::with_capacity(raw.len() / 2);
     words_into(&mut words, raw);
     words
@@ -303,7 +303,7 @@ fn words_into(words: &mut Vec<u16>, raw: &[u8]) {
 }
 
 /// A bf16 `[out][inp]` matrix, read whole.
-fn matrix(
+pub(crate) fn matrix(
     index: &SafeTensorIndex,
     name: &str,
     out: usize,
@@ -325,7 +325,11 @@ fn matrix(
 }
 
 /// Any-dtype tensor of exactly `len` elements, widened to fp32.
-fn vector(index: &SafeTensorIndex, name: &str, len: usize) -> Result<Vec<f32>, LinearError> {
+pub(crate) fn vector(
+    index: &SafeTensorIndex,
+    name: &str,
+    len: usize,
+) -> Result<Vec<f32>, LinearError> {
     let tensor = index
         .tensor(name)
         .ok_or_else(|| LinearError::Missing(name.into()))?;
@@ -341,16 +345,16 @@ fn vector(index: &SafeTensorIndex, name: &str, len: usize) -> Result<Vec<f32>, L
 }
 
 /// A bf16 `[out][inp]` matrix read only through products.
-struct Weight {
-    data: Stored,
-    out: usize,
-    inp: usize,
+pub(crate) struct Weight {
+    pub(crate) data: Stored,
+    pub(crate) out: usize,
+    pub(crate) inp: usize,
 }
 
 /// A weight's bytes: the checkpoint's bf16 words, or (routed experts from a converted
 /// directory, see [`LinearModel::use_mxfp4_experts`]) MXFP4 codes and scales; on the
 /// heap, or moved into a device's memory by [`LinearModel::share_weights`].
-enum Stored {
+pub(crate) enum Stored {
     Bf16(Vec<u16>),
     Mxfp4 { packed: Vec<u8>, scales: Vec<u8> },
     SharedBf16(Shared),
@@ -358,7 +362,7 @@ enum Stored {
 }
 
 impl Weight {
-    const fn new(words: Vec<u16>, out: usize, inp: usize) -> Self {
+    pub(crate) const fn new(words: Vec<u16>, out: usize, inp: usize) -> Self {
         Self {
             data: Stored::Bf16(words),
             out,
@@ -374,7 +378,7 @@ impl Weight {
         }
     }
 
-    fn as_ref(&self) -> WeightRef<'_> {
+    pub(crate) fn as_ref(&self) -> WeightRef<'_> {
         match &self.data {
             Stored::Bf16(w) => WeightRef::Bf16(w),
             Stored::Mxfp4 { packed, scales } => WeightRef::Mxfp4 { packed, scales },
@@ -388,7 +392,7 @@ impl Weight {
 
     /// Moves the weight into `device`'s memory; returns the bytes moved (0 when the
     /// device keeps it where it is).
-    fn share(&mut self, device: &dyn DenseAccel) -> usize {
+    pub(crate) fn share(&mut self, device: &dyn DenseAccel) -> usize {
         self.share_recycling(device, &mut Vec::new())
     }
 
@@ -455,16 +459,16 @@ impl Weight {
 }
 
 /// Products sharing an input.
-struct Mul<'a> {
-    x: &'a [f32],
-    rows: usize,
-    parts: Vec<(&'a Weight, &'a mut [f32])>,
+pub(crate) struct Mul<'a> {
+    pub(crate) x: &'a [f32],
+    pub(crate) rows: usize,
+    pub(crate) parts: Vec<(&'a Weight, &'a mut [f32])>,
 }
 
 /// Runs `muls` on `accel` together, or each product on the CPU when there is none or it
 /// declines. Each product's CPU result depends only on its own weight and input, so how
 /// products are gathered never changes the reference path's floats.
-fn products(accel: Accel<'_>, muls: &mut [Mul<'_>]) {
+pub(crate) fn products(accel: Accel<'_>, muls: &mut [Mul<'_>]) {
     if let Some(device) = accel {
         let mut jobs: Vec<DenseJob<'_>> = muls
             .iter_mut()

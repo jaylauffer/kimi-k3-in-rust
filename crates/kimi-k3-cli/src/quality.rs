@@ -204,8 +204,29 @@ pub fn compare(
         }
     }
     model.set_expert_transform(None);
-    let vocab = model.config.vocab_size;
-    let s = compare_logits(&ids, &logits[0], &logits[1], vocab);
+    report(
+        names,
+        &ids,
+        &logits[0],
+        &logits[1],
+        model.config.vocab_size,
+        tokenizer,
+    );
+    Ok(())
+}
+
+/// Prints how run `b`'s next-token distributions over `ids` differ from run `a`'s
+/// (`[ids][vocab]` logits each): perplexity, accuracy, top-1 agreement, KL divergence.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn report(
+    names: [&str; 2],
+    ids: &[u32],
+    a: &[f32],
+    b: &[f32],
+    vocab: usize,
+    tokenizer: &Tokenizer,
+) {
+    let s = compare_logits(ids, a, b, vocab);
     let n = s.positions as f64;
     let mut kl = s.kl.clone();
     kl.sort_by(f64::total_cmp);
@@ -238,7 +259,6 @@ pub fn compare(
         worst + 1,
         tokenizer.decode_lossy(&ids[worst + 1..worst + 2]),
     );
-    Ok(())
 }
 
 #[cfg(test)]

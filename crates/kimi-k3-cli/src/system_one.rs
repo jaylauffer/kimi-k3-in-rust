@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use kimi_k3_core::gemma::{GemmaModel, GemmaSession};
 use kimi_k3_core::layer::Accel;
 use kimi_k3_core::linear::{LinearModel, LinearSession};
 use kimi_k3_core::tokenizer::Tokenizer;
@@ -23,23 +24,74 @@ Read it, then answer the question after it with the letter of exactly one option
 /// Room left after the state for a question and its options.
 const QUESTION_ROOM: usize = 1024;
 
-/// Kimi Linear answering lettered options.
-pub struct KimiLabels<'a> {
-    model: &'a mut LinearModel,
+/// A model that reads tokens into a session it can snapshot.
+pub trait Reader {
+    type Session: Clone;
+    fn open(&self, capacity: usize) -> Self::Session;
+    /// Feeds `ids` and returns the logits after the last of them.
+    ///
+    /// # Errors
+    /// The model's error, as text.
+    fn read(
+        &mut self,
+        session: &mut Self::Session,
+        ids: &[u32],
+        accel: Accel<'_>,
+        keep: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>, String>;
+}
+
+impl Reader for LinearModel {
+    type Session = LinearSession;
+    fn open(&self, capacity: usize) -> LinearSession {
+        self.session(capacity)
+    }
+    fn read(
+        &mut self,
+        session: &mut LinearSession,
+        ids: &[u32],
+        accel: Accel<'_>,
+        keep: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>, String> {
+        self.feed(session, ids, accel, keep)
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl Reader for GemmaModel {
+    type Session = GemmaSession;
+    fn open(&self, capacity: usize) -> GemmaSession {
+        self.session(capacity)
+    }
+    fn read(
+        &mut self,
+        session: &mut GemmaSession,
+        ids: &[u32],
+        accel: Accel<'_>,
+        keep: &dyn Fn() -> bool,
+    ) -> Result<Vec<f32>, String> {
+        self.feed(session, ids, accel, keep)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// A chat model answering lettered options.
+pub struct KimiLabels<'a, M: Reader = LinearModel> {
+    model: &'a mut M,
     tokenizer: &'a Tokenizer,
     format: &'a ChatFormat,
     accel: Accel<'a>,
     cancel: &'a AtomicBool,
     /// The state last read, and the session right after it.
-    read: Option<(String, LinearSession)>,
+    read: Option<(String, M::Session)>,
     /// Forward passes spent reading states and questions.
     pub state_tokens: usize,
     pub question_tokens: usize,
 }
 
-impl<'a> KimiLabels<'a> {
+impl<'a, M: Reader> KimiLabels<'a, M> {
     pub fn new(
-        model: &'a mut LinearModel,
+        model: &'a mut M,
         tokenizer: &'a Tokenizer,
         format: &'a ChatFormat,
         accel: Accel<'a>,
@@ -67,7 +119,7 @@ impl<'a> KimiLabels<'a> {
     }
 }
 
-impl LabelModel for KimiLabels<'_> {
+impl<M: Reader> LabelModel for KimiLabels<'_, M> {
     fn label_logits(
         &mut self,
         state: &str,
@@ -84,10 +136,8 @@ impl LabelModel for KimiLabels<'_> {
             let head = self
                 .format
                 .open_user_message(self.tokenizer, INSTRUCTION, state)?;
-            let mut session = self.model.session(head.len() + QUESTION_ROOM);
-            self.model
-                .feed(&mut session, &head, self.accel, keep)
-                .map_err(|e| e.to_string())?;
+            let mut session = self.model.open(head.len() + QUESTION_ROOM);
+            self.model.read(&mut session, &head, self.accel, &keep)?;
             self.state_tokens += head.len();
             self.read = Some((state.to_string(), session));
         }
@@ -97,10 +147,7 @@ impl LabelModel for KimiLabels<'_> {
             .format
             .close_user_message(self.tokenizer, &format!("\n\n{question}"))?;
         self.question_tokens += tail.len();
-        let logits = self
-            .model
-            .feed(&mut session, &tail, self.accel, keep)
-            .map_err(|e| e.to_string())?;
+        let logits = self.model.read(&mut session, &tail, self.accel, &keep)?;
         ids.iter()
             .map(|&id| {
                 logits
@@ -113,10 +160,10 @@ impl LabelModel for KimiLabels<'_> {
 }
 
 /// Reads the JSON request at `path`, answers it, and prints the response JSON.
-pub fn run(
+pub fn run<M: Reader>(
     path: &Path,
     temperature: f32,
-    model: &mut LinearModel,
+    model: &mut M,
     tokenizer: &Tokenizer,
     format: &ChatFormat,
     accel: Accel<'_>,

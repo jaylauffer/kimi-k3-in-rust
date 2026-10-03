@@ -13,6 +13,7 @@ use loadngo_inference::system_one::{Answer, Question, Request};
 use loadngo_inference::{Session, StopReason, Utf8Stream, tools::Toolbox};
 use serde_json::json;
 
+use crate::chat_gemma::GemmaTokens;
 use crate::transcript::{Resumed, Transcript};
 
 const OPEN: u32 = 163_587;
@@ -107,6 +108,7 @@ fn validate(tokenizer: &Tokenizer) -> Result<(), String> {
 pub enum ChatFormat {
     K3,
     KimiLinear(LinearTokens),
+    Gemma(GemmaTokens),
 }
 
 /// Kimi Linear control tokens, looked up in the checkpoint's own tokenizer.
@@ -140,17 +142,25 @@ impl ChatFormat {
     /// Session boundaries include tool-result prompts. Find the last actual user
     /// prompt before removing its entire exchange, including in older saved chats.
     fn undo_user_turn(&self, session: &mut Session) -> bool {
-        let Self::KimiLinear(t) = self else {
-            return session.undo();
-        };
-        let start = session.turn_starts().iter().rev().copied().find(|&start| {
-            // Inspect only the prompt, before its assistant header, so generated
-            // control tokens cannot masquerade as another user turn.
-            session.tokens()[start..]
+        // Inspect only the prompt, before its assistant header, so generated
+        // control tokens cannot masquerade as another user turn.
+        let has_user = |prompt: &[u32]| match self {
+            Self::KimiLinear(t) => prompt
                 .iter()
                 .take_while(|&&id| id != t.assistant)
-                .any(|&id| id == t.user)
-        });
+                .any(|&id| id == t.user),
+            Self::Gemma(g) => g.has_user(prompt),
+            Self::K3 => false,
+        };
+        if matches!(self, Self::K3) {
+            return session.undo();
+        }
+        let start = session
+            .turn_starts()
+            .iter()
+            .rev()
+            .copied()
+            .find(|&start| has_user(&session.tokens()[start..]));
         let Some(start) = start else {
             return false;
         };
@@ -181,17 +191,110 @@ impl ChatFormat {
         }))
     }
 
-    /// Adds a system note that opens every conversation (Kimi Linear only); notes added
-    /// later follow earlier ones.
+    /// # Errors
+    /// When the tokenizer lacks one of Gemma 4's control tokens as a single id.
+    pub fn gemma(tokenizer: &Tokenizer, bos: u32, eos: &[u32]) -> Result<Self, String> {
+        Ok(Self::Gemma(GemmaTokens::new(tokenizer, bos, eos)?))
+    }
+
+    /// Adds a system note that opens every conversation (not K3); notes added later
+    /// follow earlier ones.
     #[must_use]
     pub fn with_note(mut self, note: &str) -> Self {
-        if let Self::KimiLinear(t) = &mut self {
-            t.note = Some(match t.note.take() {
-                Some(earlier) => format!("{earlier}\n{note}"),
-                None => note.to_string(),
-            });
-        }
+        let slot = match &mut self {
+            Self::KimiLinear(t) => &mut t.note,
+            Self::Gemma(g) => &mut g.note,
+            Self::K3 => return self,
+        };
+        *slot = Some(match slot.take() {
+            Some(earlier) => format!("{earlier}\n{note}"),
+            None => note.to_string(),
+        });
         self
+    }
+
+    /// Whether this format is a sequence of role messages (Kimi Linear, Gemma), which
+    /// tools, context flow and checkpoints need.
+    #[must_use]
+    pub const fn has_messages(&self) -> bool {
+        !matches!(self, Self::K3)
+    }
+
+    /// A message in `role` holding `content`.
+    fn message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, role: &str, content: &str) {
+        match self {
+            Self::KimiLinear(t) => t.message(ids, tokenizer, role, content),
+            Self::Gemma(g) => g.message(ids, tokenizer, role, content),
+            Self::K3 => {}
+        }
+    }
+
+    /// A user message holding `text`.
+    fn user_message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
+        match self {
+            Self::KimiLinear(t) => {
+                ids.push(t.user);
+                ordinary(ids, tokenizer, "user");
+                ids.push(t.middle);
+                ordinary(ids, tokenizer, text);
+                ids.push(t.end);
+            }
+            Self::Gemma(g) => g.message(ids, tokenizer, "user", text),
+            Self::K3 => {}
+        }
+    }
+
+    /// The opening of the assistant's reply.
+    fn reply_header(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer) {
+        match self {
+            Self::KimiLinear(t) => {
+                ids.push(t.assistant);
+                ordinary(ids, tokenizer, "assistant");
+                ids.push(t.middle);
+            }
+            Self::Gemma(g) => g.reply_header(ids, tokenizer),
+            Self::K3 => {}
+        }
+    }
+
+    /// Where a reply begins in `span` (a turn's prompt and reply): past its header.
+    fn reply_offset(&self, span: &[u32]) -> Option<usize> {
+        match self {
+            Self::KimiLinear(t) => {
+                let header = span.iter().position(|&id| id == t.assistant)?;
+                let middle = span[header..].iter().position(|&id| id == t.middle)?;
+                Some(header + middle + 1)
+            }
+            Self::Gemma(g) => g.reply_start(span),
+            Self::K3 => None,
+        }
+    }
+
+    /// The text of the last user message in `prompt`.
+    fn user_text<'s>(&self, prompt: &'s [u32]) -> Option<&'s [u32]> {
+        match self {
+            Self::KimiLinear(t) => {
+                let user = prompt.iter().rposition(|&id| id == t.user)?;
+                let body = &prompt[user..];
+                let from = body.iter().position(|&id| id == t.middle)?;
+                let to = body[from..]
+                    .iter()
+                    .position(|&id| id == t.end)
+                    .map_or(body.len(), |end| from + end);
+                Some(&body[from + 1..to])
+            }
+            Self::Gemma(g) => g.user_text(prompt),
+            Self::K3 => None,
+        }
+    }
+
+    /// The token that opens tool calls in a reply.
+    fn calls_open(&self) -> Option<u32> {
+        match self {
+            Self::KimiLinear(t) => Some(t.section_begin),
+            Self::Gemma(g) => Some(g.call),
+            Self::K3 => None,
+        }
     }
 
     fn prompt(
@@ -223,6 +326,17 @@ impl ChatFormat {
                 ids.push(t.middle);
                 ids
             }
+            Self::Gemma(g) => {
+                let mut ids = if first {
+                    self.preamble(tokenizer, tools)
+                } else {
+                    Vec::new()
+                };
+                g.message(&mut ids, tokenizer, "system", &current_date_note());
+                g.message(&mut ids, tokenizer, "user", text);
+                g.reply_header(&mut ids, tokenizer);
+                ids
+            }
         }
     }
 
@@ -231,6 +345,23 @@ impl ChatFormat {
     /// every conversation, so a session that has consumed it can be reused.
     pub fn preamble(&self, tokenizer: &Tokenizer, tools: Option<&Toolbox>) -> Vec<u32> {
         let mut ids = Vec::new();
+        if let Self::Gemma(g) = self {
+            let tools = tools.filter(|t| !t.is_empty());
+            let mut system = String::new();
+            if tools.is_some() {
+                system.push_str(&TOOL_GUIDANCE.replacen("You are Kimi,", "You are Gemma,", 1));
+            }
+            if let Some(note) = &g.note {
+                if !system.is_empty() {
+                    system.push('\n');
+                }
+                system.push_str(note);
+            }
+            let declaration = tools.map(Toolbox::declaration);
+            return g
+                .preamble(tokenizer, &system, declaration.as_deref())
+                .unwrap_or_else(|_| vec![g.bos]);
+        }
         let Self::KimiLinear(t) = self else {
             return ids;
         };
@@ -256,14 +387,22 @@ impl ChatFormat {
         system: &str,
         head: &str,
     ) -> Result<Vec<u32>, String> {
-        let Self::KimiLinear(t) = self else {
-            return Err("only the Kimi Linear format splits user messages".into());
-        };
         let mut ids = Vec::new();
-        t.message(&mut ids, tokenizer, "system", system);
-        ids.push(t.user);
-        ordinary(&mut ids, tokenizer, "user");
-        ids.push(t.middle);
+        match self {
+            Self::KimiLinear(t) => {
+                t.message(&mut ids, tokenizer, "system", system);
+                ids.push(t.user);
+                ordinary(&mut ids, tokenizer, "user");
+                ids.push(t.middle);
+            }
+            Self::Gemma(g) => {
+                ids.push(g.bos);
+                g.message(&mut ids, tokenizer, "system", system);
+                ids.push(g.turn);
+                ordinary(&mut ids, tokenizer, "user\n");
+            }
+            Self::K3 => return Err("the K3 format does not split user messages".into()),
+        }
         ordinary(&mut ids, tokenizer, head);
         Ok(ids)
     }
@@ -278,19 +417,22 @@ impl ChatFormat {
         tokenizer: &Tokenizer,
         tail: &str,
     ) -> Result<Vec<u32>, String> {
-        let Self::KimiLinear(t) = self else {
-            return Err("only the Kimi Linear format splits user messages".into());
-        };
         let mut ids = Vec::new();
         ordinary(&mut ids, tokenizer, tail);
-        ids.extend([t.end, t.assistant]);
-        ordinary(&mut ids, tokenizer, "assistant");
-        ids.push(t.middle);
+        match self {
+            Self::KimiLinear(t) => ids.push(t.end),
+            Self::Gemma(g) => ids.extend([g.turn_end, g.newline]),
+            Self::K3 => return Err("the K3 format does not split user messages".into()),
+        }
+        self.reply_header(&mut ids, tokenizer);
         Ok(ids)
     }
 
     /// Tool calls in a finished Kimi Linear reply, as `(id, arguments)` text pairs.
     fn tool_calls(&self, tokenizer: &Tokenizer, reply: &[u32]) -> Vec<(String, String)> {
+        if let Self::Gemma(g) = self {
+            return g.tool_calls(tokenizer, reply);
+        }
         let Self::KimiLinear(t) = self else {
             return Vec::new();
         };
@@ -333,6 +475,7 @@ impl ChatFormat {
         match self {
             Self::K3 => "k3",
             Self::KimiLinear(_) => "kimi-linear",
+            Self::Gemma(_) => "gemma",
         }
     }
 
@@ -341,7 +484,15 @@ impl ChatFormat {
         &self,
         tokenizer: &Tokenizer,
         results: &[(String, String, String)],
+        last: Option<u32>,
     ) -> Vec<u32> {
+        if let Self::Gemma(g) = self {
+            // Results inside the model's turn, then the turn closes before Jay's message.
+            let mut ids = Vec::new();
+            g.responses(&mut ids, tokenizer, results, last == Some(g.response));
+            ids.extend([g.turn_end, g.newline]);
+            return ids;
+        }
         let Self::KimiLinear(t) = self else {
             return Vec::new();
         };
@@ -362,11 +513,18 @@ impl ChatFormat {
         &self,
         tokenizer: &Tokenizer,
         results: &[(String, String, String)],
+        last: Option<u32>,
     ) -> Vec<u32> {
+        if let Self::Gemma(g) = self {
+            // The model goes on in the same turn after its results.
+            let mut ids = Vec::new();
+            g.responses(&mut ids, tokenizer, results, last == Some(g.response));
+            return ids;
+        }
         let Self::KimiLinear(t) = self else {
             return Vec::new();
         };
-        let mut ids = self.tool_messages(tokenizer, results);
+        let mut ids = self.tool_messages(tokenizer, results, last);
         ids.push(t.assistant);
         ordinary(&mut ids, tokenizer, "assistant");
         ids.push(t.middle);
@@ -377,6 +535,15 @@ impl ChatFormat {
         match self {
             Self::K3 => vec![END, EOS],
             Self::KimiLinear(t) => vec![t.end, t.eos[0], t.eos[1]],
+            Self::Gemma(g) => {
+                let mut stops = vec![g.turn_end, g.response];
+                for &id in &g.eos {
+                    if !stops.contains(&id) {
+                        stops.push(id);
+                    }
+                }
+                stops
+            }
         }
     }
 
@@ -384,12 +551,39 @@ impl ChatFormat {
         match self {
             Self::K3 => "[thinking] ",
             Self::KimiLinear(_) => "Kimi> ",
+            Self::Gemma(_) => "Gemma> ",
         }
     }
 
     fn push(&self, display: &mut Display, tokenizer: &Tokenizer, token: u32) -> String {
         match self {
             Self::K3 => display.push(tokenizer, token),
+            Self::Gemma(g) => {
+                if token == g.call {
+                    return format!("{}\n[tool call ", terminal_text(&display.utf8.finish()));
+                }
+                if token == g.call_end {
+                    return format!("{}]", terminal_text(&display.utf8.finish()));
+                }
+                if token == g.quote {
+                    return format!("{}\"", terminal_text(&display.utf8.finish()));
+                }
+                if [
+                    g.turn,
+                    g.turn_end,
+                    g.channel,
+                    g.channel_end,
+                    g.response,
+                    g.response_end,
+                ]
+                .contains(&token)
+                    || g.eos.contains(&token)
+                {
+                    terminal_text(&display.utf8.finish())
+                } else {
+                    terminal_text(&display.utf8.push(&tokenizer.decode(&[token])))
+                }
+            }
             Self::KimiLinear(t) => {
                 if token == t.section_begin {
                     return terminal_text(&display.utf8.finish());
@@ -891,9 +1085,9 @@ fn compact(
     next: &mut impl FnMut(&[u32]) -> Result<u32, String>,
     output: &mut impl Write,
 ) -> Result<Compacted, String> {
-    let ChatFormat::KimiLinear(t) = format else {
-        return Err("only Kimi Linear chats are compacted".into());
-    };
+    if !format.has_messages() {
+        return Err("only Kimi Linear and Gemma chats are compacted".into());
+    }
     let (tokens, turns) = (session.tokens(), session.turn_starts());
     let Some(last) = turns.len().checked_sub(1) else {
         return Err("there is no conversation yet".into());
@@ -902,26 +1096,16 @@ fn compact(
     // Where a turn's reply begins: just past its prompt's assistant header.
     let reply_start = |turn: usize| {
         let span = &tokens[turns[turn]..turn_end(turn)];
-        let header = span.iter().position(|&id| id == t.assistant)?;
-        let middle = span[header..].iter().position(|&id| id == t.middle)?;
-        Some(turns[turn] + header + middle + 1)
+        Some(turns[turn] + format.reply_offset(span)?)
     };
     // Jay's messages, word for word: Kimi's summary of a request is not the request.
     let mut said: Vec<(usize, String)> = Vec::new();
     for turn in 0..turns.len() {
         let prompt = &tokens[turns[turn]..reply_start(turn).unwrap_or_else(|| turn_end(turn))];
-        let Some(user) = prompt.iter().rposition(|&id| id == t.user) else {
+        let Some(body) = format.user_text(prompt) else {
             continue;
         };
-        let body = &prompt[user..];
-        let Some(from) = body.iter().position(|&id| id == t.middle) else {
-            continue;
-        };
-        let to = body[from..]
-            .iter()
-            .position(|&id| id == t.end)
-            .map_or(body.len(), |end| from + end);
-        said.push((turn, tokenizer.decode_lossy(&body[from + 1..to])));
+        said.push((turn, tokenizer.decode_lossy(body)));
     }
     let pending = session.is_pending();
     // The end of what is carried over.
@@ -935,13 +1119,9 @@ fn compact(
     // nothing is read twice; otherwise the newest turns are left out until there is.
     // Asked as a user message, with the reply already begun: on the model, a system
     // message after a run of tool rounds was answered with one more tool call.
-    let mut request = vec![t.user];
-    ordinary(&mut request, tokenizer, "user");
-    request.push(t.middle);
-    ordinary(&mut request, tokenizer, FLOW_REQUEST);
-    request.extend([t.end, t.assistant]);
-    ordinary(&mut request, tokenizer, "assistant");
-    request.push(t.middle);
+    let mut request = Vec::new();
+    format.user_message(&mut request, tokenizer, FLOW_REQUEST);
+    format.reply_header(&mut request, tokenizer);
     ordinary(&mut request, tokenizer, HANDOFF_OPENING);
     let need = request.len() + flow.handoff_tokens() + 1;
     let cut_at = |kept: usize| turns.get(kept).copied().unwrap_or(tokens.len());
@@ -991,7 +1171,7 @@ fn compact(
         let written = &scratch.tokens()[cut + request.len()..];
         let text = written
             .iter()
-            .position(|id| *id == t.section_begin || format.stops().contains(id))
+            .position(|id| Some(*id) == format.calls_open() || format.stops().contains(id))
             .map_or(written, |stop| &written[..stop]);
         let text = tokenizer.decode_lossy(text);
         if !text.trim().is_empty() {
@@ -1033,7 +1213,7 @@ fn compact(
         }
     }
     let mut ids = format.preamble(tokenizer, tools);
-    t.message(&mut ids, tokenizer, "system", &note);
+    format.message(&mut ids, tokenizer, "system", &note);
     let mut new_turns = vec![0];
     if let Some((user_turn, text)) = latest {
         ids.extend(format.prompt(tokenizer, &text, false, tools));
@@ -1206,7 +1386,7 @@ pub fn run_with(
         ),
     };
     let mut flow = Flow {
-        enabled: matches!(format, ChatFormat::KimiLinear(_)),
+        enabled: format.has_messages(),
         max_context,
         compacted_len: 0,
     };
@@ -1321,7 +1501,11 @@ pub fn run_with(
                 // Calls left waiting are answered as not run, so the history stays a
                 // well-formed conversation, then the new message follows.
                 let mut ids = held.as_ref().map_or_else(Vec::new, |held| {
-                    format.tool_messages(tokenizer, &held.abandoned())
+                    format.tool_messages(
+                        tokenizer,
+                        &held.abandoned(),
+                        session.tokens().last().copied(),
+                    )
                 });
                 ids.extend(format.prompt(tokenizer, text, session.tokens().is_empty(), tools));
                 // A message that would crowd the context starts from a handoff instead.
@@ -1626,7 +1810,8 @@ pub fn run_with(
                 break Some("write failure limit".into());
             }
             let mut results = calls.done;
-            let mut prompt = format.tool_results(tokenizer, &results);
+            let mut prompt =
+                format.tool_results(tokenizer, &results, session.tokens().last().copied());
             // Results that would crowd the context go into one rebuilt from her handoff.
             if flow.due(session.tokens().len(), prompt.len())
                 && let Some(spent) = flow_now(
@@ -1659,7 +1844,7 @@ pub fn run_with(
                     text.truncate(cut);
                     text.push_str("\n[truncated to fit the context]");
                 }
-                prompt = format.tool_results(tokenizer, &results);
+                prompt = format.tool_results(tokenizer, &results, session.tokens().last().copied());
             }
             if let Err(error) = session.begin_turn(&prompt) {
                 writeln!(
@@ -1767,6 +1952,7 @@ mod tests {
                             "fs_read".into(),
                             "read".into(),
                         )],
+                        None,
                     ))
                     .unwrap();
             }
@@ -2545,6 +2731,7 @@ mod tests {
             format.tool_results(
                 &tokenizer,
                 &[("functions.fs_read:00".into(), "fs_read".into(), text)],
+                None,
             )
         };
         let filler = CONTEXT - 5 - session.tokens().len() - result(String::new()).len();
@@ -2982,6 +3169,7 @@ mod tests {
                 "fs_read".into(),
                 "hello".into(),
             )],
+            None,
         );
         assert!(
             tokenizer

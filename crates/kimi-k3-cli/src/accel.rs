@@ -218,11 +218,12 @@ mod gpu {
     use super::DenseAccel;
     use super::ane::Ane;
     use kimi_k3_core::layer::{
-        AttentionJob, DenseJob, DeviceCache, ExpertsJob, KdaBlockJob, MlaBlockJob, RecurrenceJob,
-        Shared, SharedWeight, WeightRef, WeightShape,
+        AttentionJob, DenseJob, DeviceCache, ExpertsJob, GroupedJob, KdaBlockJob, MlaBlockJob,
+        RecurrenceJob, Shared, SharedWeight, WeightRef, WeightShape,
     };
     use loadngo_metal_compute::{
-        AttentionShape, Buffer, Completed, Dispatch, Gpu as Metal, RecurrenceShape, Resident, Slice,
+        AttentionShape, Buffer, Completed, Dispatch, Gpu as Metal, GroupedShape, RecurrenceShape,
+        Resident, Slice,
     };
     use loadngo_proactor::{PlatformPort, Proactor, new_platform_proactor};
     use std::cell::{Cell, RefCell};
@@ -260,6 +261,10 @@ mod gpu {
         attention_gpu_s: f64,
         attention_wall_s: f64,
         attention_failed: u64,
+        grouped: u64,
+        grouped_gpu_s: f64,
+        grouped_wall_s: f64,
+        grouped_failed: u64,
         recurrence: u64,
         recurrence_gpu_s: f64,
         recurrence_wall_s: f64,
@@ -283,6 +288,15 @@ mod gpu {
 
     /// One attention layer's cache copied into GPU memory: `len` positions valid, room
     /// for `capacity`. Kept in the session's [`kimi_k3_core::layer::DeviceCache`].
+    /// A grouped-attention layer's keys and values in GPU memory: `rows` rows each,
+    /// holding positions `0..synced` the way the session's ring does.
+    struct RingCopy {
+        k: Buffer,
+        v: Buffer,
+        rows: usize,
+        synced: usize,
+    }
+
     struct CacheCopy {
         kv: Buffer,
         rope: Buffer,
@@ -313,6 +327,9 @@ mod gpu {
     fn align16(n: usize) -> usize {
         n.div_ceil(16) * 16
     }
+
+    /// New positions from which grouped attention runs on the matrix units.
+    const GROUPED_TILED_FROM: usize = 32;
 
     /// Positions from which an expert's rows are padded to tiles of 32 and multiplied on
     /// the matrix units; fewer (decoding) keep one product per position.
@@ -431,7 +448,9 @@ mod gpu {
                  KDA blocks {} fused, {:.2} ms GPU, {:.2} ms wall each, {} run step by step \
                  after a GPU failure; expert layers {} fused, {:.2} ms GPU, {:.2} ms wall \
                  each, {} as separate products after a GPU failure; MLA blocks {} fused, \
-                 {:.2} ms GPU, {:.2} ms wall each, {} run step by step after a GPU failure | {}",
+                 {:.2} ms GPU, {:.2} ms wall each, {} run step by step after a GPU failure; \
+                 grouped attention {} layers on the GPU, {:.2} ms GPU, {:.2} ms wall each, \
+                 {} on the CPU after a GPU failure | {}",
                 self.metal.name(),
                 s.shared_bytes as f64 / 1e9,
                 self.metal.wired_bytes() as f64 / 1e9,
@@ -475,6 +494,10 @@ mod gpu {
                 each(s.mla_block_gpu_s, s.mla_blocks),
                 each(s.mla_block_wall_s, s.mla_blocks),
                 s.mla_block_failed,
+                s.grouped,
+                each(s.grouped_gpu_s, s.grouped),
+                each(s.grouped_wall_s, s.grouped),
+                s.grouped_failed,
                 self.ane.summary()
             )
         }
@@ -1193,6 +1216,132 @@ mod gpu {
             Ok(())
         }
 
+        /// Grouped-query attention on the GPU. The layer's keys and values stay in GPU
+        /// memory between calls; each call copies in only the rows of its own positions,
+        /// unless the copy is missing or behind (a new or restored session), when it takes
+        /// them all.
+        #[allow(clippy::too_many_lines)] // the cache copy, then one dispatch
+        fn grouped(&self, job: &mut GroupedJob<'_>) -> Result<(), String> {
+            let start = Instant::now();
+            let row = job.kv_heads * job.dim;
+            let end = job.start + job.t;
+            let rows = job.slots.min(end);
+            // A prompt pass goes to the matrix units, which read rows up to the next
+            // multiple of 32 (finite, multiplied by zero) and want padded queries.
+            let tiled = job.t >= GROUPED_TILED_FROM && job.dim % 16 == 0;
+            let readable = if job.slots < end {
+                job.slots
+            } else {
+                end.next_multiple_of(32)
+            };
+            let old = job
+                .device
+                .0
+                .take()
+                .and_then(|state| state.downcast::<RingCopy>().ok())
+                .map(|copy| *copy);
+            let mut copy = match old {
+                Some(copy) if copy.rows >= readable && copy.synced == job.start => copy,
+                old => {
+                    let capacity = readable
+                        .max(old.as_ref().map_or(0, |c| c.rows * 2))
+                        .max(readable + readable / 2)
+                        .max(1024)
+                        .min(job.slots.next_multiple_of(32))
+                        .max(readable);
+                    let buffer = || -> Result<Buffer, String> {
+                        let mut buffer = self
+                            .metal
+                            .buffer(capacity * row * 4)
+                            .map_err(|e| e.to_string())?;
+                        buffer.as_f32_mut().fill(0.0);
+                        Ok(buffer)
+                    };
+                    RingCopy {
+                        k: buffer()?,
+                        v: buffer()?,
+                        rows: capacity,
+                        synced: 0,
+                    }
+                }
+            };
+            if copy.synced == job.start {
+                for p in job.start..end {
+                    let at = (p % job.slots) * row;
+                    copy.k.as_f32_mut()[at..at + row].copy_from_slice(&job.k[at..at + row]);
+                    copy.v.as_f32_mut()[at..at + row].copy_from_slice(&job.v[at..at + row]);
+                }
+            } else {
+                copy.k.as_f32_mut()[..rows * row].copy_from_slice(&job.k[..rows * row]);
+                copy.v.as_f32_mut()[..rows * row].copy_from_slice(&job.v[..rows * row]);
+            }
+            copy.synced = end;
+
+            let padded = if tiled {
+                job.t.next_multiple_of(32)
+            } else {
+                job.t
+            };
+            let width = job.heads * job.dim;
+            let (q_len, out_len) = (padded * width * 4, padded * width * 4);
+            let mut staging = self.take_staging(q_len, out_len)?;
+            let x = staging[X].as_f32_mut();
+            x[..job.q.len()].copy_from_slice(job.q);
+            x[job.q.len()..padded * width].fill(0.0);
+            let kv_rows = if tiled { readable } else { rows };
+            let (rows_cap, kv_len) = (copy.rows, kv_rows * row * 4);
+            staging.push(copy.k);
+            staging.push(copy.v);
+            let mut batch = self
+                .metal
+                .batch(staging, Dispatch::Serial)
+                .map_err(|e| e.to_string())?;
+            let shape = GroupedShape {
+                t: job.t,
+                start: job.start,
+                heads: job.heads,
+                kv_heads: job.kv_heads,
+                dim: job.dim,
+                window: job.window,
+                slots: job.slots,
+                scale: job.scale,
+            };
+            let slices = (
+                Slice::new(X, 0, q_len),
+                Slice::new(2, 0, kv_len),
+                Slice::new(3, 0, kv_len),
+                Slice::new(Y, 0, out_len),
+            );
+            if tiled {
+                batch.attention_grouped_tiled(slices.0, slices.1, slices.2, slices.3, shape)
+            } else {
+                batch.attention_grouped(slices.0, slices.1, slices.2, slices.3, shape)
+            }
+            .map_err(|e| e.to_string())?;
+            let done = self.submit(batch)?;
+            let mut buffers = done.buffers;
+            let (v, k) = (
+                buffers.pop().ok_or("value buffer missing")?,
+                buffers.pop().ok_or("key buffer missing")?,
+            );
+            let gpu_time = done.gpu_time.map_err(|e| e.to_string())?;
+            job.out
+                .copy_from_slice(&buffers[Y].as_f32()[..job.out.len()]);
+            *self.staging.borrow_mut() = Some(buffers);
+            job.device.0 = Some(Box::new(RingCopy {
+                k,
+                v,
+                rows: rows_cap,
+                synced: end,
+            }));
+            self.update(|s| {
+                s.grouped += 1;
+                s.grouped_gpu_s += gpu_time.as_secs_f64();
+                s.grouped_wall_s += start.elapsed().as_secs_f64();
+            });
+            Ok(())
+        }
+
         /// The KDA recurrence on the GPU. The session's state stays authoritative: it is
         /// copied in when the GPU copy is missing and copied back after every run.
         fn recur(&self, job: &mut RecurrenceJob<'_>) -> Result<(), String> {
@@ -1436,6 +1585,19 @@ mod gpu {
                     self.update(|s| s.kda_block_failed += 1);
                     if self.stats.get().kda_block_failed <= 3 {
                         eprintln!("gpu: KDA block run step by step instead: {error}");
+                    }
+                    false
+                }
+            }
+        }
+
+        fn grouped_attention(&self, job: &mut GroupedJob<'_>) -> bool {
+            match self.grouped(job) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.update(|s| s.grouped_failed += 1);
+                    if self.stats.get().grouped_failed <= 3 {
+                        eprintln!("gpu: grouped attention computed on the CPU instead: {error}");
                     }
                     false
                 }
