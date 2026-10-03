@@ -12,7 +12,7 @@ fn help_and_empty_invocation_do_not_load_a_model() {
         for required in ["--chat", "--gen", "--max-context", "/continue", "example:"] {
             assert!(text.contains(required));
         }
-        assert!(out.stderr.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
     }
 }
 
@@ -34,7 +34,7 @@ fn invalid_options_fail_before_model_loading_with_a_help_hint() {
             .output()
             .unwrap();
         assert!(!out.status.success());
-        assert!(out.stdout.is_empty());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "");
         let text = String::from_utf8(out.stderr).unwrap();
         assert!(text.contains("run --help"), "{text}");
         assert!(

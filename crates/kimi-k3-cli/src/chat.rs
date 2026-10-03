@@ -1979,7 +1979,7 @@ mod tests {
             assert_eq!(restored.turn_starts(), [0]);
             assert!(!restored.is_pending());
             assert!(format.undo_user_turn(&mut restored));
-            assert!(restored.tokens().is_empty());
+            assert_eq!(restored.tokens(), &[] as &[u32]);
             assert!(!format.undo_user_turn(&mut restored));
         }
     }
@@ -2665,7 +2665,7 @@ mod tests {
         assert!(compactions >= 2, "{compactions} compactions");
         // Only a handoff is ever written above the compaction line; the context never fills.
         assert!(script.longest < CONTEXT, "{}", script.longest);
-        assert!(!script.rebuilt.is_empty());
+        assert_ne!(script.rebuilt.len(), 0, "nothing was rebuilt");
         for context in &script.rebuilt {
             assert!(context.contains(HANDOFF));
             assert!(context.contains("Read every path for me"));
@@ -3176,10 +3176,9 @@ mod tests {
                 .decode_lossy(&results)
                 .contains("## Return of functions.fs_read:0")
         );
-        assert!(
-            format
-                .tool_calls(&tokenizer, &tokenizer.encode("no calls<|im_end|>"))
-                .is_empty()
+        assert_eq!(
+            format.tool_calls(&tokenizer, &tokenizer.encode("no calls<|im_end|>")),
+            Vec::<(String, String)>::new()
         );
     }
 
