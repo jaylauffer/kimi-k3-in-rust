@@ -797,11 +797,9 @@ mod tests {
 
         let empty = index.tensor("empty.f32").expect("empty fixture is indexed");
         assert_eq!(empty.numel(), 0);
-        assert!(
-            index
-                .read_raw(empty)
-                .expect("empty tensor reads")
-                .is_empty()
+        assert_eq!(
+            index.read_raw(empty).expect("empty tensor reads"),
+            Vec::<u8>::new()
         );
         index
             .read_f32(empty, &mut [])
