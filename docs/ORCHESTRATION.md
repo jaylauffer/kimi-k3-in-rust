@@ -174,11 +174,47 @@ complete headers: 459 tensors, 24 layers, 32 experts, file type `MXFP4_MOE`.
   Zhoenus talking-head work, 2026-05-01).
 - A partial download of the same GGUF (1.7 GB, unfinished) is in the Hugging Face cache.
 
-This engine reads safetensors. Porting gpt-oss means one of two things:
+Deduplication check (2026-10-04, BLAKE3 over both files):
 
-- read GGUF, whose MXFP4 block layout must be checked against the OCP packing these
-  kernels use; or
-- download OpenAI's safetensors release (about 13 GB).
+- The loadngo copy is already in the signed pudding CAS on Zhoenus II.
+  - Root `pudding-20260917` `4d8babf2`, entry `loadngo/models/gpt-oss-20b-MXFP4_MOE.gguf`.
+  - Object `56fcc05c…`, stored uncompressed: same hash, same size.
+- The Downloads copy (`fb4a7029…`) is in neither CAS. It differs from the archived copy
+  in exactly two places:
+  - a newer chat template, 804 bytes longer;
+  - 160 of the 201,088 rows of `output.weight`, nearly all ids from 200,166 up (the
+    special and reserved tokens). Sampled differences are about 1e-7 RMS, against a
+    weight RMS of 3e-4.
+
+  Every other tensor is byte-identical.
+- So the two are the same model. The archived copy is the one to keep. Only the newer
+  chat template is worth saving from the Downloads copy, as a reference for the chat
+  format.
+
+What porting it to this engine from the GGUF we have takes (no download):
+
+- **GGUF reader** for this engine, which reads only safetensors today.
+- **Weights.**
+  - 72 MXFP4 expert tensors (gate, up and down for 24 layers × 32 experts).
+  - 98 Q8_0 tensors: embedding, output, and attention projections. These are not bf16
+    in this file.
+  - 289 f32 tensors: norms, biases and the attention sinks.
+  - MXFP4 has to be checked against the OCP packing the kernels use, and repacked at
+    load if ggml orders the nibbles differently. Q8_0 decodes exactly to f32.
+- **Architecture.**
+  - 24 layers, alternating sliding-window (128) and full attention.
+  - 64 query heads and 8 KV heads of width 64, with biases.
+  - YaRN rotary: theta 150,000, factor 32 from 4,096.
+  - A learned attention sink per head: an extra term in the softmax denominator.
+  - 32 experts, top 4, with biases.
+  - The sliding layers can use the Gemma ring and `attention_grouped` kernels; the sink
+    is a small addition to them.
+- **Tokenizer and chat.**
+  - GPT-4o-style byte BPE with a regex pre-split. Kimi's tiktoken port already
+    hand-writes a pre-split, so it is the starting point.
+  - The harmony chat format, checked against the template in the file.
+- **Checks** as for Gemma: tokenizer parity and a tiny random-weight oracle.
+  transformers implements gpt-oss, so the oracle script carries over.
 
 Each new model family costs about a day of engine work, as Gemma did. The evaluation
 set comes first. Then candidates are ported only when the evaluation says Kimi Linear
