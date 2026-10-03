@@ -164,6 +164,22 @@ exist):
 - **Devstral Small** (24B dense, Apache 2.0): trained for coding-agent work. Dense, so
   slower to decode than the others.
 
+gpt-oss-20b is already on this Mac, in two GGUF copies (llama.cpp's format). Both have
+complete headers: 459 tensors, 24 layers, 32 experts, file type `MXFP4_MOE`.
+
+- `~/pudding/loadngo/models/gpt-oss-20b-MXFP4_MOE.gguf`: 12.1 GB, April 19.
+  `models/` is ignored by git.
+- `~/Downloads/gpt-oss-20b-mxfp4.gguf`: 12.1 GB, April 27. It is the default model of
+  loadngo's `network/src/model_service.rs`, which runs it under `llama-server` (the
+  Zhoenus talking-head work, 2026-05-01).
+- A partial download of the same GGUF (1.7 GB, unfinished) is in the Hugging Face cache.
+
+This engine reads safetensors. Porting gpt-oss means one of two things:
+
+- read GGUF, whose MXFP4 block layout must be checked against the OCP packing these
+  kernels use; or
+- download OpenAI's safetensors release (about 13 GB).
+
 Each new model family costs about a day of engine work, as Gemma did. The evaluation
 set comes first. Then candidates are ported only when the evaluation says Kimi Linear
 falls short, starting with gpt-oss-20b, whose weight format is already supported.
