@@ -97,8 +97,10 @@ its end. The CPU reference is used without a GPU.
     decode speed and the file read: it called `fs_read{path: "docs/KIMI_LINEAR.md"}`,
     then `fs_read{line_start: 280, …}` for the rest, and answered "14-20 tokens/s for
     short context (and up to 32 tokens/s in later updates). I read the file
-    `docs/KIMI_LINEAR.md`." That run took 16 minutes on the first attention kernel
-    (the 2,581-token opening alone 122 s).
+    `docs/KIMI_LINEAR.md`." That run took 16.4 minutes on the first attention kernel
+    (the 2,581-token opening alone 122 s). Rerun on the final kernels, the same calls
+    and the same answer took 5.2 minutes: opening 59 s, then replies of 8.9 s, 172 s
+    (reading the 6,000-token file) and 70 s.
 - Speed on a 6,014-token prompt (this file's sibling `KIMI_LINEAR.md`), measured after
   each change:
 
