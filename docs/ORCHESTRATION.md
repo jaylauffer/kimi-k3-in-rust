@@ -134,6 +134,40 @@ Jay has no weeks for a live trial. The history is already enough to measure on:
   Code's knowledge, and adding a model family to this engine took about a day for
   Gemma.
 
+### Candidate models (Jay asked about Llama, 2026-10-04)
+
+The Mac mini has 64 GiB of memory, shared by the GPU, macOS and the KV cache, so a
+model's 4-bit weights need to stay under about 40-45 GB. Kimi Linear's 4-bit experts
+plus its other weights are 28.3 GB in GPU memory. Jarraya has 234 GiB free.
+
+The models Jay named:
+
+- **Llama 4 Scout** (109B, 17B active): about 58 GB at 4.25 bits per weight. That leaves
+  too little for macOS and the cache; it fits only at about 3 bits, with more loss. It
+  would decode at roughly 15-20 tokens/s if it fit. The bf16 download is about 218 GB,
+  so Jarraya would be nearly full.
+- **Llama 4 Maverick** (400B, 17B active): about 210 GB at 4 bits. It does not fit, and
+  would need experts streamed from disk as Kimi K3 does, at about a minute per token.
+- **Code Llama** (2023, Llama 2 based): it has no native tool calling and was trained
+  before agentic coding. Current models of the same size are far ahead, so it is not
+  worth evaluating.
+
+Better candidates that fit, as of Claude Code's knowledge (mid-2026; newer releases may
+exist):
+
+- **gpt-oss-20b** (21B, about 3.6B active, Apache 2.0).
+  - Trained for tool use and shipped in MXFP4, the format this engine's kernels already
+    run. There is no conversion loss, because it was trained for that format.
+  - About 13 GB.
+- **Qwen3-Coder-30B-A3B** (30B, 3B active, Apache 2.0): trained for agentic coding.
+  About 17 GB at 4 bits.
+- **Devstral Small** (24B dense, Apache 2.0): trained for coding-agent work. Dense, so
+  slower to decode than the others.
+
+Each new model family costs about a day of engine work, as Gemma did. The evaluation
+set comes first. Then candidates are ported only when the evaluation says Kimi Linear
+falls short, starting with gpt-oss-20b, whose weight format is already supported.
+
 ### First step
 
 A dispatch-and-verify loop for one worker, Claude Code via `claude -p`, on small,
