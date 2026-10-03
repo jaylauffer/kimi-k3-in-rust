@@ -103,6 +103,7 @@ struct Args {
     quantize: gemma::Quantize,
     mxfp4: Option<PathBuf>,
     compare_with: Option<PathBuf>,
+    attention: accel::AttentionDevice,
     system_one: Option<PathBuf>,
     temperature: f32,
     voice: bool,
@@ -147,6 +148,7 @@ impl Args {
         let mut quantize = gemma::Quantize::All;
         let mut mxfp4 = None;
         let mut compare_with = None;
+        let mut attention = accel::AttentionDevice::Gpu;
         let mut system_one = None;
         let mut temperature = 1.0_f32;
         let mut voice = false;
@@ -209,6 +211,10 @@ impl Args {
                     quantize = gemma::Quantize::parse(&next_value(&mut raw, "--quantize")?)?;
                 }
                 "--mxfp4" => mxfp4 = Some(PathBuf::from(next_value(&mut raw, "--mxfp4")?)),
+                "--attention" => {
+                    attention =
+                        accel::AttentionDevice::parse(&next_value(&mut raw, "--attention")?)?;
+                }
                 "--compare-with" => {
                     compare_with = Some(PathBuf::from(next_value(&mut raw, "--compare-with")?));
                 }
@@ -306,6 +312,7 @@ impl Args {
             quantize,
             mxfp4,
             compare_with,
+            attention,
             system_one,
             temperature,
             voice,
@@ -362,6 +369,7 @@ fn parse_arg<T: std::str::FromStr>(
         .map_err(|_| format!("{flag}: {value:?} is not a valid value"))
 }
 
+#[allow(clippy::too_many_lines)] // one help text
 fn print_usage() {
     println!(
         "k3, Kimi K3 inference engine (Rust port)\n\
@@ -409,9 +417,11 @@ fn print_usage() {
          \x20                      sessions in ~/.loadngo/kimi/memory.jsonl)\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
          \x20                      as they load, to judge its quality (not faster; default bf16)\n\
-         \x20 --compare mxfp4|cpu|decode  optional, Kimi Linear, with --prompt-file: score the\n\
+         \x20 --compare mxfp4|cpu|decode|attention  optional, with --prompt-file: score the\n\
          \x20                      text twice (bf16 vs mxfp4 experts, CPU vs --accel, or CPU vs\n\
-         \x20                      --accel one position at a time as chat decodes) and print\n\
+         \x20                      --accel one position at a time as chat decodes, or, for\n\
+         \x20                      Gemma 4, attention on the GPU and the Neural Engine, each\n\
+         \x20                      against the CPU reference) and print\n\
          \x20                      perplexity, top-1 agreement and KL divergence\n\
          \x20 --system-one FILE    optional, Kimi Linear: answer the typed questions in a JSON\n\
          \x20                      request ({{\"state\": ..., \"questions\": {{id: {{\"type\": \"noul\" |\n\
@@ -440,6 +450,18 @@ fn print_usage() {
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
          \x20                      into DIR (4-bit, all resident within --cache-gb)\n\
+         \x20 --convert-mxfp4 DIR  optional, Gemma 4: write the decoder's matrices as MXFP4 into\n\
+         \x20                      DIR, one file per layer; the checkpoint is only read\n\
+         \x20 --quantize all|mlp   optional, with --convert-mxfp4: every matrix (default all), or\n\
+         \x20                      only the MLPs (attention stays bf16; about twice the memory)\n\
+         \x20 --mxfp4 DIR          optional, Gemma 4: run with the matrices converted into DIR\n\
+         \x20                      (the rest from the checkpoint's bf16)\n\
+         \x20 --attention gpu|npu|cpu  optional, Gemma 4 with --accel gpu: where prompt passes'\n\
+         \x20                      attention runs (default gpu; npu: the Neural Engine, fp16,\n\
+         \x20                      completions through the proactor; cpu: the reference).\n\
+         \x20                      With npu, decoding stays on the GPU\n\
+         \x20 --compare-with DIR   optional, Gemma 4, with --mxfp4 and --prompt-file: score the\n\
+         \x20                      text with --mxfp4's weights, then with DIR's, and compare\n\
          \x20 --recompute          optional: recompute the whole context every token (the old,\n\
          \x20                      slow reference path) instead of feeding only new tokens\n\
          \x20 --accel cpu|ane|gpu  optional device for the bf16 trunk products (default cpu,\n\

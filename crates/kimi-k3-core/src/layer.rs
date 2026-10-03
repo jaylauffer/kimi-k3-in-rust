@@ -157,6 +157,24 @@ pub trait DenseAccel {
         false
     }
 
+    /// Starts [`Self::grouped_attention`] without waiting for it, for a device that
+    /// computes it asynchronously; returns a ticket for
+    /// [`Self::grouped_attention_finish`], or `None` (the default) to decline, when the
+    /// caller uses [`Self::grouped_attention`]. `job.out` is not written. The keys and
+    /// values `job` names must not change until the ticket is finished.
+    #[allow(unused_variables)]
+    fn grouped_attention_start(&self, job: &mut GroupedJob<'_>) -> Option<u64> {
+        None
+    }
+
+    /// Waits for a [`Self::grouped_attention_start`] ticket and writes its result into
+    /// `out`. Returns false, with `out` unspecified, when it failed; the caller then
+    /// computes it itself and empties the job's `device` cache.
+    #[allow(unused_variables)]
+    fn grouped_attention_finish(&self, ticket: u64, out: &mut [f32]) -> bool {
+        false
+    }
+
     /// The KDA recurrence (see [`RecurrenceJob`]). Returns false, with `out` and
     /// `state` untouched, to decline; the caller then runs it on the CPU and empties
     /// `job.device`.

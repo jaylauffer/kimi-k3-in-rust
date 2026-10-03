@@ -56,6 +56,9 @@ pub enum Comparison {
     Cpu,
     /// The CPU reference, then the `--accel` device, one position at a time.
     Decode,
+    /// Gemma 4: grouped attention on the GPU, then prompt passes' attention on the
+    /// Neural Engine.
+    Attention,
 }
 
 impl Comparison {
@@ -64,8 +67,9 @@ impl Comparison {
             "mxfp4" => Ok(Self::Mxfp4),
             "cpu" => Ok(Self::Cpu),
             "decode" => Ok(Self::Decode),
+            "attention" => Ok(Self::Attention),
             other => Err(format!(
-                "--compare must be mxfp4, cpu or decode, not {other}"
+                "--compare must be mxfp4, cpu, decode or attention, not {other}"
             )),
         }
     }
@@ -95,6 +99,8 @@ pub(crate) fn mxfp4_round_trip(words: &mut [u16], cols: usize) {
 struct Stats {
     positions: usize,
     nll: [f64; 2],
+    /// Each run's negative log-likelihood at every position.
+    nll_at: [Vec<f64>; 2],
     correct: [usize; 2],
     top1_agree: usize,
     kl: Vec<f64>,
@@ -125,6 +131,7 @@ fn compare_logits(ids: &[u32], a: &[f32], b: &[f32], vocab: usize) -> Stats {
     let mut stats = Stats {
         positions,
         nll: [0.0; 2],
+        nll_at: [Vec::with_capacity(positions), Vec::with_capacity(positions)],
         correct: [0; 2],
         top1_agree: 0,
         kl: Vec::with_capacity(positions),
@@ -137,6 +144,8 @@ fn compare_logits(ids: &[u32], a: &[f32], b: &[f32], vocab: usize) -> Stats {
         let (ta, tb) = (argmax(&la), argmax(&lb));
         stats.nll[0] -= la[target];
         stats.nll[1] -= lb[target];
+        stats.nll_at[0].push(-la[target]);
+        stats.nll_at[1].push(-lb[target]);
         stats.correct[0] += usize::from(ta == target);
         stats.correct[1] += usize::from(tb == target);
         stats.top1_agree += usize::from(ta == tb);
@@ -167,6 +176,9 @@ pub fn compare(
             [(device, None), (device, ExpertFormat::Mxfp4.transform())],
         ),
         Comparison::Cpu | Comparison::Decode => (["cpu", "device"], [(None, None), (device, None)]),
+        Comparison::Attention => {
+            return Err("--compare attention is for Gemma 4 checkpoints".into());
+        }
     };
     let keep = || !cancel.load(std::sync::atomic::Ordering::Relaxed);
     let mut logits = Vec::with_capacity(2);
@@ -215,6 +227,9 @@ pub fn compare(
     Ok(())
 }
 
+/// Positions per perplexity stretch in [`report`].
+const STRETCH: usize = 1024;
+
 /// Prints how run `b`'s next-token distributions over `ids` differ from run `a`'s
 /// (`[ids][vocab]` logits each): perplexity, accuracy, top-1 agreement, KL divergence.
 #[allow(clippy::cast_precision_loss)]
@@ -259,6 +274,23 @@ pub(crate) fn report(
         worst + 1,
         tokenizer.decode_lossy(&ids[worst + 1..worst + 2]),
     );
+    // Perplexity by stretch of the text, so a fault that grows with position shows.
+    if s.positions > STRETCH {
+        let by = |run: usize| {
+            s.nll_at[run]
+                .chunks(STRETCH)
+                .map(|c| format!("{:.1}", (c.iter().sum::<f64>() / c.len() as f64).exp()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  perplexity by {STRETCH}-token stretch:\n    {}: {}\n    {}: {}",
+            names[0],
+            by(0),
+            names[1],
+            by(1)
+        );
+    }
 }
 
 #[cfg(test)]

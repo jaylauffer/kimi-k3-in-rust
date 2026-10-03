@@ -126,15 +126,32 @@ the GPU never hands work to the Neural Engine. Decoding a dense 31B reads every 
 for every token, and `loadngo-coreml`'s weight-streaming engine reads at 24-29 GB/s
 against the GPU's ~180-228 GB/s, so the Neural Engine is a poor fit for decoding.
 
-A prototype for attention exists (2026-10-03, at Jay's request): loadngo-coreml's
-`AttentionEngine` runs Gemma's grouped attention on the Neural Engine, with each
-prediction's completion delivered through the loadngo proactor. On a full window
-(a 512-position pass over the 1,536-slot ring), it takes 9.75 ms against the GPU kernel's
-21.9 ms. It runs concurrently with GPU work: 79 ms together against 141-144 ms in
-sequence. Errors are fp16-sized (RMS ~1.5e-3). Single tokens are slower than on the
-GPU. Figures and the four steps an integration would take are in loadngo
-`docs/NPU_ACCELERATION.md`, "Grouped-query attention on the Neural Engine, through the
-proactor".
+Attention for prompts can run there (2026-10-03, at Jay's request): `--attention npu`
+sends every prompt pass's grouped attention to the Neural Engine through loadngo-coreml's
+`AttentionEngine`, its completions arriving through the loadngo proactor, while
+decoding stays on the GPU. Prompt passes run in pairs so the Neural Engine computes one
+pass's attention while the GPU computes the other's products (`GemmaModel::run_pair`;
+`DenseAccel::grouped_attention_start`/`_finish`).
+
+- Speed, 6,014-token prompt: 140.5 s with GPU attention, 112.6 s with `--attention npu`
+  (-20%). Decoding is unchanged.
+- Accuracy (`--compare attention`, each against CPU attention with the same GPU
+  products): GPU exact (top-1 100%, KL 0.00000); Neural Engine top-1 97.1%, KL mean
+  0.033, median 0.0002, one position at 34 nats. `K3_NPU_CHECK=1` computes every Neural
+  Engine pass on the GPU too and prints the largest difference: fp16 rounding throughout
+  (at most 0.13 on values of 4-6), no faulty pass.
+- The default stays `--attention gpu` until Jay decides whether fp16 attention is good
+  enough for prompts.
+- Tests: the tiny transformers oracle with Neural Engine attention, single passes and a
+  pair (`gemma::tests::npu_attention_matches_the_transformers_oracle`).
+
+Details and the prototype's measurements: loadngo `docs/NPU_ACCELERATION.md`,
+"Grouped-query attention on the Neural Engine, through the proactor".
+
+The perplexity of about 749 on that text is the same with CPU, GPU and (725) Neural
+Engine attention, so it is not an attention fault. It comes from the model (an
+instruction-tuned model scoring raw text, logits soft-capped at ±30) or from the 4-bit
+conversion; not yet separated.
 
 ## Next
 

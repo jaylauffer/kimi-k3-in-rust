@@ -723,10 +723,29 @@ impl GemmaModel {
     ) -> Result<Vec<f32>, LinearError> {
         self.check(session, ids)?;
         let mut logits = Vec::new();
-        for chunk in ids.chunks(CHUNK) {
-            match self.run(session, chunk, accel, all_logits, &mut keep_running) {
+        let chunks: Vec<&[u32]> = ids.chunks(CHUNK).collect();
+        let mut at = 0;
+        while at < chunks.len() {
+            // Two passes at once when there are two and a device: its attention for one can
+            // run while it computes the other's products (see `run_pair`).
+            let pair = accel.is_some() && at + 1 < chunks.len();
+            let result = if pair {
+                self.run_pair(
+                    session,
+                    [chunks[at], chunks[at + 1]],
+                    accel,
+                    all_logits,
+                    &mut keep_running,
+                )
+            } else {
+                self.run(session, chunks[at], accel, all_logits, &mut keep_running)
+            };
+            let taken = if pair { 2 } else { 1 };
+            match result {
                 Ok(rows) => {
-                    session.ids.extend_from_slice(chunk);
+                    for chunk in &chunks[at..at + taken] {
+                        session.ids.extend_from_slice(chunk);
+                    }
                     if all_logits {
                         logits.extend_from_slice(&rows);
                     } else {
@@ -738,20 +757,15 @@ impl GemmaModel {
                     return Err(error);
                 }
             }
+            at += taken;
         }
         Ok(logits)
     }
 
-    fn run(
-        &self,
-        session: &mut GemmaSession,
-        ids: &[u32],
-        accel: Accel<'_>,
-        all_logits: bool,
-        keep_running: &mut dyn FnMut() -> bool,
-    ) -> Result<Vec<f32>, LinearError> {
-        let c = &self.config;
-        let (e, t, start) = (c.hidden_size, ids.len(), session.ids.len());
+    /// A pass of `ids` starting at position `start`: embedded, with its rotary angles.
+    fn begin(&self, ids: &[u32], start: usize) -> Pass {
+        let e = self.config.hidden_size;
+        let t = ids.len();
         let mut h = vec![0.0_f32; t * e];
         let WeightRef::Bf16(embed) = self.embed.as_ref() else {
             unreachable!("the embedding is read as bf16");
@@ -775,57 +789,83 @@ impl GemmaModel {
             }
             (cos, sin)
         };
-        let ropes = [rope(&self.sliding_freq), rope(&self.full_freq)];
-        let mut x = vec![0.0_f32; t * e];
-        let mut tmp = vec![0.0_f32; t * e];
-        let mut scratch = Scratch::default();
-        for (l, (layer, kv)) in self.layers.iter().zip(&mut session.kv).enumerate() {
-            if !keep_running() {
-                return Err(LinearError::Cancelled);
-            }
-            for (y, hx) in x.chunks_exact_mut(e).zip(h.chunks_exact(e)) {
-                rmsnorm(y, hx, &layer.in_norm, c.rms_norm_eps);
-            }
-            let (cos, sin) = &ropes[usize::from(layer.full)];
-            self.attention(
-                &mut tmp,
-                &x,
-                layer,
-                l,
-                kv,
-                start,
-                (cos, sin),
-                accel,
-                &mut scratch,
-            );
-            for (hi, a) in h.chunks_exact_mut(e).zip(tmp.chunks_exact_mut(e)) {
-                rmsnorm(&mut x[..e], a, &layer.post_attn_norm, c.rms_norm_eps);
-                for (hv, &av) in hi.iter_mut().zip(&x[..e]) {
-                    *hv += av;
-                }
-            }
-            for (y, hx) in x.chunks_exact_mut(e).zip(h.chunks_exact(e)) {
-                rmsnorm(y, hx, &layer.pre_ff_norm, c.rms_norm_eps);
-            }
-            self.mlp(&mut tmp, &x, layer, t, accel, &mut scratch);
-            for (hi, m) in h.chunks_exact_mut(e).zip(tmp.chunks_exact(e)) {
-                let normed = &mut scratch.row;
-                normed.resize(e, 0.0);
-                rmsnorm(normed, m, &layer.post_ff_norm, c.rms_norm_eps);
-                for (hv, &mv) in hi.iter_mut().zip(normed.iter()) {
-                    *hv = (*hv + mv) * layer.scalar;
-                }
+        Pass {
+            start,
+            t,
+            ropes: [rope(&self.sliding_freq), rope(&self.full_freq)],
+            x: vec![0.0; t * e],
+            tmp: vec![0.0; t * e],
+            h,
+            s: Scratch::default(),
+        }
+    }
+
+    /// Layer `l` up to its attention: the input norm, the projections with their norms
+    /// and rotation, and this pass's keys and values written into `kv`.
+    fn front(&self, pass: &mut Pass, l: usize, kv: &mut Kv, accel: Accel<'_>) {
+        let c = &self.config;
+        let layer = &self.layers[l];
+        let e = c.hidden_size;
+        for (y, hx) in pass.x.chunks_exact_mut(e).zip(pass.h.chunks_exact(e)) {
+            rmsnorm(y, hx, &layer.in_norm, c.rms_norm_eps);
+        }
+        let (cos, sin) = &pass.ropes[usize::from(layer.full)];
+        self.project(
+            &pass.x,
+            layer,
+            l,
+            kv,
+            pass.start,
+            (cos, sin),
+            accel,
+            &mut pass.s,
+        );
+    }
+
+    /// Layer `l` after its attention (in `pass.s.attn`): the output projection, both
+    /// norms and residuals, the MLP and the layer scalar.
+    fn back(&self, pass: &mut Pass, l: usize, accel: Accel<'_>) {
+        let c = &self.config;
+        let layer = &self.layers[l];
+        let (e, t) = (c.hidden_size, pass.t);
+        products(
+            accel,
+            &mut [Mul {
+                x: &pass.s.attn,
+                rows: t,
+                parts: vec![(&layer.o, &mut pass.tmp[..])],
+            }],
+        );
+        for (hi, a) in pass.h.chunks_exact_mut(e).zip(pass.tmp.chunks_exact(e)) {
+            rmsnorm(&mut pass.x[..e], a, &layer.post_attn_norm, c.rms_norm_eps);
+            for (hv, &av) in hi.iter_mut().zip(&pass.x[..e]) {
+                *hv += av;
             }
         }
-        if !keep_running() {
-            return Err(LinearError::Cancelled);
+        for (y, hx) in pass.x.chunks_exact_mut(e).zip(pass.h.chunks_exact(e)) {
+            rmsnorm(y, hx, &layer.pre_ff_norm, c.rms_norm_eps);
         }
+        self.mlp(&mut pass.tmp, &pass.x, layer, t, accel, &mut pass.s);
+        for (hi, m) in pass.h.chunks_exact_mut(e).zip(pass.tmp.chunks_exact(e)) {
+            let normed = &mut pass.s.row;
+            normed.resize(e, 0.0);
+            rmsnorm(normed, m, &layer.post_ff_norm, c.rms_norm_eps);
+            for (hv, &mv) in hi.iter_mut().zip(normed.iter()) {
+                *hv = (*hv + mv) * layer.scalar;
+            }
+        }
+    }
+
+    /// The final norm and the logits of `pass` (every position, or only its last).
+    fn end(&self, pass: &Pass, all_logits: bool, accel: Accel<'_>) -> Vec<f32> {
+        let c = &self.config;
+        let (e, t) = (c.hidden_size, pass.t);
         let first = if all_logits { 0 } else { t - 1 };
         let rows = t - first;
         let mut normed = vec![0.0_f32; rows * e];
         for (y, hx) in normed
             .chunks_exact_mut(e)
-            .zip(h[first * e..].chunks_exact(e))
+            .zip(pass.h[first * e..].chunks_exact(e))
         {
             rmsnorm(y, hx, &self.norm, c.rms_norm_eps);
         }
@@ -843,13 +883,115 @@ impl GemmaModel {
                 *v = cap * (*v / cap).tanh();
             }
         }
+        logits
+    }
+
+    fn run(
+        &self,
+        session: &mut GemmaSession,
+        ids: &[u32],
+        accel: Accel<'_>,
+        all_logits: bool,
+        keep_running: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, LinearError> {
+        let mut pass = self.begin(ids, session.ids.len());
+        for (l, kv) in session.kv.iter_mut().enumerate() {
+            if !keep_running() {
+                return Err(LinearError::Cancelled);
+            }
+            self.front(&mut pass, l, kv, accel);
+            self.attend(l, kv, pass.start, pass.t, accel, &mut pass.s);
+            self.back(&mut pass, l, accel);
+        }
+        if !keep_running() {
+            return Err(LinearError::Cancelled);
+        }
+        Ok(self.end(&pass, all_logits, accel))
+    }
+
+    /// Two consecutive passes, interleaved so a device that computes attention
+    /// asynchronously (the Neural Engine) works on one pass while the GPU computes the
+    /// other's products. Per layer `l`, in this order:
+    ///
+    /// ```text
+    /// front(0, l), start attention(0, l)
+    /// finish attention(1, l - 1), back(1, l - 1)      // overlaps attention(0, l)
+    /// finish attention(0, l)
+    /// front(1, l), start attention(1, l)              // after (0, l): the ring allows
+    /// back(0, l)                                      // one pass in flight per layer
+    /// ```
+    ///
+    /// Each layer's cache receives pass 0's rows, then pass 0's attention runs, then pass
+    /// 1's rows and attention, as when the passes run one after the other, so the result
+    /// is the same; without asynchronous attention it is computed in exactly that order.
+    fn run_pair(
+        &self,
+        session: &mut GemmaSession,
+        ids: [&[u32]; 2],
+        accel: Accel<'_>,
+        all_logits: bool,
+        keep_running: &mut dyn FnMut() -> bool,
+    ) -> Result<Vec<f32>, LinearError> {
+        let start = session.ids.len();
+        let mut p0 = self.begin(ids[0], start);
+        let mut p1 = self.begin(ids[1], start + ids[0].len());
+        let layers = self.layers.len();
+        let mut pending1: Option<u64> = None;
+        for l in 0..=layers {
+            if !keep_running() {
+                // Collect what is still in flight before giving up.
+                if let Some(ticket) = pending1.take() {
+                    let kv = &mut session.kv[l - 1];
+                    self.attend_finish(ticket, l - 1, kv, p1.start, p1.t, accel, &mut p1.s);
+                }
+                return Err(LinearError::Cancelled);
+            }
+            let pending0 = if l < layers {
+                let kv = &mut session.kv[l];
+                self.front(&mut p0, l, kv, accel);
+                self.attend_start(l, kv, p0.start, p0.t, accel, &mut p0.s)
+            } else {
+                None
+            };
+            if l > 0 {
+                let kv = &mut session.kv[l - 1];
+                if let Some(ticket) = pending1.take() {
+                    self.attend_finish(ticket, l - 1, kv, p1.start, p1.t, accel, &mut p1.s);
+                }
+                self.back(&mut p1, l - 1, accel);
+            }
+            if l == layers {
+                break;
+            }
+            let kv = &mut session.kv[l];
+            match pending0 {
+                Some(ticket) => {
+                    self.attend_finish(ticket, l, kv, p0.start, p0.t, accel, &mut p0.s);
+                }
+                None => self.attend(l, kv, p0.start, p0.t, accel, &mut p0.s),
+            }
+            self.front(&mut p1, l, kv, accel);
+            pending1 = self.attend_start(l, kv, p1.start, p1.t, accel, &mut p1.s);
+            if pending1.is_none() {
+                self.attend(l, kv, p1.start, p1.t, accel, &mut p1.s);
+            }
+            self.back(&mut p0, l, accel);
+        }
+        if !keep_running() {
+            return Err(LinearError::Cancelled);
+        }
+        let mut logits = Vec::new();
+        if all_logits {
+            logits.extend(self.end(&p0, true, accel));
+        }
+        logits.extend(self.end(&p1, all_logits, accel));
         Ok(logits)
     }
 
-    #[allow(clippy::too_many_lines)] // one attention block, read top to bottom
-    fn attention(
+    /// The projections of layer `l` with their norms and rotation (into `s.q`, `s.k`,
+    /// `s.v`), and this pass's keys and values written into `kv`.
+    fn project(
         &self,
-        out: &mut [f32],
         x: &[f32],
         layer: &Layer,
         l: usize,
@@ -895,7 +1037,6 @@ impl GemmaModel {
                 rms_unscaled(head, c.rms_norm_eps);
             }
         }
-        // Store the new keys and values.
         let slots = kv.slots;
         let needed = slots.min(start + t) * kw;
         if kv.k.len() < needed {
@@ -907,41 +1048,112 @@ impl GemmaModel {
             kv.k[slot * kw..(slot + 1) * kw].copy_from_slice(&s.k[i * kw..(i + 1) * kw]);
             kv.v[slot * kw..(slot + 1) * kw].copy_from_slice(&s.v[i * kw..(i + 1) * kw]);
         }
-        let window = if layer.full {
+    }
+
+    /// Layer `l`'s attention job over `kv` (its output `s.attn`).
+    fn job<'a>(
+        &self,
+        l: usize,
+        kv: &'a mut Kv,
+        start: usize,
+        t: usize,
+        s: &'a mut Scratch,
+    ) -> GroupedJob<'a> {
+        let c = &self.config;
+        let (hd, kvh, _) = c.attention(l);
+        let heads = c.num_attention_heads;
+        s.attn.resize(t * heads * hd, 0.0);
+        let rows = kv.slots.min(start + t) * kvh * hd;
+        GroupedJob {
+            q: &s.q,
+            k: &kv.k[..rows],
+            v: &kv.v[..rows],
+            out: &mut s.attn,
+            t,
+            start,
+            heads,
+            kv_heads: kvh,
+            dim: hd,
+            window: if self.layers[l].full {
+                usize::MAX
+            } else {
+                c.sliding_window
+            },
+            slots: kv.slots,
+            scale: 1.0,
+            device: &mut kv.device,
+        }
+    }
+
+    /// Layer `l`'s attention now, on the device or the CPU (into `s.attn`).
+    fn attend(
+        &self,
+        l: usize,
+        kv: &mut Kv,
+        start: usize,
+        t: usize,
+        accel: Accel<'_>,
+        s: &mut Scratch,
+    ) {
+        let on_device =
+            accel.is_some_and(|device| device.grouped_attention(&mut self.job(l, kv, start, t, s)));
+        if !on_device {
+            kv.device.0 = None;
+            self.cpu_attention_for(l, kv, start, t, s);
+        }
+    }
+
+    /// Starts layer `l`'s attention on a device that computes it asynchronously; `None`
+    /// when it does not (the caller then uses [`Self::attend`]).
+    fn attend_start(
+        &self,
+        l: usize,
+        kv: &mut Kv,
+        start: usize,
+        t: usize,
+        accel: Accel<'_>,
+        s: &mut Scratch,
+    ) -> Option<u64> {
+        accel.and_then(|device| device.grouped_attention_start(&mut self.job(l, kv, start, t, s)))
+    }
+
+    /// Collects attention started by [`Self::attend_start`] (into `s.attn`); computes it on
+    /// the CPU if the device failed. `kv` must still hold the pass's keys and values.
+    fn attend_finish(
+        &self,
+        ticket: u64,
+        l: usize,
+        kv: &mut Kv,
+        start: usize,
+        t: usize,
+        accel: Accel<'_>,
+        s: &mut Scratch,
+    ) {
+        let heads = self.config.num_attention_heads;
+        let (hd, _, _) = self.config.attention(l);
+        s.attn.resize(t * heads * hd, 0.0);
+        let done = accel.is_some_and(|device| device.grouped_attention_finish(ticket, &mut s.attn));
+        if !done {
+            kv.device.0 = None;
+            self.cpu_attention_for(l, kv, start, t, s);
+        }
+    }
+
+    fn cpu_attention_for(&self, l: usize, kv: &Kv, start: usize, t: usize, s: &mut Scratch) {
+        let c = &self.config;
+        let (hd, kvh, _) = c.attention(l);
+        s.attn.resize(t * c.num_attention_heads * hd, 0.0);
+        let window = if self.layers[l].full {
             usize::MAX
         } else {
             c.sliding_window
         };
-        s.attn.resize(t * qw, 0.0);
-        let rows = slots.min(start + t) * kw;
-        let on_device = accel.is_some_and(|device| {
-            device.grouped_attention(&mut GroupedJob {
-                q: &s.q,
-                k: &kv.k[..rows],
-                v: &kv.v[..rows],
-                out: &mut s.attn,
-                t,
-                start,
-                heads,
-                kv_heads: kvh,
-                dim: hd,
-                window,
-                slots,
-                scale: 1.0,
-                device: &mut kv.device,
-            })
-        });
-        if !on_device {
-            kv.device.0 = None;
-            self.cpu_attention(s, kv, (t, start, slots), (heads, kvh, hd), window);
-        }
-        products(
-            accel,
-            &mut [Mul {
-                x: &s.attn,
-                rows: t,
-                parts: vec![(&layer.o, out)],
-            }],
+        self.cpu_attention(
+            s,
+            kv,
+            (t, start, kv.slots),
+            (c.num_attention_heads, kvh, hd),
+            window,
         );
     }
 
@@ -1052,6 +1264,18 @@ impl GemmaModel {
             }],
         );
     }
+}
+
+/// One pass's hidden state and buffers.
+struct Pass {
+    start: usize,
+    t: usize,
+    /// Rotary cosines and sines for sliding and full layers.
+    ropes: [(Vec<f32>, Vec<f32>); 2],
+    h: Vec<f32>,
+    x: Vec<f32>,
+    tmp: Vec<f32>,
+    s: Scratch,
 }
 
 /// Per-pass intermediates, grown as needed.

@@ -242,6 +242,7 @@ pub fn run(
         return convert(&args.model_dir, out, args.quantize, &mut gate, cancel);
     }
     let device = accel::Device::open(args.accel)?;
+    device.set_attention(args.attention)?;
     let gpu = if args.accel == accel::AccelKind::Gpu {
         Some(device.accel().ok_or("the GPU device did not open")?)
     } else {
@@ -298,6 +299,29 @@ pub fn run(
             (quality::Comparison::Cpu, _) => {
                 let a = score(&model, None, false)?;
                 (["cpu", "device"], a, score(&model, device.accel(), false)?)
+            }
+            (quality::Comparison::Attention, _) => {
+                // Each device against the CPU reference, products on the GPU throughout.
+                device.set_attention(accel::AttentionDevice::Cpu)?;
+                let reference = score(&model, device.accel(), false)?;
+                device.set_attention(accel::AttentionDevice::Gpu)?;
+                let gpu_logits = score(&model, device.accel(), false)?;
+                quality::report(
+                    ["attention on the CPU", "on the GPU"],
+                    &ids,
+                    &reference,
+                    &gpu_logits,
+                    vocab,
+                    tokenizer,
+                );
+                drop(gpu_logits);
+                device.set_attention(accel::AttentionDevice::Npu)?;
+                let npu_logits = score(&model, device.accel(), false)?;
+                (
+                    ["attention on the CPU", "on the Neural Engine"],
+                    reference,
+                    npu_logits,
+                )
             }
             (quality::Comparison::Decode, _) => {
                 let a = score(&model, None, false)?;
@@ -528,6 +552,66 @@ mod tests {
     /// The GPU path (resident weights, Metal products, grouped attention) against
     /// transformers' logits for the tiny oracle model (see `scripts/gemma_tiny_oracle.py`),
     /// fed whole and then a token at a time. Fails if the GPU declined the work.
+    /// As [`gpu_matches_the_transformers_oracle`] with prompt passes' attention on the
+    /// Neural Engine (fp16): looser bounds, and every prompt pass must have run there.
+    #[test]
+    fn npu_attention_matches_the_transformers_oracle() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gemma4/tiny");
+        let oracle: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("oracle.json")).unwrap()).unwrap();
+        let ids: Vec<u32> = serde_json::from_value(oracle["ids"].clone()).unwrap();
+        let positions: Vec<usize> = serde_json::from_value(oracle["positions"].clone()).unwrap();
+        let want: Vec<Vec<f32>> = serde_json::from_value(oracle["logits"].clone()).unwrap();
+        let device = accel::Device::open(accel::AccelKind::Gpu).unwrap();
+        device.set_attention(accel::AttentionDevice::Npu).unwrap();
+        let gpu = device.accel();
+        let model = GemmaModel::load(&dir, None, gpu, || true).unwrap();
+        let vocab = model.config.vocab_size;
+        let mut session = model.session(ids.len());
+        // A whole pass, then pieces and single tokens: the Neural Engine's cache must
+        // keep up through the GPU's decoding steps.
+        let mut fed = 0;
+        for size in [512, 40, 1, 1, 33, 13] {
+            let end = (fed + size).min(ids.len());
+            let all = model
+                .score(&mut session, &ids[fed..end], gpu, || true)
+                .unwrap();
+            for (k, &p) in positions
+                .iter()
+                .enumerate()
+                .filter(|&(_, &p)| p >= fed && p < end)
+            {
+                let row = &all[(p - fed) * vocab..(p - fed + 1) * vocab];
+                let error = row
+                    .iter()
+                    .zip(&want[k])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(error < 5e-2, "position {p}: {error}");
+            }
+            fed = end;
+        }
+        // The whole text in one call: a pair of passes (512 + 88), both started on the
+        // Neural Engine and finished through the proactor while the GPU works.
+        let mut session = model.session(ids.len());
+        let all = model.score(&mut session, &ids, gpu, || true).unwrap();
+        for (&p, w) in positions.iter().zip(&want) {
+            let row = &all[p * vocab..(p + 1) * vocab];
+            let error = row
+                .iter()
+                .zip(w)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            assert!(error < 5e-2, "paired passes, position {p}: {error}");
+        }
+        let summary = device.summary();
+        assert!(!summary.contains(" 0 on the Neural Engine"), "{summary}");
+        assert!(
+            summary.contains(", 0 on the GPU after a Neural Engine failure"),
+            "{summary}"
+        );
+    }
+
     #[test]
     fn gpu_matches_the_transformers_oracle() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/gemma4/tiny");
@@ -565,7 +649,7 @@ mod tests {
         let summary = device.summary();
         assert!(summary.contains("0 GPU failures"), "{summary}");
         assert!(
-            summary.contains("0 on the CPU after a GPU failure | "),
+            summary.contains(", 0 on the CPU after a GPU failure, "),
             "{summary}"
         );
         assert!(!summary.contains("grouped attention 0 layers"), "{summary}");

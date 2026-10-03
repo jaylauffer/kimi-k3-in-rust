@@ -43,6 +43,28 @@ impl AccelKind {
 }
 
 /// The selected device, owned for the whole process.
+/// Where Gemma 4's grouped attention runs, with `--accel gpu`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionDevice {
+    /// Every pass on the GPU (the default).
+    Gpu,
+    /// Prompt passes on the Neural Engine, decoding on the GPU.
+    Npu,
+    /// The CPU reference, products still on the GPU (for comparisons).
+    Cpu,
+}
+
+impl AttentionDevice {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "gpu" => Ok(Self::Gpu),
+            "npu" => Ok(Self::Npu),
+            "cpu" => Ok(Self::Cpu),
+            other => Err(format!("--attention must be gpu, npu or cpu, not {other}")),
+        }
+    }
+}
+
 pub enum Device {
     Cpu,
     #[cfg(target_os = "macos")]
@@ -73,6 +95,22 @@ impl Device {
             Self::Ane(device) => Some(&**device as &dyn DenseAccel),
             #[cfg(target_os = "macos")]
             Self::Gpu(device) => Some(&**device as &dyn DenseAccel),
+        }
+    }
+
+    /// Where grouped attention (Gemma 4) runs, with `--accel gpu` only.
+    ///
+    /// # Errors
+    /// For any other device, unless `on` is the GPU (the default).
+    pub fn set_attention(&self, on: AttentionDevice) -> Result<(), String> {
+        match self {
+            #[cfg(target_os = "macos")]
+            Self::Gpu(device) => {
+                device.set_attention(on);
+                Ok(())
+            }
+            _ if on == AttentionDevice::Gpu => Ok(()),
+            _ => Err("--attention npu|cpu needs --accel gpu".into()),
         }
     }
 
@@ -265,6 +303,10 @@ mod gpu {
         grouped_gpu_s: f64,
         grouped_wall_s: f64,
         grouped_failed: u64,
+        npu_attention: u64,
+        npu_attention_s: f64,
+        npu_attention_wall_s: f64,
+        npu_attention_failed: u64,
         recurrence: u64,
         recurrence_gpu_s: f64,
         recurrence_wall_s: f64,
@@ -297,6 +339,36 @@ mod gpu {
         synced: usize,
     }
 
+    /// A grouped-attention layer's keys and values on each device that has run it.
+    #[derive(Default)]
+    struct GroupedCopies {
+        gpu: Option<RingCopy>,
+        npu: Option<loadngo_coreml::attention::KvCache>,
+    }
+
+    /// Where a Neural Engine pass's completion job leaves its result, with when it was
+    /// started.
+    type NpuSlot = (
+        Arc<Mutex<Option<Result<loadngo_coreml::attention::AttentionOutput, String>>>>,
+        Instant,
+    );
+
+    /// `job` as the Neural Engine's attention pass.
+    fn npu_pass_of<'a>(job: &'a GroupedJob<'_>) -> loadngo_coreml::attention::AttentionPass<'a> {
+        loadngo_coreml::attention::AttentionPass {
+            q: job.q,
+            k: job.k,
+            v: job.v,
+            t: job.t,
+            start: job.start,
+            heads: job.heads,
+            kv_heads: job.kv_heads,
+            dim: job.dim,
+            window: job.window,
+            slots: job.slots,
+        }
+    }
+
     struct CacheCopy {
         kv: Buffer,
         rope: Buffer,
@@ -321,6 +393,13 @@ mod gpu {
         /// GPU memory once, by the address and length the model holds them at.
         constants: RefCell<HashMap<(usize, usize), Arc<Resident>>>,
         ane: Ane,
+        /// Grouped attention on the Neural Engine, created on first use.
+        npu: RefCell<Option<loadngo_coreml::attention::AttentionEngine>>,
+        /// Neural Engine passes started and not yet finished, by ticket.
+        npu_pending: RefCell<HashMap<u64, NpuSlot>>,
+        npu_next: Cell<u64>,
+        /// Where grouped attention runs.
+        attention: Cell<super::AttentionDevice>,
         stats: Cell<Stats>,
     }
 
@@ -414,8 +493,17 @@ mod gpu {
                 work: RefCell::new(None),
                 constants: RefCell::new(HashMap::new()),
                 ane: Ane::new()?,
+                npu: RefCell::new(None),
+                npu_pending: RefCell::new(HashMap::new()),
+                npu_next: Cell::new(1),
+                attention: Cell::new(super::AttentionDevice::Gpu),
                 stats: Cell::new(Stats::default()),
             })
+        }
+
+        /// Where grouped attention runs (see [`super::AttentionDevice`]).
+        pub fn set_attention(&self, on: super::AttentionDevice) {
+            self.attention.set(on);
         }
 
         fn update(&self, f: impl FnOnce(&mut Stats)) {
@@ -449,8 +537,10 @@ mod gpu {
                  after a GPU failure; expert layers {} fused, {:.2} ms GPU, {:.2} ms wall \
                  each, {} as separate products after a GPU failure; MLA blocks {} fused, \
                  {:.2} ms GPU, {:.2} ms wall each, {} run step by step after a GPU failure; \
-                 grouped attention {} layers on the GPU, {:.2} ms GPU, {:.2} ms wall each, \
-                 {} on the CPU after a GPU failure | {}",
+                 grouped attention {} layers on the GPU ({:.2} ms GPU each), {} on the \
+                 Neural Engine ({:.2} ms each, {:.2} ms wall), {:.2} ms wall per layer in all, \
+                 {} on the CPU after a GPU failure, {} on the GPU after a Neural Engine \
+                 failure | {}",
                 self.metal.name(),
                 s.shared_bytes as f64 / 1e9,
                 self.metal.wired_bytes() as f64 / 1e9,
@@ -496,8 +586,12 @@ mod gpu {
                 s.mla_block_failed,
                 s.grouped,
                 each(s.grouped_gpu_s, s.grouped),
-                each(s.grouped_wall_s, s.grouped),
+                s.npu_attention,
+                each(s.npu_attention_s, s.npu_attention),
+                each(s.npu_attention_wall_s, s.npu_attention),
+                each(s.grouped_wall_s, s.grouped + s.npu_attention),
                 s.grouped_failed,
+                s.npu_attention_failed,
                 self.ane.summary()
             )
         }
@@ -1216,30 +1310,18 @@ mod gpu {
             Ok(())
         }
 
-        /// Grouped-query attention on the GPU. The layer's keys and values stay in GPU
-        /// memory between calls; each call copies in only the rows of its own positions,
-        /// unless the copy is missing or behind (a new or restored session), when it takes
-        /// them all.
-        #[allow(clippy::too_many_lines)] // the cache copy, then one dispatch
-        fn grouped(&self, job: &mut GroupedJob<'_>) -> Result<(), String> {
-            let start = Instant::now();
+        /// The GPU copy of a grouped-attention layer's keys and values, brought up to `job`:
+        /// only its own rows when the copy holds every earlier position, all of them
+        /// otherwise (a new or restored session). Room for `readable` rows.
+        fn ring_copy(
+            &self,
+            old: Option<RingCopy>,
+            job: &GroupedJob<'_>,
+            readable: usize,
+        ) -> Result<RingCopy, String> {
             let row = job.kv_heads * job.dim;
             let end = job.start + job.t;
             let rows = job.slots.min(end);
-            // A prompt pass goes to the matrix units, which read rows up to the next
-            // multiple of 32 (finite, multiplied by zero) and want padded queries.
-            let tiled = job.t >= GROUPED_TILED_FROM && job.dim % 16 == 0;
-            let readable = if job.slots < end {
-                job.slots
-            } else {
-                end.next_multiple_of(32)
-            };
-            let old = job
-                .device
-                .0
-                .take()
-                .and_then(|state| state.downcast::<RingCopy>().ok())
-                .map(|copy| *copy);
             let mut copy = match old {
                 Some(copy) if copy.rows >= readable && copy.synced == job.start => copy,
                 old => {
@@ -1276,7 +1358,236 @@ mod gpu {
                 copy.v.as_f32_mut()[..rows * row].copy_from_slice(&job.v[..rows * row]);
             }
             copy.synced = end;
+            Ok(copy)
+        }
 
+        /// Grouped-query attention. The layer's keys and values stay in GPU memory and,
+        /// once a prompt pass has run there, on the Neural Engine; every pass writes its
+        /// own rows into both, whichever device computes it. Prompt passes (32 positions
+        /// or more) go to the Neural Engine when it is enabled
+        /// ([`Self::set_attention`]) and the pass fits it; everything else, and any
+        /// pass the Neural Engine refuses or fails, runs on the GPU.
+        fn grouped(&self, job: &mut GroupedJob<'_>) -> Result<(), String> {
+            let start = Instant::now();
+            let end = job.start + job.t;
+            let readable = if job.slots < end {
+                job.slots
+            } else {
+                end.next_multiple_of(32)
+            };
+            let mut copies = job
+                .device
+                .0
+                .take()
+                .and_then(|state| state.downcast::<GroupedCopies>().ok())
+                .map_or_else(GroupedCopies::default, |copies| *copies);
+            let ring = self.ring_copy(copies.gpu.take(), job, readable)?;
+            let prompt = job.t >= GROUPED_TILED_FROM;
+            let on_npu = prompt
+                && self.attention.get() == super::AttentionDevice::Npu
+                && match self.npu_pass(job, &mut copies.npu) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        copies.npu = None;
+                        self.update(|s| s.npu_attention_failed += 1);
+                        if self.stats.get().npu_attention_failed <= 3 {
+                            eprintln!("npu: attention computed on the GPU instead: {error}");
+                        }
+                        false
+                    }
+                };
+            let ring = if on_npu && std::env::var_os("K3_NPU_CHECK").is_some() {
+                // Diagnostic: the same pass on the GPU, and the largest difference.
+                let npu_out = job.out.to_vec();
+                let ring = self.gpu_pass(job, ring, readable)?;
+                let (mut worst, mut at) = (0.0_f32, 0);
+                for (i, (a, b)) in npu_out.iter().zip(job.out.iter()).enumerate() {
+                    let d = (a - b).abs();
+                    if d > worst || d.is_nan() {
+                        (worst, at) = (d, i);
+                    }
+                }
+                let width = job.heads * job.dim;
+                eprintln!(
+                    "npu check: pass at {} (+{}), {} keys, dim {}: max |npu - gpu| {worst:.3e} at position {} head {} (npu {:.4}, gpu {:.4})",
+                    job.start,
+                    job.t,
+                    job.slots.min(end),
+                    job.dim,
+                    job.start + at / width,
+                    (at % width) / job.dim,
+                    npu_out[at],
+                    job.out[at]
+                );
+                job.out.copy_from_slice(&npu_out);
+                ring
+            } else if on_npu {
+                ring
+            } else {
+                if copies.npu.is_some() {
+                    // Keep the Neural Engine's copy current for the next prompt pass.
+                    let pass = npu_pass_of(job);
+                    let mut engine = self.npu_engine()?;
+                    let _ = engine
+                        .as_mut()
+                        .ok_or("no Neural Engine attention")?
+                        .sync(&pass, &mut copies.npu);
+                }
+                self.gpu_pass(job, ring, readable)?
+            };
+            copies.gpu = Some(ring);
+            job.device.0 = Some(Box::new(copies));
+            self.update(|s| s.grouped_wall_s += start.elapsed().as_secs_f64());
+            Ok(())
+        }
+
+        /// The Neural Engine's attention engine, created on first use.
+        fn npu_engine(
+            &self,
+        ) -> Result<std::cell::RefMut<'_, Option<loadngo_coreml::attention::AttentionEngine>>, String>
+        {
+            let mut engine = self.npu.borrow_mut();
+            if engine.is_none() {
+                *engine = Some(loadngo_coreml::attention::AttentionEngine::new(
+                    loadngo_inference::compute::ComputePolicy::CpuAndNpu,
+                )?);
+            }
+            Ok(engine)
+        }
+
+        /// One pass on the Neural Engine, its completion received through this device's
+        /// proactor (the loop blocks in the proactor's wait, as for GPU batches).
+        fn npu_pass(
+            &self,
+            job: &mut GroupedJob<'_>,
+            cache: &mut Option<loadngo_coreml::attention::KvCache>,
+        ) -> Result<(), String> {
+            let started = Instant::now();
+            let pass = npu_pass_of(job);
+            let slot: Arc<
+                Mutex<Option<Result<loadngo_coreml::attention::AttentionOutput, String>>>,
+            > = Arc::default();
+            let filled = Arc::clone(&slot);
+            self.npu_engine()?
+                .as_mut()
+                .ok_or("no Neural Engine attention")?
+                .submit(&pass, cache, &self.proactor.handle(), move |result| {
+                    *filled.lock().expect("completion slot") = Some(result);
+                })?;
+            let done = loop {
+                self.proactor.run_once().map_err(|e| e.to_string())?;
+                if let Some(done) = slot.lock().expect("completion slot").take() {
+                    break done?;
+                }
+            };
+            job.out.copy_from_slice(&done.out);
+            self.update(|s| {
+                s.npu_attention += 1;
+                s.npu_attention_s += done.latency.as_secs_f64();
+                s.npu_attention_wall_s += started.elapsed().as_secs_f64();
+            });
+            Ok(())
+        }
+
+        /// Starts a prompt pass on the Neural Engine and returns its ticket; `None` when
+        /// it should run synchronously (not a prompt pass, the Neural Engine is not
+        /// selected, or it refused the pass).
+        fn npu_start(&self, job: &mut GroupedJob<'_>) -> Option<u64> {
+            if job.t < GROUPED_TILED_FROM
+                || self.attention.get() != super::AttentionDevice::Npu
+                || std::env::var_os("K3_NPU_CHECK").is_some()
+            {
+                return None;
+            }
+            let end = job.start + job.t;
+            let readable = if job.slots < end {
+                job.slots
+            } else {
+                end.next_multiple_of(32)
+            };
+            let mut copies = job
+                .device
+                .0
+                .take()
+                .and_then(|state| state.downcast::<GroupedCopies>().ok())
+                .map_or_else(GroupedCopies::default, |copies| *copies);
+            // The GPU copy keeps up too, for the decoding that follows the prompt.
+            let ring = self.ring_copy(copies.gpu.take(), job, readable).ok();
+            let slot: NpuSlot = (Arc::default(), Instant::now());
+            let filled = Arc::clone(&slot.0);
+            let pass = npu_pass_of(job);
+            let submitted = self.npu_engine().and_then(|mut engine| {
+                engine
+                    .as_mut()
+                    .ok_or_else(|| "no Neural Engine attention".to_string())?
+                    .submit(
+                        &pass,
+                        &mut copies.npu,
+                        &self.proactor.handle(),
+                        move |result| {
+                            *filled.lock().expect("completion slot") = Some(result);
+                        },
+                    )
+            });
+            copies.gpu = ring;
+            let ticket = match submitted {
+                Ok(()) => {
+                    let ticket = self.npu_next.get();
+                    self.npu_next.set(ticket + 1);
+                    self.npu_pending.borrow_mut().insert(ticket, slot);
+                    Some(ticket)
+                }
+                Err(error) => {
+                    copies.npu = None;
+                    self.update(|s| s.npu_attention_failed += 1);
+                    if self.stats.get().npu_attention_failed <= 3 {
+                        eprintln!("npu: attention computed on the GPU instead: {error}");
+                    }
+                    None
+                }
+            };
+            job.device.0 = Some(Box::new(copies));
+            ticket
+        }
+
+        /// Waits for a ticket from [`Self::npu_start`], running this device's proactor
+        /// (other completions run meanwhile), and writes its result into `out`.
+        fn npu_finish(&self, ticket: u64, out: &mut [f32]) -> Result<(), String> {
+            let (slot, started) = self
+                .npu_pending
+                .borrow_mut()
+                .remove(&ticket)
+                .ok_or("unknown Neural Engine ticket")?;
+            let done = loop {
+                if let Some(done) = slot.lock().expect("completion slot").take() {
+                    break done?;
+                }
+                self.proactor.run_once().map_err(|e| e.to_string())?;
+            };
+            if done.out.len() != out.len() {
+                return Err("Neural Engine attention returned the wrong size".into());
+            }
+            out.copy_from_slice(&done.out);
+            self.update(|s| {
+                s.npu_attention += 1;
+                s.npu_attention_s += done.latency.as_secs_f64();
+                s.npu_attention_wall_s += started.elapsed().as_secs_f64();
+            });
+            Ok(())
+        }
+
+        /// One pass on the GPU from the layer's ring copy; returns the copy.
+        fn gpu_pass(
+            &self,
+            job: &mut GroupedJob<'_>,
+            copy: RingCopy,
+            readable: usize,
+        ) -> Result<RingCopy, String> {
+            let row = job.kv_heads * job.dim;
+            let rows = job.slots.min(job.start + job.t);
+            // A prompt pass goes to the matrix units, which read rows up to the next
+            // multiple of 32 (finite, multiplied by zero) and want padded queries.
+            let tiled = job.t >= GROUPED_TILED_FROM && job.dim % 16 == 0;
             let padded = if tiled {
                 job.t.next_multiple_of(32)
             } else {
@@ -1289,7 +1600,7 @@ mod gpu {
             x[..job.q.len()].copy_from_slice(job.q);
             x[job.q.len()..padded * width].fill(0.0);
             let kv_rows = if tiled { readable } else { rows };
-            let (rows_cap, kv_len) = (copy.rows, kv_rows * row * 4);
+            let (rows_cap, synced, kv_len) = (copy.rows, copy.synced, kv_rows * row * 4);
             staging.push(copy.k);
             staging.push(copy.v);
             let mut batch = self
@@ -1328,18 +1639,16 @@ mod gpu {
             job.out
                 .copy_from_slice(&buffers[Y].as_f32()[..job.out.len()]);
             *self.staging.borrow_mut() = Some(buffers);
-            job.device.0 = Some(Box::new(RingCopy {
-                k,
-                v,
-                rows: rows_cap,
-                synced: end,
-            }));
             self.update(|s| {
                 s.grouped += 1;
                 s.grouped_gpu_s += gpu_time.as_secs_f64();
-                s.grouped_wall_s += start.elapsed().as_secs_f64();
             });
-            Ok(())
+            Ok(RingCopy {
+                k,
+                v,
+                rows: rows_cap,
+                synced,
+            })
         }
 
         /// The KDA recurrence on the GPU. The session's state stays authoritative: it is
@@ -1591,7 +1900,27 @@ mod gpu {
             }
         }
 
+        fn grouped_attention_start(&self, job: &mut GroupedJob<'_>) -> Option<u64> {
+            self.npu_start(job)
+        }
+
+        fn grouped_attention_finish(&self, ticket: u64, out: &mut [f32]) -> bool {
+            match self.npu_finish(ticket, out) {
+                Ok(()) => true,
+                Err(error) => {
+                    self.update(|s| s.npu_attention_failed += 1);
+                    if self.stats.get().npu_attention_failed <= 3 {
+                        eprintln!("npu: attention computed on the CPU instead: {error}");
+                    }
+                    false
+                }
+            }
+        }
+
         fn grouped_attention(&self, job: &mut GroupedJob<'_>) -> bool {
+            if self.attention.get() == super::AttentionDevice::Cpu {
+                return false;
+            }
             match self.grouped(job) {
                 Ok(()) => true,
                 Err(error) => {
