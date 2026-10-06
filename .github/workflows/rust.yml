@@ -46,26 +46,6 @@ jobs:
           ref: dev
           path: loadngo
 
-      # loadngo's workspace manifest names a qcoin-types path dependency, and
-      # Cargo loads that whole workspace for any loadngo path crate. qcoin is
-      # checked out at the revision loadngo's own CI pins (QCOIN_REV in loadngo
-      # .github/workflows/ci.yml), read from the loadngo commit just checked
-      # out, so the two move together. A SHA copied here went stale once.
-      - name: Read loadngo's qcoin pin
-        id: qcoin-pin
-        shell: bash
-        run: |
-          rev=$(sed -n 's/^  QCOIN_REV: *\([0-9a-f]\{40\}\) *$/\1/p' loadngo/.github/workflows/ci.yml)
-          [ -n "$rev" ] || { echo "QCOIN_REV not found in loadngo's ci.yml"; exit 1; }
-          echo "qcoin at $rev"
-          echo "rev=$rev" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@v4
-        with:
-          repository: jaylauffer/qcoin
-          ref: ${{ steps.qcoin-pin.outputs.rev }}
-          path: qcoin
-
       - name: Toolchain
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
