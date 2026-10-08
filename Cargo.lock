@@ -209,6 +209,7 @@ dependencies = [
  "crc32fast",
  "flate2",
  "hex",
+ "libc",
  "loadngo-anchor",
  "loadngo-pq-crypto",
  "ron",
