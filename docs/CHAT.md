@@ -58,8 +58,45 @@ Validation on macOS: `cargo test --workspace --all-features --offline --locked`,
 `cargo fmt --all --check`, and the offline locked release CLI build passed.
 The tests use scripted replies; the running model was not restarted for validation.
 
-The guards against a stuck model stay: a reply repeating one block is ended, and the
-same read-only call made twice in a row ends the turn.
+The guards against a stuck model stay: a reply repeating one block is ended, and
+repeated tool calls close her tools (below).
+
+### Repeated tool calls (since 2026-10-08)
+
+A call whose name and arguments match a call already made in this turn is not run
+again (terminal tools excepted, since their output changes; a successful edit or
+command, and a compaction, clear the record of reads). Its result tells her it was not run and
+to answer with what she has. The first round made only of such calls gets that note.
+The second one closes her tools for the rest of the turn:
+
+- each call's result says her tools are closed and asks for a plain answer: what she
+  found, with paths and line numbers, and what she did not find;
+- her reply is begun for her with "I'll stop searching here and answer from what I
+  have read." (the same device as the handoff opening: on the model, an instruction
+  alone was answered with one more tool call);
+- if she still starts a tool call, that token ends the reply, so the history never
+  holds a call without a result;
+- the turn ends with `[tools closed: ...]`, stop reason `repeated tool call; answered
+  without tools` and a `tools_closed` event in the saved chat. The turn budget does not
+  pause this reply, since it runs no tool.
+
+Until 2026-10-08 the second round ended the turn with `[stopped: Kimi repeated the same
+tool call]` and no answer. That morning (chat `2026-10-08-073103`) Jay asked her to
+start in `loadngo/proactor` with no question attached; from the earlier "we're building
+a better git" she looked for git code, grepped `git` (which also matches words such as
+"digit"), and found only the `git check-ignore` call in loadngo
+`inference/src/edit_tools.rs`. Her handoff at the 24k-token compaction set the next step
+as "how the git commands are integrated with the proactor system", which does not
+exist. She re-read the proactor `Cargo.toml` and `lib.rs`, then `edit_tools.rs` lines
+240-290 three times; the third was refused with the note, and her next reply made the
+same call word for word. 27 replies and 230 s ended with nothing for Jay.
+
+Checked on macOS with scripted replies and the real Kimi Linear tokenizer
+(`a_second_repeated_tool_call_closes_tools_and_kimi_answers`): the call runs once;
+the closing reply's context holds the closed-tools result and ends with the opening;
+an answer is shown, and a call tried instead ends the reply at its first token. Four
+mutations fail it (no call-token cut, never closing, no opening, the old note). Not yet
+run on the model: Jay's running Kimi has the old binary.
 
 ## Context flow (Kimi Linear, 2026-10-02)
 
@@ -138,6 +175,12 @@ attempt". The checkpoint, reading only that handoff, answered (with the three op
 `in-progress` 46%, `repeating` false 67% and `progress` 2 at 93%; in fact the same
 call had failed repeatedly and nothing had been changed (progress 1). Her next reply
 carried on with the shell approach.
+
+In the 2026-10-08 chat above, the checkpoint after the compaction answered `stuck` 53% /
+`in-progress` 28%, `repeating` false 65% and `progress` 2 at 73%, 80 s before the
+repeat guard ended her turn. `stuck` was right; she had only read files (progress 1),
+and was circling the same lines with different ranges, which `observed.identical_calls`
+(0) does not count.
 
 Since 2026-10-01, failed writes can be retried after fixing the reported cause;
 they are not treated as successful duplicate mutations. The same write failing

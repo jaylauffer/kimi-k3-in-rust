@@ -806,6 +806,16 @@ const REPEATED_CALL: &str = "Not run: you already made this exact call in this t
 result is above. It would return the same thing. Do not call it again. Answer Jay with what you \
 have, or tell him plainly what you could not find.";
 
+/// The result of a second round of repeated calls: tools close for the rest of the turn.
+const TOOLS_CLOSED: &str = "Not run: you already made this exact call in this turn, and its \
+result is above. Your tools are closed for the rest of this turn. Answer Jay now in plain text \
+from what you have read: what you found, with paths and line numbers, and say plainly what you \
+did not find.";
+
+/// How the answer after closed tools begins; the program writes it, so the reply starts as
+/// text. On 2026-10-08, told not to call again, Kimi made the same call a third time.
+const ANSWER_OPENING: &str = "I'll stop searching here and answer from what I have read.\n\n";
+
 impl LinearTokens {
     /// `<|im_system|>role<|im_middle|>content<|im_end|>`, each text its own segment.
     fn message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, role: &str, content: &str) {
@@ -1554,6 +1564,8 @@ pub fn run_with(
         let mut earlier_calls = Vec::new();
         let mut failed_writes = Vec::new();
         let mut repeated_rounds = 0;
+        // After a second round of repeated calls: one last reply, with no tool calls.
+        let mut closing = false;
         let stop: Option<String> = loop {
             let mut calls = if let Some(calls) = run_held.take() {
                 calls
@@ -1564,13 +1576,21 @@ pub fn run_with(
                 // Once the reply is looping, the next "token" is the end of the message:
                 // the turn closes normally instead of running to the token limit.
                 let looping = std::cell::Cell::new(None);
+                // With tools closed, a tool call ends the reply where it would begin.
+                let calls_open = format.calls_open().filter(|_| closing);
                 let result = session.generate(
                     max_tokens,
                     &stops,
                     cancel,
                     |context| match looping.get() {
                         Some(_) => Ok(stops[0]),
-                        None => next(context),
+                        None => next(context).map(|token| {
+                            if Some(token) == calls_open {
+                                stops[0]
+                            } else {
+                                token
+                            }
+                        }),
                     },
                     |token| {
                         write!(output, "{}", format.push(&mut display, tokenizer, token))
@@ -1673,6 +1693,15 @@ pub fn run_with(
                     .map_err(|e| e.to_string())?;
                     break Some("repeating reply".into());
                 }
+                if closing {
+                    writeln!(
+                        output,
+                        "[tools closed: Kimi repeated the same tool call and answered from what \
+                         she had read; ask differently or /reset]"
+                    )
+                    .map_err(|e| e.to_string())?;
+                    break Some("repeated tool call; answered without tools".into());
+                }
                 if tools.is_none() {
                     break None;
                 }
@@ -1685,14 +1714,7 @@ pub fn run_with(
                     !repeatable_tool(&key.0) && earlier_calls.contains(&key)
                 }) {
                     repeated_rounds += 1;
-                    if repeated_rounds == 2 {
-                        writeln!(
-                            output,
-                            "[stopped: Kimi repeated the same tool call; ask differently or /reset]"
-                        )
-                        .map_err(|e| e.to_string())?;
-                        break Some("repeated tool call".into());
-                    }
+                    closing = repeated_rounds == 2;
                 }
                 Held {
                     done: Vec::new(),
@@ -1700,7 +1722,8 @@ pub fn run_with(
                 }
             };
             let Some(tools) = tools else { break None };
-            if let Some(spent) = budget.spent(turn_started.elapsed(), turn_tokens) {
+            // Closing runs no tool, so it is not paused: the answer is what a pause would want.
+            if !closing && let Some(spent) = budget.spent(turn_started.elapsed(), turn_tokens) {
                 writeln!(
                     output,
                     "[paused: {spent}. /continue runs the {} waiting tool call(s) with a \
@@ -1728,10 +1751,11 @@ pub fn run_with(
                 if !repeatable_tool(&name) && earlier_calls.contains(&key) {
                     writeln!(output, "[tool call repeated: {name}; not run again]")
                         .map_err(|e| e.to_string())?;
+                    let note = if closing { TOOLS_CLOSED } else { REPEATED_CALL };
                     if let Some(transcript) = &mut transcript {
-                        transcript.tool_result(&name, REPEATED_CALL);
+                        transcript.tool_result(&name, note);
                     }
-                    calls.done.push((id, name, REPEATED_CALL.to_string()));
+                    calls.done.push((id, name, note.to_string()));
                     continue;
                 }
                 let (text, succeeded) = match tools.call(&name, &arguments) {
@@ -1846,6 +1870,13 @@ pub fn run_with(
                 }
                 prompt = format.tool_results(tokenizer, &results, session.tokens().last().copied());
             }
+            if closing {
+                ordinary(&mut prompt, tokenizer, ANSWER_OPENING);
+                log(
+                    &mut transcript,
+                    json!({"event": "tools_closed", "opening": ANSWER_OPENING}),
+                );
+            }
             if let Err(error) = session.begin_turn(&prompt) {
                 writeln!(
                     output,
@@ -1860,9 +1891,14 @@ pub fn run_with(
                 transcript.save_state(&session, reply_start, None);
             }
             display = Display::default();
-            write!(output, "{}", format.opening())
-                .and_then(|()| output.flush())
-                .map_err(|e| e.to_string())?;
+            write!(
+                output,
+                "{}{}",
+                format.opening(),
+                if closing { ANSWER_OPENING } else { "" }
+            )
+            .and_then(|()| output.flush())
+            .map_err(|e| e.to_string())?;
         };
         log(
             &mut transcript,
@@ -3076,56 +3112,85 @@ mod tests {
     }
 
     // Uses only the downloaded Kimi Linear tokenizer files; no weights are read. The
-    // scripted "model" makes the same call every round, as Kimi did on 2026-09-27.
+    // scripted "model" makes the same call every round, as Kimi did on 2026-09-27 and
+    // 2026-10-08. After the second repeat her tools close: she either answers, or the
+    // call she tries again ends her reply where it would begin.
     #[test]
     #[ignore = "requires KIMI_LINEAR_CHECKPOINT tokenizer files"]
-    fn a_repeated_tool_call_is_not_run_again_and_a_second_repeat_ends_the_turn() {
+    fn a_second_repeated_tool_call_closes_tools_and_kimi_answers() {
+        const ANSWER: &str = "wg-gcp.conf is not in the archive; cas_find found no .conf files.";
         let dir = std::env::var("KIMI_LINEAR_CHECKPOINT").expect("set checkpoint directory");
         let tokenizer = Tokenizer::load(dir).unwrap();
         let format = ChatFormat::kimi_linear(&tokenizer, 163_586).unwrap();
-        let ran = std::rc::Rc::new(std::cell::Cell::new(0));
-        let mut tools = Toolbox::default();
-        tools.push(Box::new(Counting(ran.clone())));
-        let reply = |n: usize| {
-            tokenizer.encode(&format!(
-                "Let me look.<|tool_calls_section_begin|><|tool_call_begin|>functions.cas_find:{n}\
-                 <|tool_call_argument_begin|>{{\"pattern\": \"**/*.conf\"}}<|tool_call_end|>\
-                 <|tool_calls_section_end|><|im_end|>"
-            ))
-        };
-        let (mut round, mut at, mut saw_note) = (0, 0, false);
-        let mut out = Vec::new();
-        run_with(
-            &format,
-            Some(&tools),
-            &tokenizer,
-            32_768,
-            200,
-            &AtomicBool::new(false),
-            &AtomicBool::new(false),
-            &b"Find wg-gcp.conf\n/quit\n"[..],
-            &mut out,
-            |context| {
-                if at == 0 && round == 2 {
-                    saw_note = tokenizer.decode_lossy(context).contains(REPEATED_CALL);
-                }
-                let tokens = reply(round);
-                let token = tokens[at];
-                at += 1;
-                if at == tokens.len() {
-                    (round, at) = (round + 1, 0);
-                }
-                Ok(token)
-            },
-            ChatOptions::default(),
-        )
-        .unwrap();
-        let text = String::from_utf8(out).unwrap();
-        assert_eq!(ran.get(), 1, "the repeat was not run: {text}");
-        assert_eq!(round, 3, "the third identical call ended the turn: {text}");
-        assert!(text.contains("[tool call repeated: cas_find; not run again]"));
-        assert!(text.contains("[stopped: Kimi repeated the same tool call"));
-        assert!(saw_note, "the model was told why its call was not run");
+        for insists in [false, true] {
+            let ran = std::rc::Rc::new(std::cell::Cell::new(0));
+            let mut tools = Toolbox::default();
+            tools.push(Box::new(Counting(ran.clone())));
+            let reply = |n: usize| {
+                tokenizer.encode(&if n == 3 && !insists {
+                    format!("{ANSWER}<|im_end|>")
+                } else {
+                    format!(
+                        "Let me look.<|tool_calls_section_begin|><|tool_call_begin|>\
+                         functions.cas_find:{n}<|tool_call_argument_begin|>\
+                         {{\"pattern\": \"**/*.conf\"}}<|tool_call_end|>\
+                         <|tool_calls_section_end|><|im_end|>"
+                    )
+                })
+            };
+            let (mut round, mut at, mut replies) = (0, 0, 0);
+            let (mut saw_repeated, mut saw_closed) = (false, false);
+            let mut out = Vec::new();
+            run_with(
+                &format,
+                Some(&tools),
+                &tokenizer,
+                32_768,
+                200,
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &b"Find wg-gcp.conf\n/quit\n"[..],
+                &mut out,
+                |context| {
+                    if at == 0 {
+                        replies += 1;
+                        let text = tokenizer.decode_lossy(context);
+                        if round == 2 {
+                            saw_repeated = text.contains(REPEATED_CALL);
+                        }
+                        if round == 3 {
+                            saw_closed =
+                                text.contains(TOOLS_CLOSED) && text.ends_with(ANSWER_OPENING);
+                        }
+                    }
+                    let tokens = reply(round);
+                    let token = tokens[at];
+                    at += 1;
+                    if at == tokens.len() {
+                        (round, at) = (round + 1, 0);
+                    }
+                    Ok(token)
+                },
+                ChatOptions::default(),
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(ran.get(), 1, "the repeats were not run: {text}");
+            assert_eq!(replies, 4, "the closing reply was the last: {text}");
+            // An insisted call ends the reply at its opening token: the history never
+            // holds a call without a result.
+            assert_eq!(round, if insists { 3 } else { 4 }, "{text}");
+            assert!(saw_repeated, "the model was told why its call was not run");
+            assert!(
+                saw_closed,
+                "tools closed and the answer begun for her: {text}"
+            );
+            assert!(text.contains("[tool call repeated: cas_find; not run again]"));
+            assert!(text.contains(ANSWER_OPENING), "{text}");
+            assert!(text.contains("[tools closed: Kimi repeated the same tool call"));
+            assert_eq!(text.contains(ANSWER), !insists, "{text}");
+            assert!(!text.contains("[stopped:"), "{text}");
+        }
     }
 
     #[test]
