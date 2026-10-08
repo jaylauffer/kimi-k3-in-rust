@@ -610,7 +610,7 @@ dependencies = [
 name = "kimi-k3-core"
 version = "0.1.0"
 dependencies = [
- "loadngo-proactor 0.1.0 (git+https://github.com/jaylauffer/loadngo?rev=0971c29e2be2b63150227785ba5d30ffd59cca4c)",
+ "loadngo-proactor 0.1.0 (git+https://github.com/jaylauffer/loadngo?rev=fdab691d9df92c8d22c706aae3524395f7f53136)",
  "serde",
  "serde_json",
 ]
@@ -709,7 +709,7 @@ dependencies = [
 [[package]]
 name = "loadngo-proactor"
 version = "0.1.0"
-source = "git+https://github.com/jaylauffer/loadngo?rev=0971c29e2be2b63150227785ba5d30ffd59cca4c#0971c29e2be2b63150227785ba5d30ffd59cca4c"
+source = "git+https://github.com/jaylauffer/loadngo?rev=fdab691d9df92c8d22c706aae3524395f7f53136#fdab691d9df92c8d22c706aae3524395f7f53136"
 dependencies = [
  "io-uring",
  "libc",

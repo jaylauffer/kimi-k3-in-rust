@@ -45,6 +45,8 @@ pub struct ReadRequest {
 pub struct ShardFiles {
     paths: Vec<PathBuf>,
     files: Vec<File>,
+    /// `files` registered with `proactor`, in the same order; released on drop.
+    fds: Vec<RawFdCompat>,
     proactor: Proactor<PlatformPort>,
     /// Serialises batches. A completion is dispatched by whichever thread polls, so two
     /// threads driving one proactor could each consume the other's last completion and
@@ -80,9 +82,28 @@ impl ShardFiles {
             loadngo_proactor::new_platform_proactor().map_err(|error| ShardIoError::Proactor {
                 error: error.to_string(),
             })?;
+        // Registered once, so IOCP does not associate a handle with the port on
+        // every read; the other ports return the descriptor unchanged.
+        let handle = proactor.handle();
+        let mut fds = Vec::with_capacity(files.len());
+        for (file, path) in files.iter().zip(paths) {
+            match handle.register(raw_handle(file)) {
+                Ok(fd) => fds.push(fd),
+                Err(error) => {
+                    for &fd in &fds {
+                        handle.release(fd);
+                    }
+                    return Err(ShardIoError::Open {
+                        path: path.clone(),
+                        error: error.to_string(),
+                    });
+                }
+            }
+        }
         Ok(Self {
             paths: paths.to_vec(),
             files,
+            fds,
             proactor,
             drive: Mutex::new(()),
         })
@@ -335,7 +356,7 @@ impl ShardFiles {
             let wanted = buffer.len();
             let results = Arc::clone(&results);
             let submitted = handle.read(
-                raw_handle(&self.files[shard]),
+                self.fds[shard],
                 IoBuf::from_vec(buffer),
                 offset,
                 move |result: IoResult| {
@@ -358,6 +379,16 @@ impl ShardFiles {
             results,
             metas,
             submit_error,
+        }
+    }
+}
+
+impl Drop for ShardFiles {
+    /// Releases the registrations before the fields drop and the files close.
+    fn drop(&mut self) {
+        let handle = self.proactor.handle();
+        for &fd in &self.fds {
+            handle.release(fd);
         }
     }
 }
