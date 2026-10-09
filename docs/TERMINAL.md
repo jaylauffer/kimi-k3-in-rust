@@ -1,5 +1,14 @@
 # Kimi command sessions and current information
 
+> **Removed 2026-10-09 (Jay).** Kimi no longer runs shell commands: `terminal_exec`,
+> `terminal_read`, `terminal_write` and `terminal_stop` (`terminal.rs`) are gone, in the
+> shared loop and in `--legacy-chat`. She checks work with loadngo's `cargo` (check,
+> test, clippy, build, fmt --check) and `git` (status, diff, log, show) tools, which run
+> no shell and refuse arguments that reach outside the workspace. Her saved chats had
+> used the terminal mostly for `git log` and `ps`. The rest of this file records how the
+> sessions behaved, for reading old transcripts; the current-information guidance at
+> its end still applies.
+
 Kimi Linear chat on macOS and Linux exposes `terminal_exec`, `terminal_read`,
 `terminal_write`, and `terminal_stop` by default. `--no-tools` disables them with other tools.
 Restart through `../launch-kimi-k3.sh` to rebuild and use them.

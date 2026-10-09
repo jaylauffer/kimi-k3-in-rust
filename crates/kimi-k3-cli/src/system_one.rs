@@ -28,6 +28,10 @@ const QUESTION_ROOM: usize = 1024;
 pub trait Reader {
     type Session: Clone;
     fn open(&self, capacity: usize) -> Self::Session;
+    /// The tokens a session has read.
+    fn ids(session: &Self::Session) -> &[u32];
+    /// Whether a session was left unusable (a pass cancelled or failed partway).
+    fn broken(session: &Self::Session) -> bool;
     /// Feeds `ids` and returns the logits after the last of them.
     ///
     /// # Errors
@@ -46,6 +50,12 @@ impl Reader for LinearModel {
     fn open(&self, capacity: usize) -> LinearSession {
         self.session(capacity)
     }
+    fn ids(session: &LinearSession) -> &[u32] {
+        session.ids()
+    }
+    fn broken(session: &LinearSession) -> bool {
+        session.is_broken()
+    }
     fn read(
         &mut self,
         session: &mut LinearSession,
@@ -62,6 +72,12 @@ impl Reader for GemmaModel {
     type Session = GemmaSession;
     fn open(&self, capacity: usize) -> GemmaSession {
         self.session(capacity)
+    }
+    fn ids(session: &GemmaSession) -> &[u32] {
+        session.ids()
+    }
+    fn broken(session: &GemmaSession) -> bool {
+        session.is_broken()
     }
     fn read(
         &mut self,

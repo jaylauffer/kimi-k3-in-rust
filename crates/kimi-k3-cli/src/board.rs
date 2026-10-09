@@ -1,14 +1,13 @@
-//! Board tools: how Kimi reads and adds to the workspace's coordination board
-//! (`AGENT-BOARD.md` in the pudding folder, see its `COLLABORATION.md`).
+//! Board tools: how Kimi reads the workspace's coordination board (`AGENT-BOARD.md` in
+//! the pudding folder, see its `COLLABORATION.md`), a section at a time.
 //!
-//! The board is ~150 KB, more than her whole context, so she reads it a section at a
-//! time, a few rows at once. She may add rows (never edit or delete them) to two
-//! sections, Active claims and Handoffs, always dated and signed "Kimi"; Jay's huddle
-//! is Jay's, and the other sections are only read. Each addition rewrites the file
-//! atomically (a temporary file renamed over it).
+//! The board is larger than her whole context, so she reads it a section at a time, a
+//! few rows at once. She no longer writes it: since 2026-10-09 her edits go through
+//! loadngo's editing tools, which claim a repository on the board at her first write and
+//! turn the claim into a handoff when the chat ends (`loadngo docs/AGENT_LOOP.md`).
 
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use loadngo_inference::tools::Tool;
 use serde_json::{Value, json};
@@ -17,36 +16,22 @@ use serde_json::{Value, json};
 /// characters.
 const MAX_ROW_CHARS: usize = 1200;
 const MAX_ROWS: usize = 12;
-/// Longest cell she may write.
-const MAX_CELL_CHARS: usize = 1500;
-
-/// Sections she may add rows to, with the cells she supplies (the date and "Kimi"
-/// come first automatically).
-const WRITABLE: [(&str, &[&str]); 2] = [
-    ("Active claims", &["repo / area", "paths", "task", "status"]),
-    ("Handoffs", &["what", "state", "verified", "open"]),
-];
 
 pub struct Board {
     path: PathBuf,
-    today: String,
 }
 
 impl Board {
-    /// The board at `path`, with `today` (for example `2026-09-27`) for new rows.
-    pub fn new(path: impl Into<PathBuf>, today: impl Into<String>) -> Self {
-        Self {
-            path: path.into(),
-            today: today.into(),
-        }
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
     }
 
+    /// `board_sections` and `board_read`.
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         let shared = std::rc::Rc::new(self);
         vec![
             Box::new(Sections(std::rc::Rc::clone(&shared))),
-            Box::new(Read(std::rc::Rc::clone(&shared))),
-            Box::new(AddRow(shared)),
+            Box::new(Read(shared)),
         ]
     }
 
@@ -116,43 +101,8 @@ fn find<'a>(
         })
 }
 
-/// `cell` made safe for one table cell: one line, pipes escaped, bounded.
-fn cell(text: &str) -> Result<String, String> {
-    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if one_line.chars().count() > MAX_CELL_CHARS {
-        return Err(format!("a cell is limited to {MAX_CELL_CHARS} characters"));
-    }
-    Ok(one_line.replace('|', "\\|"))
-}
-
-/// `text` with `row` added as the newest row of section `name`: after the header when
-/// the section's table starts with one, otherwise before its first row.
-pub fn with_row(text: &str, name: &str, row: &str) -> Result<String, String> {
-    let all = sections(text);
-    let (_, from, to) = find(&all, name)?;
-    let lines: Vec<&str> = text.lines().collect();
-    let first = (*from..*to)
-        .find(|&i| lines[i].starts_with('|'))
-        .ok_or_else(|| format!("section {name:?} has no table"))?;
-    let at = if lines.get(first + 1).is_some_and(|l| is_separator(l)) {
-        first + 2
-    } else {
-        first
-    };
-    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + 1);
-    out.extend_from_slice(&lines[..at]);
-    out.push(row);
-    out.extend_from_slice(&lines[at..]);
-    let mut joined = out.join("\n");
-    if text.ends_with('\n') {
-        joined.push('\n');
-    }
-    Ok(joined)
-}
-
 struct Sections(std::rc::Rc<Board>);
 struct Read(std::rc::Rc<Board>);
-struct AddRow(std::rc::Rc<Board>);
 
 impl Tool for Sections {
     fn name(&self) -> &'static str {
@@ -172,7 +122,7 @@ impl Tool for Sections {
             let n = rows(&lines, from, to).len();
             let _ = writeln!(out, "{heading}: {n} rows");
         }
-        out.push_str("Rows are newest first. You may add rows to Active claims and Handoffs.");
+        out.push_str("Rows are newest first.");
         Ok(out)
     }
 }
@@ -225,68 +175,6 @@ impl Tool for Read {
     }
 }
 
-impl Tool for AddRow {
-    fn name(&self) -> &'static str {
-        "board_add_row"
-    }
-    fn description(&self) -> &'static str {
-        "Add a row, signed Kimi and dated today, to the top of a board section. Active claims takes 4 cells: repo / area, paths, task, status. Handoffs takes 4: what, state, verified, open. Rows are never edited or deleted."
-    }
-    fn parameters(&self) -> Value {
-        json!({"type": "object", "properties": {
-            "section": {"type": "string", "enum": ["Active claims", "Handoffs"]},
-            "cells": {"type": "array", "items": {"type": "string"}, "minItems": 4, "maxItems": 4}},
-            "required": ["section", "cells"]})
-    }
-    fn call(&self, args: &Value) -> Result<String, String> {
-        let name = args
-            .get("section")
-            .and_then(Value::as_str)
-            .ok_or("`section` is required")?;
-        let (section, labels) = WRITABLE
-            .iter()
-            .find(|(s, _)| s.eq_ignore_ascii_case(name.trim()))
-            .ok_or_else(|| {
-                format!("rows can be added only to Active claims or Handoffs, not {name:?}")
-            })?;
-        let cells: Vec<String> = args
-            .get("cells")
-            .and_then(Value::as_array)
-            .ok_or("`cells` must be a list of text")?
-            .iter()
-            .map(|c| {
-                c.as_str()
-                    .ok_or("every cell must be text")
-                    .map(str::to_string)
-            })
-            .collect::<Result<_, _>>()?;
-        if cells.len() != labels.len() {
-            return Err(format!(
-                "{section} takes {} cells: {}",
-                labels.len(),
-                labels.join(", ")
-            ));
-        }
-        let mut row = format!("| {} | Kimi |", self.0.today);
-        for c in &cells {
-            let _ = write!(row, " {} |", cell(c)?);
-        }
-        let text = self.0.text()?;
-        let updated = with_row(&text, section, &row)?;
-        let tmp = self.0.path.with_extension("md.kimi-tmp");
-        std::fs::write(&tmp, updated).map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.0.path)
-            .map_err(|e| format!("{}: {e}", self.0.path.display()))?;
-        Ok(format!("added to {section}: {row}"))
-    }
-}
-
-/// The board in `base`, if there is one.
-pub fn board_in(base: &Path) -> Option<PathBuf> {
-    let path = base.join("AGENT-BOARD.md");
-    path.is_file().then_some(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,45 +194,15 @@ mod tests {
     }
 
     #[test]
-    fn new_rows_go_under_the_header_or_before_the_first_row() {
-        let claims = with_row(BOARD, "Active claims", "| NEW |").unwrap();
-        let at_new = claims.find("| NEW |").unwrap();
-        assert!(at_new > claims.find("|---").unwrap() && at_new < claims.find("| d1 |").unwrap());
-        let handoffs = with_row(BOARD, "Handoffs", "| NEW |").unwrap();
-        assert!(handoffs.find("| NEW |").unwrap() < handoffs.find("| d2 |").unwrap());
-        assert!(handoffs.ends_with('\n'));
-    }
-
-    #[test]
-    fn cells_are_one_line_with_pipes_escaped() {
-        assert_eq!(cell("a | b\nc").unwrap(), "a \\| b c");
-        assert!(cell(&"x".repeat(MAX_CELL_CHARS + 1)).is_err());
-    }
-
-    #[test]
-    fn adding_is_limited_to_claims_and_handoffs_and_signed_kimi() {
-        let dir = std::env::temp_dir().join(format!("kimi-board-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("AGENT-BOARD.md");
+    fn the_tools_only_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENT-BOARD.md");
         std::fs::write(&path, BOARD).unwrap();
-        let tools = Board::new(&path, "2026-09-27").into_tools();
-        let add = &tools[2];
-        let huddle = add.call(&json!({"section": "Jay's huddle", "cells": ["a", "b", "c", "d"]}));
-        assert!(
-            huddle
-                .unwrap_err()
-                .contains("only to Active claims or Handoffs")
-        );
-        assert!(
-            add.call(&json!({"section": "Handoffs", "cells": ["a"]}))
-                .is_err()
-        );
-        add.call(&json!({"section": "Handoffs", "cells": ["Drafted outreach", "done", "read back", "none"]}))
-            .unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            text.contains("| 2026-09-27 | Kimi | Drafted outreach | done | read back | none |")
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
+        let tools = Board::new(&path).into_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, ["board_sections", "board_read"]);
+        let read = tools[1].call(&json!({"section": "Handoffs"})).unwrap();
+        assert!(read.starts_with("Handoffs: rows 0..2 of 2"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BOARD);
     }
 }

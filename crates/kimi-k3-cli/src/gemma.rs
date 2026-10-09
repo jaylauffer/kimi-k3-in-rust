@@ -452,6 +452,26 @@ fn chat(
     let config = &model.config;
     let mut format =
         crate::chat::ChatFormat::gemma(tokenizer, config.bos_token_id, &config.eos_token_ids)?;
+    if !args.legacy_chat {
+        return crate::agent_chat::run(
+            args,
+            crate::agent_chat::Loaded {
+                model,
+                description: "Gemma 4 31B-it (Google, open weights)",
+                identity: "Gemma",
+                engine: crate::linear::engine_name(args.accel),
+                format: &format,
+                accel: device.accel(),
+            },
+            tokenizer,
+            crate::linear::extra_notes(args),
+            max_context,
+            gen_tokens,
+            gate,
+            cancel,
+            generating,
+        );
+    }
     if let Some(memory) = crate::linear::memory_store(args) {
         format = format.with_note(&crate::linear::memory_note(&memory));
     }
@@ -460,7 +480,7 @@ fn chat(
         format = format.with_note(crate::linear::VOICE_NOTE);
     }
     let mut options = crate::chat_options(args, format.name(), max_context)?;
-    let tools = crate::linear::toolbox(args);
+    let tools = crate::linear::toolbox(args)?;
     let tools = Some(&tools).filter(|t| !t.is_empty());
     let keep = || !cancel.load(Ordering::Relaxed);
     // The opening (instructions, notes, tool declarations) is the same for every

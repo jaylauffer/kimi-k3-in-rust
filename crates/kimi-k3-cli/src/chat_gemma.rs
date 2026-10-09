@@ -566,35 +566,11 @@ mod template {
     use loadngo_inference::tools::Toolbox;
     use std::path::{Path, PathBuf};
 
+    /// The chat's own tools, as `agent_chat` gives them to Kimi and Gemma.
     fn toolbox(root: &Path) -> Toolbox {
-        let mut tools = Toolbox::default();
-        for tool in crate::board::Board::new(root.join("AGENT-BOARD.md"), "2026-10-03").into_tools()
-        {
-            tools.push(tool);
-        }
-        for tool in crate::text_tools::tools(root).unwrap() {
-            tools.push(tool);
-        }
-        #[cfg(unix)]
-        for tool in crate::terminal::tools(root).unwrap() {
-            tools.push(tool);
-        }
-        for tool in loadngo_inference::tools::FsTools::new(root, None).into_tools() {
-            tools.push(tool);
-        }
-        for tool in loadngo_inference::web_tools::WebTools::new().into_tools() {
-            tools.push(tool);
-        }
-        for tool in
-            loadngo_inference::memory_tools::MemoryStore::new(root.join("m.jsonl")).into_tools()
-        {
-            tools.push(tool);
-        }
-        let archives = loadngo_inference::cas_tools::Archives::new(Vec::new(), None);
-        for tool in loadngo_inference::cas_tools::cas_tools(archives) {
-            tools.push(tool);
-        }
-        tools
+        crate::agent_chat::workspace(root, Some(root.join("m.jsonl")), true, Vec::new(), None)
+            .unwrap()
+            .tools
     }
 
     fn fixture() -> PathBuf {

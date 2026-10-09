@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
-use loadngo_inference::tools::{FsTools, Toolbox};
+use loadngo_inference::tools::Toolbox;
 
 use crate::{Args, accel, chat, convert, quality, system_one, thermal};
 
@@ -37,101 +37,30 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
 }
 
-/// Local reads, workspace text edits, and read-only Archive CAS access for chat.
-pub(crate) fn toolbox(args: &Args) -> Toolbox {
-    let mut tools = Toolbox::default();
-    if args.no_tools {
-        eprintln!("file tools: off (--no-tools)");
-        return tools;
+/// The legacy chat's tools (`--legacy-chat`): the same as the shared loop's.
+pub(crate) fn toolbox(args: &Args) -> Result<Toolbox, String> {
+    Ok(crate::agent_chat::workspace_for(args)?
+        .map(|w| w.tools)
+        .unwrap_or_default())
+}
+
+/// The engine, as the chat tells the model.
+pub(crate) const fn engine_name(accel: accel::AccelKind) -> &'static str {
+    match accel {
+        accel::AccelKind::Ane => "the Apple Neural Engine",
+        accel::AccelKind::Gpu => "the GPU",
+        accel::AccelKind::Cpu => "the CPU",
     }
-    let base = args
-        .fs_base
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| ".".into());
-    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    eprintln!(
-        "file tools: local drive, read-only, relative to {}",
-        base.display()
-    );
-    if let Some(path) = crate::board::board_in(&base) {
-        let today = date("+%F").unwrap_or_else(|| "undated".into());
-        eprintln!(
-            "board tools: {} (read by section; rows added to Active claims and Handoffs, signed Kimi)",
-            path.display()
-        );
-        for tool in crate::board::Board::new(path, today).into_tools() {
-            tools.push(tool);
-        }
+}
+
+/// Notes every conversation on the shared loop opens with, beyond the instructions.
+pub(crate) fn extra_notes(args: &Args) -> String {
+    let mut extra = crate::chat::FRESHNESS_GUIDANCE.to_owned();
+    if args.voice {
+        extra.push_str("\n\n");
+        extra.push_str(VOICE_NOTE);
     }
-    match crate::text_tools::tools(&base) {
-        Ok(editors) => {
-            eprintln!(
-                "File editing: workspace UTF-8 text under {}; root AGENTS.md/CLAUDE.md protected (text_read, text_write, text_edit)",
-                base.display()
-            );
-            for tool in editors {
-                tools.push(tool);
-            }
-        }
-        Err(error) => eprintln!("File editing unavailable: {error}"),
-    }
-    match crate::terminal::tools(&base) {
-        Ok(terminal) => {
-            eprintln!(
-                "terminal tools: commands, output, stdin and stop; same OS permissions as Kimi"
-            );
-            for tool in terminal {
-                tools.push(tool);
-            }
-        }
-        Err(error) => eprintln!("terminal tools unavailable: {error}"),
-    }
-    for tool in FsTools::new(base, home.as_deref()).into_tools() {
-        tools.push(tool);
-    }
-    if let Some(memory) = memory_store(args) {
-        eprintln!(
-            "memory: {} (memory_save, memory_search, memory_list, memory_forget)",
-            memory.path().display()
-        );
-        for tool in memory.into_tools() {
-            tools.push(tool);
-        }
-    }
-    if args.no_web {
-        eprintln!("web tools: off (--no-web)");
-    } else {
-        eprintln!("web tools: web_search (DuckDuckGo) and web_fetch; queries leave this machine");
-        for tool in loadngo_inference::web_tools::WebTools::new().into_tools() {
-            tools.push(tool);
-        }
-    }
-    // Every Archive CAS archive on the attached drives, found the way the Archive CAS
-    // browser finds them; `--cas-root` adds a root discovery would miss, and `--cas-key`
-    // is the key signatures are checked against.
-    let key = args.cas_key.as_deref().and_then(|path| {
-        data::archive_cas_sign::read_public_key(path)
-            .map_err(|error| eprintln!("file tools: CAS key {}: {error:#}", path.display()))
-            .ok()
-    });
-    let archives =
-        loadngo_inference::cas_tools::Archives::new(args.cas_root.iter().cloned().collect(), key);
-    let roots = archives.roots();
-    eprintln!(
-        "archive tools: {} Archive CAS {} attached ({}); cas_archives lists every archive",
-        roots.len(),
-        if roots.len() == 1 { "root" } else { "roots" },
-        roots
-            .iter()
-            .map(|r| r.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    for tool in loadngo_inference::cas_tools::cas_tools(archives) {
-        tools.push(tool);
-    }
-    tools
+    extra
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)] // GB shown to one decimal
@@ -249,6 +178,28 @@ pub fn run(
         );
         model.set_expert_transform(args.experts.transform());
     }
+    if args.chat && !args.legacy_chat {
+        let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        let accel = device.accel();
+        return crate::agent_chat::run(
+            args,
+            crate::agent_chat::Loaded {
+                model: &mut model,
+                description: "Kimi Linear 48B-A3B (Moonshot AI, open weights)",
+                identity: "Kimi",
+                engine: engine_name(args.accel),
+                format: &format,
+                accel,
+            },
+            tokenizer,
+            extra_notes(args),
+            max_context,
+            gen_tokens,
+            &mut gate,
+            cancel,
+            generating,
+        );
+    }
     let mut session = model.session(max_context);
     let keep = || !cancel.load(Ordering::Relaxed);
 
@@ -262,7 +213,7 @@ pub fn run(
             format = format.with_note(VOICE_NOTE);
         }
         let mut options = crate::chat_options(args, format.name(), max_context)?;
-        let tools = toolbox(args);
+        let tools = toolbox(args)?;
         let tools = Some(&tools).filter(|t| !t.is_empty());
         // Every conversation opens with the same tool declarations (~800 tokens, about a
         // minute on a cold expert cache). Consume them once now and keep a snapshot, so
@@ -436,17 +387,6 @@ memory_search; drop wrong or outdated notes with memory_forget.";
         Ok(_) => format!("{intro} You have no notes yet."),
         Err(e) => format!("{intro} (Your notes could not be read: {e}.)"),
     }
-}
-
-/// The local date in `date`'s `format`.
-fn date(format: &str) -> Option<String> {
-    let out = std::process::Command::new("date")
-        .arg(format)
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.trim();
-    (out.status.success() && !text.is_empty()).then(|| text.to_string())
 }
 
 /// How to answer when replies are spoken aloud (`--voice`).

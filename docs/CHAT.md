@@ -1,5 +1,45 @@
 # Local interactive chat
 
+## Since 2026-10-09: the shared chat loop
+
+Kimi Linear and Gemma 4 chat on loadngo's shared loop (`loadngo-inference::agent`,
+loadngo `docs/AGENT_LOOP.md`), the one gpt-oss runs on. `crates/kimi-k3-cli/src/agent_chat.rs`
+connects them: `KimiTemplate` (both formats), `Engine` (any `Reader`: the context is kept
+as tokens and the session follows it, restarting from a snapshot after the opening when
+`/undo` or `/reset` go back) and the terminal or voice (`Kimi> ` then the reply; status
+lines on stderr).
+
+What changed for Kimi:
+
+- **Tools**: loadngo's workspace tools (files read-only; `text_read`, `text_edit`,
+  `text_write`, `text_format`; `cargo` and `git`; the Archive CAS; notes; the web) and her
+  read-only `board_sections`/`board_read`. Her own text tools, the terminal tools (Jay:
+  dropped) and `board_add_row` are gone: the editing tools claim a repository on the board
+  at her first write and hand it off when the chat ends, listing the uncommitted files and
+  the chat's own `cargo check`/`test`.
+- **Guards**: the loop's (repeated calls not run again and then the tools closed, write
+  failure limits, notes when one tool keeps failing or an edit undoes another, a looping
+  reply halted, the check before an answer after unchecked changes, the archive coverage
+  check), and Jev acting every 6 calls instead of in shadow at a handoff (`--no-checkpoint`
+  turns Jev off).
+- **Each turn** a system note gives the local date and time and says which model she is,
+  on which engine, her context, where this chat is saved and her last reply's speed.
+- **Commands**: `/help`, `/stats`, `/undo`, `/reset`, `/quit`. Ctrl-C stops a reply.
+- **Saved chats**: still `~/.loadngo/kimi/transcripts/<time>.jsonl`, with the same event
+  names; no `.state.json` beside them yet.
+
+Not yet on the loop (step 3): `/continue`, turn budgets (`--turn-minutes`,
+`--turn-tokens`), `--resume`, and compaction through a handoff, so a full context ends a
+turn (`/undo` or `/reset` make room). `--legacy-chat` runs the chat described below, which
+has them, with the same tools.
+
+Checked 2026-10-09 on the GPU: Kimi Linear answered where her chat is saved and which model
+and engine she is, then fixed the seeded `median` bug (12 calls, 77 s, the chat's own check
+passing): her first finished code task. Gemma answered a one-call question. Evidence:
+loadngo `docs/AGENT_LOOP.md`, "Evidence, step 2".
+
+The rest of this file describes the chat before the loop (`--legacy-chat`, and K3).
+
 ## Run
 
 Since 2026-09-24 the root launcher chats with **Kimi Linear 48B-A3B** by default (about

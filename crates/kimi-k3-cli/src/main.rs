@@ -24,6 +24,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 mod accel;
+mod agent_chat;
 mod board;
 mod chat;
 mod chat_gemma;
@@ -32,19 +33,6 @@ mod gemma;
 mod linear;
 mod quality;
 mod system_one;
-#[cfg(unix)]
-mod terminal;
-#[cfg(not(unix))]
-mod terminal {
-    pub fn interrupt() {}
-
-    pub fn tools(
-        _: &std::path::Path,
-    ) -> Result<Vec<Box<dyn loadngo_inference::tools::Tool>>, String> {
-        Err("terminal tools require Unix process groups; this platform is not supported yet".into())
-    }
-}
-mod text_tools;
 mod thermal;
 mod transcript;
 // The wake-word parser and reply wrapper are portable and tested everywhere; only macOS
@@ -112,6 +100,7 @@ struct Args {
     no_transcript: bool,
     no_checkpoint: bool,
     resume: Option<String>,
+    legacy_chat: bool,
 }
 
 impl Args {
@@ -157,6 +146,7 @@ impl Args {
         let mut no_transcript = false;
         let mut no_checkpoint = false;
         let mut resume = None;
+        let mut legacy_chat = false;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -239,6 +229,7 @@ impl Args {
                     budget.tokens = (tokens > 0).then_some(tokens);
                 }
                 "--no-transcript" => no_transcript = true,
+                "--legacy-chat" => legacy_chat = true,
                 "--no-checkpoint" => no_checkpoint = true,
                 "--resume" => resume = Some(next_value(&mut raw, "--resume")?),
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
@@ -321,6 +312,7 @@ impl Args {
             no_transcript,
             no_checkpoint,
             resume,
+            legacy_chat,
         })
     }
 }
@@ -400,19 +392,23 @@ fn print_usage() {
          \x20 --help, -h            show help and exit\n\
          \n\
          example: k3 /Volumes/Jarraya/kimi-k3 --chat --gen 64 --max-context 512\n\
-         In chat: /help, /continue, /undo, /reset, /stats, /quit. Ctrl-C pauses a turn\n\
-         (generation stops at a safe layer/output boundary, a running terminal command is\n\
-         stopped, and tool calls not yet run wait for /continue). At the prompt, Ctrl-C or\n\
-         Ctrl-D exits; --resume latest carries the saved chat on.\n\
+         Kimi Linear and Gemma chat on loadngo's shared loop (loadngo docs/AGENT_LOOP.md):\n\
+         /help, /undo, /reset, /stats, /quit; Ctrl-C stops a reply (generation stops at a\n\
+         safe layer/output boundary). Tools: files (read-only), text edits under\n\
+         COLLABORATION.md (claims and handoffs on the board are written for her), cargo and\n\
+         git (fixed subcommands, no shell), the Archive CAS, notes, the web, and board\n\
+         sections. No terminal commands. At the prompt, Ctrl-C or Ctrl-D exits.\n\
+         \x20 --legacy-chat        optional, Kimi Linear or Gemma: the chat before the shared\n\
+         \x20                      loop, for what it alone has until step 3: /continue, turn\n\
+         \x20                      budgets, --resume and compaction through a handoff\n\
          \x20 --fs-base DIR        optional: workspace for reads and text edits (root AGENTS.md/CLAUDE.md protected)\n\
          \x20                      with relative paths starting here (default: current dir)\n\
          \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
          \x20                      on attached drives (cas_archives lists every archive)\n\
          \x20 --cas-key PATH       optional: trusted Dilithium public key; archives it signed\n\
          \x20                      are marked signed, all others unsigned\n\
-         \x20 --no-tools           optional: chat without tools, including terminal commands\n\
-         \x20 --no-web             optional: disable web_search/web_fetch; terminal commands\n\
-         \x20                      can still use the network\n\
+         \x20 --no-tools           optional: chat without tools\n\
+         \x20 --no-web             optional: disable web_search/web_fetch\n\
          \x20 --no-memory          optional: chat without her memory (notes she keeps across\n\
          \x20                      sessions in ~/.loadngo/kimi/memory.jsonl)\n\
          \x20 --experts bf16|mxfp4 optional, Kimi Linear: round routed experts to 4-bit MXFP4\n\
@@ -432,20 +428,19 @@ fn print_usage() {
          \x20                      recognition listens; say \"Kimi, ...\" to ask something, and\n\
          \x20                      the reply is also spoken. Nothing leaves the machine.\n\
          \x20 --locale L           optional, with --voice: speech locale (default en-US)\n\
-         \x20 --turn-minutes N     optional, chat: pause a turn (every reply and tool round\n\
+         \x20 --turn-minutes N     optional, --legacy-chat: pause a turn (every reply and tool round\n\
          \x20                      after one message) after N minutes; 0 = no limit (default 30)\n\
-         \x20 --turn-tokens N      optional, chat: pause a turn once Kimi has generated N\n\
+         \x20 --turn-tokens N      optional, --legacy-chat: pause a turn once Kimi has generated N\n\
          \x20                      tokens in it; 0 = no limit (default 16384). /continue\n\
          \x20                      resumes a paused turn with a fresh budget\n\
          \x20 --no-transcript      optional, chat: do not save the chat. By default each chat\n\
          \x20                      is logged to ~/.loadngo/kimi/transcripts/<time>.jsonl for\n\
-         \x20                      review, with a resume snapshot beside it (<time>.state.json)\n\
-         \x20 --resume latest|PATH optional, chat: carry on a saved chat (the newest, or a\n\
+         \x20                      review (--legacy-chat: with a resume snapshot, <time>.state.json)\n\
+         \x20 --resume latest|PATH optional, --legacy-chat: carry on a saved chat (the newest, or a\n\
          \x20                      .jsonl/.state.json path) from its exact history\n\
-         \x20 --no-checkpoint      optional, Kimi Linear chat: when the context is rebuilt from\n\
-         \x20                      Kimi's handoff, do not ask the typed System One questions\n\
-         \x20                      about where the turn stands (they are shown and saved; nothing\n\
-         \x20                      acts on them yet)\n\
+         \x20 --no-checkpoint      optional, chat: without Jev (System One), which judges the\n\
+         \x20                      work every 6 tool calls and acts when it is stuck, and gates\n\
+         \x20                      web calls (--legacy-chat: its shadow questions at a handoff)\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
@@ -518,7 +513,6 @@ fn run() -> Result<(), String> {
     let signal_cancel = Arc::clone(&cancel);
     let signal_generating = Arc::clone(&generating);
     ctrlc::set_handler(move || {
-        terminal::interrupt();
         if signal_generating.load(Ordering::Relaxed) {
             signal_cancel.store(true, Ordering::Relaxed);
         } else {

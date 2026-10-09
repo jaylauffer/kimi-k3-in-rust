@@ -1,5 +1,14 @@
 # File editing in Kimi Linear chat
 
+> **Removed 2026-10-09.** Kimi's own `text_read`/`text_write`/`text_edit`
+> (`text_tools.rs`) are gone. Kimi Linear and Gemma now use loadngo's editing tools
+> (`loadngo-inference::edit_tools`: `text_read`, `text_edit`, `text_write`,
+> `text_format`), with `cargo` and `git`, on loadngo's shared chat loop; see loadngo
+> `docs/AGENT_LOOP.md` and `docs/GPT_OSS.md` ("Editing, checking and Jev"). Those
+> tools refuse the root's rules and board, other agents' uncommitted or claimed files,
+> and build output, and claim a repository on the board at the first write. The rest
+> of this file records how her old tools behaved, for reading old transcripts.
+
 Kimi Linear exposes `text_read`, `text_write` (create only) and `text_edit`
 (one exact replacement) for UTF-8 text throughout the workspace. Since
 2026-10-01, root files and non-Git directories are writable, and there is no

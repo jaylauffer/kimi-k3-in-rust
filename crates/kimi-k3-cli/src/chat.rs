@@ -34,16 +34,13 @@ One line per message. Chats are saved to ~/.loadngo/kimi/transcripts (--no-trans
 turns that off); --resume latest picks the last one up. Kimi Linear can read local files and the
 signed CAS snapshot, and create/edit workspace UTF-8 text files (--no-tools
 disables these).
-File edits and terminal command side effects survive /undo and /reset.
-Only workspace-root AGENTS.md and CLAUDE.md are protected; repository copies are editable.
-Terminal tools run commands, read output, send stdin and stop sessions (no PTY).
-Kimi can also search and read public web pages (--no-web turns those tools off;
-terminal commands can still use the network).
+File edits survive /undo and /reset. She checks work with cargo and git; she runs no other
+commands. Kimi can also search and read public web pages (--no-web turns those tools off).
 When a Kimi Linear chat's context is nearly full, Kimi writes a handoff and the context is
 rebuilt from it; the turn goes on. A chat saved at the limit continues with /continue.
 ";
 
-fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
+pub(crate) fn ordinary(ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
     ids.extend(tokenizer.encode_ordinary(text));
 }
 
@@ -102,6 +99,26 @@ fn validate(tokenizer: &Tokenizer) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A Kimi Linear format with made-up control token ids, for tests with a byte
+/// tokenizer.
+#[cfg(test)]
+pub(crate) fn test_linear_format() -> ChatFormat {
+    ChatFormat::KimiLinear(LinearTokens {
+        system: 200_000,
+        user: 200_001,
+        assistant: 200_002,
+        middle: 200_003,
+        end: 200_004,
+        section_begin: 200_005,
+        section_end: 200_006,
+        call_begin: 200_007,
+        argument_begin: 200_008,
+        call_end: 200_009,
+        eos: [200_004; 2],
+        note: None,
+    })
 }
 
 /// Which chat encoding a checkpoint uses.
@@ -221,7 +238,13 @@ impl ChatFormat {
     }
 
     /// A message in `role` holding `content`.
-    fn message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, role: &str, content: &str) {
+    pub(crate) fn message(
+        &self,
+        ids: &mut Vec<u32>,
+        tokenizer: &Tokenizer,
+        role: &str,
+        content: &str,
+    ) {
         match self {
             Self::KimiLinear(t) => t.message(ids, tokenizer, role, content),
             Self::Gemma(g) => g.message(ids, tokenizer, role, content),
@@ -230,7 +253,7 @@ impl ChatFormat {
     }
 
     /// A user message holding `text`.
-    fn user_message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
+    pub(crate) fn user_message(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer, text: &str) {
         match self {
             Self::KimiLinear(t) => {
                 ids.push(t.user);
@@ -245,7 +268,7 @@ impl ChatFormat {
     }
 
     /// The opening of the assistant's reply.
-    fn reply_header(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer) {
+    pub(crate) fn reply_header(&self, ids: &mut Vec<u32>, tokenizer: &Tokenizer) {
         match self {
             Self::KimiLinear(t) => {
                 ids.push(t.assistant);
@@ -429,7 +452,7 @@ impl ChatFormat {
     }
 
     /// Tool calls in a finished Kimi Linear reply, as `(id, arguments)` text pairs.
-    fn tool_calls(&self, tokenizer: &Tokenizer, reply: &[u32]) -> Vec<(String, String)> {
+    pub(crate) fn tool_calls(&self, tokenizer: &Tokenizer, reply: &[u32]) -> Vec<(String, String)> {
         if let Self::Gemma(g) = self {
             return g.tool_calls(tokenizer, reply);
         }
@@ -467,6 +490,42 @@ impl ChatFormat {
             rest = &rest[end..];
         }
         calls
+    }
+
+    /// What a conversation on the shared loop (`loadngo_inference::agent`) opens with: the
+    /// tool declarations and one system message (Kimi Linear), or the system turn holding
+    /// both (Gemma).
+    ///
+    /// # Errors
+    /// For K3, which has no tools, or declarations Gemma cannot write.
+    pub(crate) fn opening_with(
+        &self,
+        tokenizer: &Tokenizer,
+        system: &str,
+        declaration: Option<&str>,
+    ) -> Result<Vec<u32>, String> {
+        match self {
+            Self::KimiLinear(t) => {
+                let mut ids = Vec::new();
+                if let Some(declaration) = declaration {
+                    t.message(&mut ids, tokenizer, "tool_declare", declaration);
+                }
+                t.message(&mut ids, tokenizer, "system", system);
+                Ok(ids)
+            }
+            Self::Gemma(g) => g.preamble(tokenizer, system, declaration),
+            Self::K3 => Err("the K3 chat has no tools or system messages".into()),
+        }
+    }
+
+    /// Closes the model's last reply as the template writes a finished one, whatever
+    /// token ended it.
+    pub(crate) fn close_reply(&self, ids: &mut Vec<u32>) {
+        match self {
+            Self::KimiLinear(t) => ids.push(t.end),
+            Self::Gemma(g) => ids.extend([g.turn_end, g.newline]),
+            Self::K3 => {}
+        }
     }
 
     /// The name saved chats record, so one is never resumed with another format's tokens.
@@ -509,7 +568,7 @@ impl ChatFormat {
     }
 
     /// Tool results as the template's tool messages, then the assistant header.
-    fn tool_results(
+    pub(crate) fn tool_results(
         &self,
         tokenizer: &Tokenizer,
         results: &[(String, String, String)],
@@ -531,7 +590,7 @@ impl ChatFormat {
         ids
     }
 
-    fn stops(&self) -> Vec<u32> {
+    pub(crate) fn stops(&self) -> Vec<u32> {
         match self {
             Self::K3 => vec![END, EOS],
             Self::KimiLinear(t) => vec![t.end, t.eos[0], t.eos[1]],
@@ -547,7 +606,7 @@ impl ChatFormat {
         }
     }
 
-    fn opening(&self) -> &'static str {
+    pub(crate) fn opening(&self) -> &'static str {
         match self {
             Self::K3 => "[thinking] ",
             Self::KimiLinear(_) => "Kimi> ",
@@ -555,10 +614,23 @@ impl ChatFormat {
         }
     }
 
-    fn push(&self, display: &mut Display, tokenizer: &Tokenizer, token: u32) -> String {
+    pub(crate) fn push(&self, display: &mut Display, tokenizer: &Tokenizer, token: u32) -> String {
         match self {
             Self::K3 => display.push(tokenizer, token),
             Self::Gemma(g) => {
+                // A thought channel (empty with thinking off, but the model may still write
+                // its name) is not part of the reply.
+                if token == g.channel {
+                    display.tag = Some((true, Vec::new()));
+                    return terminal_text(&display.utf8.finish());
+                }
+                if token == g.channel_end {
+                    display.tag = None;
+                    return String::new();
+                }
+                if display.tag.is_some() {
+                    return String::new();
+                }
                 if token == g.call {
                     return format!("{}\n[tool call ", terminal_text(&display.utf8.finish()));
                 }
@@ -641,21 +713,13 @@ file's contents, read it before answering and name the path you read. web_search
 public web and web_fetch reads a page: use them for current events, prices, schedules and \
 anything recent or that you are unsure of, and say which site the answer came from. Answer \
 everything else from your own knowledge. Before changing files, read applicable AGENTS.md \
-and COLLABORATION.md and the board. Claim exact repo-relative paths via board_add_row \
-(Active claims, exact repo name, comma-separated paths, status in progress). text_read returns \
-a revision; text_edit uses that revision and one unique old_text/new_text replacement. \
-text_write creates a new UTF-8 text file anywhere in the workspace, including its root, \
-without requiring Git. Only workspace-root AGENTS.md and CLAUDE.md are protected; \
-repository-local instruction files are editable. Paths start at the workspace. Never adopt another agent's \
-dirty files. terminal_exec starts a shell command and returns a session id; terminal_read \
-reads output/status, terminal_write sends stdin or closes it, and terminal_stop cancels. \
-Use these to inspect repositories and run builds/tests. Read command exit status before \
-claiming success; report checks not run. Commands run with your OS user's permissions, \
-including filesystem writes and network access: follow Jay's scope and shared-work claims. \
-Never push, publish, delete user data, or alter another agent's work without Jay's authorization. \
-Change source with text_read and text_edit, not shell commands: they take the same \
-paths fs_read shows. This Mac's sed, grep and find are the BSD ones. File edits and command side effects survive \
-/undo and /reset. Finish with a board handoff. Avoid repeating unchanged tool calls; after a \
+and COLLABORATION.md; board_sections and board_read show the board, and your first edit in a \
+repository claims it there for you. text_read returns a revision; text_edit replaces one \
+unique old_text with new_text; text_write creates a new UTF-8 text file. Paths start at the \
+workspace. A file another agent is working on is refused: tell Jay. cargo runs check, test, \
+clippy, build or fmt --check in a crate, and git runs status, diff, log or show; read their \
+exit status before claiming success, and report checks not run. You cannot commit, push or \
+run other commands: Jay reviews your changes. File edits survive /undo and /reset. Avoid repeating unchanged tool calls; after a \
 successful edit you may read the updated file again. A failed edit did not change the file: \
 read its error, correct its path, revision or exact text, and retry only after fixing the cause. \
 Never repeat an unchanged failing write. When a search finds nothing, say so plainly.";
@@ -828,13 +892,13 @@ impl LinearTokens {
 }
 
 /// The tool name in a Kimi call id such as `functions.fs_read:0`.
-fn tool_name(id: &str) -> &str {
+pub(crate) fn tool_name(id: &str) -> &str {
     let id = id.strip_prefix("functions.").unwrap_or(id);
     id.split(':').next().unwrap_or(id)
 }
 
 /// Do not let model text inject terminal escape sequences (including OSC).
-fn terminal_text(text: &str) -> String {
+pub(crate) fn terminal_text(text: &str) -> String {
     text.chars()
         .flat_map(|c| {
             if c.is_control() && c != '\n' && c != '\t' {
@@ -847,8 +911,8 @@ fn terminal_text(text: &str) -> String {
 }
 
 #[derive(Default)]
-struct Display {
-    utf8: Utf8Stream,
+pub(crate) struct Display {
+    pub(crate) utf8: Utf8Stream,
     tag: Option<(bool, Vec<u8>)>,
 }
 
