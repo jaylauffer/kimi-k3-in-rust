@@ -170,6 +170,18 @@ pub fn run(
         );
         model.set_expert_transform(args.experts.transform());
     }
+    if let Some(path) = &args.eval {
+        let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
+        return crate::agent_chat::evaluate(
+            &mut model,
+            tokenizer,
+            &format,
+            device.accel(),
+            cancel,
+            path,
+            "Kimi Linear 48B-A3B",
+        );
+    }
     if args.chat {
         let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
         let accel = device.accel();

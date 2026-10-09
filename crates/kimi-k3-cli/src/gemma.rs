@@ -362,6 +362,20 @@ pub fn run(
     } else {
         ONE_SHOT_CONTEXT
     };
+    if let Some(path) = &args.eval {
+        let config = &model.config;
+        let format =
+            crate::chat::ChatFormat::gemma(tokenizer, config.bos_token_id, &config.eos_token_ids)?;
+        return crate::agent_chat::evaluate(
+            &mut model,
+            tokenizer,
+            &format,
+            device.accel(),
+            cancel,
+            path,
+            "Gemma 4 31B-it",
+        );
+    }
     if args.chat {
         return chat(
             args,

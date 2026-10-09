@@ -219,6 +219,26 @@ Each new model family costs about a day of engine work, as Gemma did. The evalua
 set comes first. Then candidates are ported only when the evaluation says Kimi Linear
 falls short, starting with gpt-oss-20b, whose weight format is already supported.
 
+### Measured, 2026-10-09
+
+The evaluation set exists: 44 finished tasks (board handoffs and real model answers) with
+an answer key, scored by loadngo's `agent::eval` (`k3 <model> --eval FILE`,
+`gpt_oss_generate --eval FILE`). The cases quote the private board, so they are kept in
+`~/pudding/eval`; the write-up is `~/pudding/reviews/2026-10-09-orchestration-eval-claude.md`
+and the summary is in loadngo `docs/AGENT_LOOP.md` ("Step 4").
+
+- Mechanical rules: 36 of 44 classes, one false comfort (an inflated review that said
+  tests pass). They were written after the cases, so they are flattered.
+- Gemma 4 31B-it: 33 of 44, one false comfort, steady across option orders; with the
+  rules, no false comfort, at the cost of 11 false alarms in 15 and 19 s per report.
+- Kimi Linear: 21 of 44 and four false comforts, including her own espeak review: her
+  typed judgement is not usable for this.
+- gpt-oss-20b: "not verified" for 43 of 44, read with no reasoning first; untested with
+  its reasoning.
+
+So the first digest would be rules + Gemma, not Kimi Linear, and the next measurement is
+on tasks the rules were not written against.
+
 ### First step
 
 A dispatch-and-verify loop for one worker, Claude Code via `claude -p`, on small,

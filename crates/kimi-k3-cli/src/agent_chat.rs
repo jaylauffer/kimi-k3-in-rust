@@ -912,6 +912,47 @@ pub fn default_budget() -> Budget {
     }
 }
 
+/// `--eval FILE`: the orchestration cases scored by the rules and by the model's typed
+/// answers (`loadngo_inference::agent::eval`); the report to stderr, the answers as JSON
+/// to stdout.
+///
+/// # Errors
+/// When the file cannot be read or the model fails.
+pub fn evaluate<M: Reader>(
+    model: &mut M,
+    tokenizer: &Tokenizer,
+    format: &ChatFormat,
+    accel: Accel<'_>,
+    cancel: &AtomicBool,
+    path: &Path,
+    name: &str,
+) -> Result<(), String> {
+    use loadngo_inference::agent::eval;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let cases = eval::load(&text)?;
+    let mut labels = KimiLabels::new(model, tokenizer, format, accel, cancel);
+    let mut run = eval::Run::default();
+    for (i, case) in cases.iter().enumerate() {
+        let started = Instant::now();
+        let j = eval::judge(&mut labels, case)?;
+        eprintln!(
+            "[{}/{}] {}: key {}, model {} (attention {:.2}), rules {}; {:.1}s",
+            i + 1,
+            cases.len(),
+            case.id,
+            case.class.name(),
+            j.best().name(),
+            j.attention,
+            eval::mechanical(&case.report).name(),
+            started.elapsed().as_secs_f64()
+        );
+        run.add(case, Some(&j));
+    }
+    eprint!("{}", run.report(name));
+    println!("{}", run.to_json(name));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

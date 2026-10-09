@@ -99,6 +99,7 @@ struct Args {
     no_transcript: bool,
     no_checkpoint: bool,
     resume: Option<String>,
+    eval: Option<PathBuf>,
 }
 
 impl Args {
@@ -144,6 +145,7 @@ impl Args {
         let mut no_transcript = false;
         let mut no_checkpoint = false;
         let mut resume = None;
+        let mut eval = None;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -228,6 +230,7 @@ impl Args {
                 "--no-transcript" => no_transcript = true,
                 "--no-checkpoint" => no_checkpoint = true,
                 "--resume" => resume = Some(next_value(&mut raw, "--resume")?),
+                "--eval" => eval = Some(PathBuf::from(next_value(&mut raw, "--eval")?)),
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
                 "--cas-root" => cas_root = Some(PathBuf::from(next_value(&mut raw, "--cas-root")?)),
                 "--cas-key" => cas_key = Some(PathBuf::from(next_value(&mut raw, "--cas-key")?)),
@@ -308,6 +311,7 @@ impl Args {
             no_transcript,
             no_checkpoint,
             resume,
+            eval,
         })
     }
 }
@@ -403,6 +407,9 @@ fn print_usage() {
          \x20 --resume latest|PATH optional, chat: carry on a saved chat (the newest of this\n\
          \x20                      model's, or a .jsonl/.state.json path) from its exact context,\n\
          \x20                      a paused turn included; snapshots from before 2026-10-09 cannot\n\
+         \x20 --eval FILE          optional, Kimi Linear or Gemma: score the orchestration cases\n\
+         \x20                      in FILE (loadngo inference::agent::eval) by the rules and the\n\
+         \x20                      model's typed answers; report to stderr, JSON to stdout\n\
          \x20 --no-checkpoint      optional, chat: without Jev (System One), which judges the\n\
          \x20                      work every 6 tool calls and acts when it is stuck, and gates\n\
          \x20                      web calls\n\
