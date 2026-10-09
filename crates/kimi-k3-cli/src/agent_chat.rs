@@ -931,6 +931,10 @@ pub fn evaluate<M: Reader>(
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cases = eval::load(&text)?;
     let mut labels = KimiLabels::new(model, tokenizer, format, accel, cancel);
+    let mut labels = loadngo_inference::system_one::LetterReadout {
+        model: &mut labels,
+        calibration: loadngo_inference::system_one::Calibration::default(),
+    };
     let mut run = eval::Run::default();
     for (i, case) in cases.iter().enumerate() {
         let started = Instant::now();
