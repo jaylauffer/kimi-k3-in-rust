@@ -34,7 +34,6 @@ mod linear;
 mod quality;
 mod system_one;
 mod thermal;
-mod transcript;
 // The wake-word parser and reply wrapper are portable and tested everywhere; only macOS
 // listens and speaks, so elsewhere they are used by the tests alone.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -96,11 +95,10 @@ struct Args {
     temperature: f32,
     voice: bool,
     locale: String,
-    budget: chat::TurnBudget,
+    budget: loadngo_inference::agent::Budget,
     no_transcript: bool,
     no_checkpoint: bool,
     resume: Option<String>,
-    legacy_chat: bool,
 }
 
 impl Args {
@@ -142,11 +140,10 @@ impl Args {
         let mut temperature = 1.0_f32;
         let mut voice = false;
         let mut locale = String::from("en-US");
-        let mut budget = chat::TurnBudget::default();
+        let mut budget = agent_chat::default_budget();
         let mut no_transcript = false;
         let mut no_checkpoint = false;
         let mut resume = None;
-        let mut legacy_chat = false;
 
         if env::args().len() <= 1 {
             print_usage();
@@ -229,7 +226,6 @@ impl Args {
                     budget.tokens = (tokens > 0).then_some(tokens);
                 }
                 "--no-transcript" => no_transcript = true,
-                "--legacy-chat" => legacy_chat = true,
                 "--no-checkpoint" => no_checkpoint = true,
                 "--resume" => resume = Some(next_value(&mut raw, "--resume")?),
                 "--fs-base" => fs_base = Some(PathBuf::from(next_value(&mut raw, "--fs-base")?)),
@@ -312,39 +308,8 @@ impl Args {
             no_transcript,
             no_checkpoint,
             resume,
-            legacy_chat,
         })
     }
-}
-
-/// The chat's budget, and where it is saved or resumed from, as the flags ask.
-fn chat_options(
-    args: &Args,
-    format: &'static str,
-    max_context: usize,
-) -> Result<chat::ChatOptions<'static>, String> {
-    let mut options = chat::ChatOptions {
-        budget: args.budget,
-        ..chat::ChatOptions::default()
-    };
-    if args.no_transcript {
-        return Ok(options);
-    }
-    let Some(dir) = transcript::default_dir() else {
-        eprintln!("transcript: HOME is not set; the chat is not saved");
-        return Ok(options);
-    };
-    if let Some(which) = &args.resume {
-        let (saved, resumed) = transcript::Transcript::resume(&dir, which, format, max_context)?;
-        options.transcript = Some(saved);
-        options.resumed = Some(resumed);
-    } else {
-        match transcript::Transcript::create(&dir, format, &args.model_dir) {
-            Ok(saved) => options.transcript = Some(saved),
-            Err(e) => eprintln!("transcript: {e}; the chat is not saved"),
-        }
-    }
-    Ok(options)
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -392,15 +357,14 @@ fn print_usage() {
          \x20 --help, -h            show help and exit\n\
          \n\
          example: k3 /Volumes/Jarraya/kimi-k3 --chat --gen 64 --max-context 512\n\
-         Kimi Linear and Gemma chat on loadngo's shared loop (loadngo docs/AGENT_LOOP.md):\n\
-         /help, /undo, /reset, /stats, /quit; Ctrl-C stops a reply (generation stops at a\n\
-         safe layer/output boundary). Tools: files (read-only), text edits under\n\
-         COLLABORATION.md (claims and handoffs on the board are written for her), cargo and\n\
-         git (fixed subcommands, no shell), the Archive CAS, notes, the web, and board\n\
-         sections. No terminal commands. At the prompt, Ctrl-C or Ctrl-D exits.\n\
-         \x20 --legacy-chat        optional, Kimi Linear or Gemma: the chat before the shared\n\
-         \x20                      loop, for what it alone has until step 3: /continue, turn\n\
-         \x20                      budgets, --resume and compaction through a handoff\n\
+         Chat runs on loadngo's shared loop (loadngo docs/AGENT_LOOP.md): /continue, /undo,\n\
+         /reset, /stats, /help, /quit. Ctrl-C pauses a turn (generation stops at a safe\n\
+         layer/output boundary; tool calls not yet run wait for /continue). Past three\n\
+         quarters of --max-context she writes a handoff and the context is rebuilt from it.\n\
+         Kimi Linear and Gemma tools: files (read-only), text edits under COLLABORATION.md\n\
+         (claims and handoffs on the board are written for her), cargo and git (fixed\n\
+         subcommands, no shell), the Archive CAS, notes, the web, and board sections. No\n\
+         terminal commands. K3 has no tools. At the prompt, Ctrl-C or Ctrl-D exits.\n\
          \x20 --fs-base DIR        optional: workspace for reads and text edits (root AGENTS.md/CLAUDE.md protected)\n\
          \x20                      with relative paths starting here (default: current dir)\n\
          \x20 --cas-root DIR       optional: an Archive CAS root to offer besides those found\n\
@@ -428,19 +392,20 @@ fn print_usage() {
          \x20                      recognition listens; say \"Kimi, ...\" to ask something, and\n\
          \x20                      the reply is also spoken. Nothing leaves the machine.\n\
          \x20 --locale L           optional, with --voice: speech locale (default en-US)\n\
-         \x20 --turn-minutes N     optional, --legacy-chat: pause a turn (every reply and tool round\n\
+         \x20 --turn-minutes N     optional, chat: pause a turn (every reply and tool round\n\
          \x20                      after one message) after N minutes; 0 = no limit (default 30)\n\
-         \x20 --turn-tokens N      optional, --legacy-chat: pause a turn once Kimi has generated N\n\
+         \x20 --turn-tokens N      optional, chat: pause a turn once Kimi has generated N\n\
          \x20                      tokens in it; 0 = no limit (default 16384). /continue\n\
          \x20                      resumes a paused turn with a fresh budget\n\
          \x20 --no-transcript      optional, chat: do not save the chat. By default each chat\n\
          \x20                      is logged to ~/.loadngo/kimi/transcripts/<time>.jsonl for\n\
-         \x20                      review (--legacy-chat: with a resume snapshot, <time>.state.json)\n\
-         \x20 --resume latest|PATH optional, --legacy-chat: carry on a saved chat (the newest, or a\n\
-         \x20                      .jsonl/.state.json path) from its exact history\n\
+         \x20                      review, with a snapshot to resume from (<time>.state.json)\n\
+         \x20 --resume latest|PATH optional, chat: carry on a saved chat (the newest of this\n\
+         \x20                      model's, or a .jsonl/.state.json path) from its exact context,\n\
+         \x20                      a paused turn included; snapshots from before 2026-10-09 cannot\n\
          \x20 --no-checkpoint      optional, chat: without Jev (System One), which judges the\n\
          \x20                      work every 6 tool calls and acts when it is stuck, and gates\n\
-         \x20                      web calls (--legacy-chat: its shadow questions at a handoff)\n\
+         \x20                      web calls\n\
          \x20 --convert-experts-mxfp4 DIR  optional, Kimi Linear: write every routed expert as\n\
          \x20                      MXFP4 into DIR, one file per layer; the checkpoint is only read\n\
          \x20 --mxfp4-experts DIR  optional, Kimi Linear: run with the routed experts converted\n\
@@ -590,17 +555,10 @@ fn run() -> Result<(), String> {
     let mut session = TrunkSession::new(&config, args.max_context);
     let mut session_logits: Option<Vec<f32>> = None;
     if args.chat {
-        let options = chat_options(&args, "k3", args.max_context)?;
-        println!("Local Kimi K3 -- about a minute per token on this Mac mini with --accel ane.");
-        return chat::run(
-            &tokenizer,
-            args.max_context,
-            args.gen_tokens,
-            &cancel,
-            &generating,
-            io::stdin().lock(),
-            io::stdout().lock(),
-            |ids| {
+        chat::validate(&tokenizer)?;
+        eprintln!("Kimi K3 is about a minute per token on this Mac mini with --accel ane.");
+        let mut backend = agent_chat::NextToken::new(
+            |ids: &[u32]| {
                 gate.checkpoint(&cancel)?;
                 let started = Instant::now();
                 eprintln!(
@@ -662,7 +620,23 @@ fn run() -> Result<(), String> {
                 }
                 u32::try_from(argmax(last)).map_err(|e| e.to_string())
             },
-            options,
+            args.max_context,
+        );
+        return agent_chat::run(
+            &args,
+            agent_chat::About {
+                description: "Kimi K3 (Moonshot AI, open weights)",
+                identity: "Kimi",
+                engine: linear::engine_name(args.accel),
+                format: &chat::ChatFormat::K3,
+            },
+            &tokenizer,
+            String::new(),
+            args.gen_tokens,
+            &mut backend,
+            None,
+            &cancel,
+            &generating,
         );
     }
 

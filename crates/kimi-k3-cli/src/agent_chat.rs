@@ -1,16 +1,17 @@
-//! Kimi Linear and Gemma 4 on loadngo's shared chat loop (`loadngo_inference::agent`,
+//! Kimi Linear, Gemma 4 and K3 on loadngo's shared chat loop (`loadngo_inference::agent`,
 //! loadngo `docs/AGENT_LOOP.md`), the loop gpt-oss runs on too. This file connects the
 //! models' chat formats (a [`Template`]), their engines (a [`Backend`]) and the terminal
-//! or voice; the turn loop, the tools, the guards and Jev's questions are the loop's.
+//! or voice; the turn loop, the tools, the guards, Jev's questions, pauses and
+//! `/continue`, compaction through a handoff and saved chats are the loop's.
 //!
-//! Since 2026-10-09 this is the default chat for both models. The chat before it
-//! (`chat::run_with`) stays behind `--legacy-chat` until the loop has what only it has:
-//! resuming a saved chat, turn budgets with `/continue`, and compaction through a handoff
-//! (step 3 of `AGENT_LOOP.md`).
+//! Since 2026-10-09 this is the only chat; the one before it (kimi `chat::run_with`) was
+//! removed once the loop had everything it had.
 
+use std::cell::Cell;
 use std::fmt::Write as _;
 use std::io::{BufRead, Read as _, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -20,7 +21,8 @@ use kimi_k3_core::tokenizer::Tokenizer;
 use loadngo_inference::agent::transcript::{Tee, Transcript};
 use loadngo_inference::agent::workspace::{Workspace, WorkspaceOptions};
 use loadngo_inference::agent::{
-    self, Agent, Backend, Call, Ended, Event, Observer, Prompt, Read, Rendered, Template,
+    self, Agent, Backend, Budget, Call, Ended, Event, Observer, Prompt, Read, Rendered, Template,
+    TurnEnd,
 };
 use loadngo_inference::system_one::LabelModel;
 
@@ -32,9 +34,16 @@ use crate::{Args, thermal};
 /// hers).
 const AGENT: &str = "Kimi";
 
-const HELP: &str = "Type a message and press Enter. Commands: /help, /stats, /undo (drops the \
-last exchange; file changes stay), /reset (starts over), /quit. Ctrl-C stops a reply or tool \
-round; at the prompt it quits. Ctrl-D quits.";
+const HELP: &str = "Type a message and press Enter. Commands: /continue (goes on with a paused \
+turn), /undo (drops the last exchange; file changes stay), /reset (starts over), /stats, /help, \
+/quit. Ctrl-C pauses a turn (/continue goes on; a new message answers waiting tool calls as not \
+run); at the prompt it quits, as does Ctrl-D. Chats are saved; --resume latest carries one on.";
+
+/// Where Kimi's chats are saved.
+#[must_use]
+pub fn transcripts() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".loadngo/kimi/transcripts"))
+}
 
 /// The tools Kimi works with in `base`: loadngo's workspace tools (files, editing under
 /// COLLABORATION.md, cargo and git, the Archive CAS, notes, the web) and her read-only
@@ -143,6 +152,10 @@ impl<'t> KimiTemplate<'t> {
 
 impl Template for KimiTemplate<'_> {
     fn opening(&self, instructions: &str, tools: Option<&str>) -> Result<Vec<u32>, String> {
+        if matches!(self.format, ChatFormat::K3) {
+            // K3's opening is part of its first message (`chat::prompt`).
+            return Ok(Vec::new());
+        }
         let mut system = format!(
             "You are {}, running locally on Jay's Mac mini.",
             self.identity
@@ -157,6 +170,14 @@ impl Template for KimiTemplate<'_> {
     }
 
     fn render(&self, p: &Prompt<'_>) -> Result<Rendered, String> {
+        if matches!(self.format, ChatFormat::K3) {
+            let mut ids = Vec::new();
+            if !p.history.is_empty() {
+                self.format.close_reply(&mut ids);
+            }
+            ids.extend(crate::chat::prompt(self.tokenizer, p.user, p.first));
+            return Ok(Rendered::Append(ids));
+        }
         let mut ids = if p.first {
             self.opening(p.instructions, p.tools)?
         } else {
@@ -338,14 +359,21 @@ impl<'a, M: Reader> Engine<'a, M> {
 }
 
 impl<M: Reader> Backend for Engine<'_, M> {
-    /// Reads `tokens` as the opening every conversation starts from.
+    /// Replaces the context. The first load is the opening every conversation starts
+    /// from, kept as a snapshot; a later one (a context rebuilt from a handoff) starts
+    /// from that snapshot when it begins with the opening.
     fn load(&mut self, tokens: &[u32]) -> Result<(), String> {
         self.held = tokens.to_vec();
-        self.session = self.model.open(self.capacity);
         self.logits = None;
         self.sync()?;
-        self.opening = Some(self.session.clone());
+        if self.opening.is_none() {
+            self.opening = Some(self.session.clone());
+        }
         Ok(())
+    }
+
+    fn held(&self) -> &[u32] {
+        &self.held
     }
 
     fn feed(&mut self, tokens: &[u32]) -> Result<(), String> {
@@ -436,6 +464,8 @@ struct Screen<'t> {
     tokenizer: &'t Tokenizer,
     display: Display,
     call: Option<(String, String)>,
+    /// The last reply's speed, for what the model is told about itself.
+    rate: Rc<Cell<Option<f64>>>,
 }
 
 impl Screen<'_> {
@@ -452,7 +482,7 @@ impl Observer for Screen<'_> {
     #[allow(clippy::cast_precision_loss)] // rates, shown to one decimal
     fn event(&mut self, event: Event<'_>) {
         match event {
-            Event::User(_) => {}
+            Event::User(_) | Event::State(_) => {}
             Event::Prompt { tokens, seconds } => {
                 eprintln!(
                     "[{tokens} tokens read in {seconds:.1}s ({:.0} tokens/s)]",
@@ -474,6 +504,9 @@ impl Observer for Screen<'_> {
             } => {
                 let rest = terminal_text(&self.display.utf8.finish());
                 self.out(&format!("{rest}\n"));
+                if tokens > 1 {
+                    self.rate.set(Some(tokens as f64 / seconds.max(1e-9)));
+                }
                 eprintln!(
                     "[{ended:?}: {tokens} tokens, {seconds:.1}s, {:.1} tokens/s]",
                     tokens as f64 / seconds.max(1e-9)
@@ -536,25 +569,120 @@ fn about(
     about
 }
 
-/// What one model brings to the chat.
-pub struct Loaded<'a, M: Reader> {
-    pub model: &'a mut M,
-    /// `Kimi Linear 48B-A3B (Moonshot AI, open weights)`, for the model to know.
+/// A model as a next-token function over the whole context, as K3's engine is: it keeps
+/// its own session and feeds only what it has not read, rebuilding when the context no
+/// longer extends it.
+pub struct NextToken<F> {
+    next: F,
+    held: Vec<u32>,
+    capacity: usize,
+}
+
+impl<F: FnMut(&[u32]) -> Result<u32, String>> NextToken<F> {
+    pub fn new(next: F, capacity: usize) -> Self {
+        Self {
+            next,
+            held: Vec::new(),
+            capacity,
+        }
+    }
+}
+
+impl<F: FnMut(&[u32]) -> Result<u32, String>> Backend for NextToken<F> {
+    fn load(&mut self, tokens: &[u32]) -> Result<(), String> {
+        tokens.clone_into(&mut self.held);
+        Ok(())
+    }
+
+    fn feed(&mut self, tokens: &[u32]) -> Result<(), String> {
+        if self.held.len() + tokens.len() > self.capacity {
+            return Err("the context is full; /undo or /reset make room".into());
+        }
+        self.held.extend_from_slice(tokens);
+        Ok(())
+    }
+
+    fn generate(
+        &mut self,
+        limit: usize,
+        stops: &[u32],
+        cancel: &AtomicBool,
+        emit: &mut dyn FnMut(u32) -> bool,
+    ) -> Result<(Vec<u32>, Ended), String> {
+        let mut out = Vec::new();
+        Ok(loop {
+            if cancel.load(Ordering::Relaxed) {
+                break (out, Ended::Cancelled);
+            }
+            if out.len() == limit {
+                break (out, Ended::Limit);
+            }
+            if self.held.len() + 1 >= self.capacity {
+                break (out, Ended::Context);
+            }
+            let next = match (self.next)(&self.held) {
+                Ok(next) => next,
+                Err(_) if cancel.load(Ordering::Relaxed) => break (out, Ended::Cancelled),
+                Err(e) => return Err(e),
+            };
+            out.push(next);
+            if stops.contains(&next) {
+                break (out, Ended::Stop);
+            }
+            self.held.push(next);
+            if !emit(next) {
+                break (out, Ended::Halted);
+            }
+        })
+    }
+
+    fn truncate(&mut self, len: usize) -> Result<(), String> {
+        self.held.truncate(len);
+        Ok(())
+    }
+
+    fn held(&self) -> &[u32] {
+        &self.held
+    }
+
+    fn position(&self) -> usize {
+        self.held.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn judge(&mut self, _date: &str) -> Option<Box<dyn LabelModel + '_>> {
+        None
+    }
+}
+
+/// What the chat says about the model.
+#[derive(Clone, Copy)]
+pub struct About<'a> {
+    /// `Kimi Linear 48B-A3B (Moonshot AI, open weights)`.
     pub description: &'static str,
-    /// `Kimi` or `Gemma`.
+    /// `Kimi`, `Gemma`.
     pub identity: &'static str,
-    /// The engine, for the model to know (`the GPU`).
+    /// `the GPU`.
     pub engine: &'static str,
     pub format: &'a ChatFormat,
+}
+
+/// A model that reads into sessions (Kimi Linear, Gemma).
+pub struct Loaded<'a, M: Reader> {
+    pub model: &'a mut M,
+    pub about: About<'a>,
     pub accel: Accel<'a>,
 }
 
-/// The interactive chat on the shared loop.
+/// The chat for a [`Reader`] model, through an [`Engine`].
 ///
 /// # Errors
-/// When the workspace, the opening or the terminal fails.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub fn run<M: Reader>(
+/// As [`run`].
+#[allow(clippy::too_many_arguments)]
+pub fn run_reader<M: Reader>(
     args: &Args,
     loaded: Loaded<'_, M>,
     tokenizer: &Tokenizer,
@@ -567,20 +695,54 @@ pub fn run<M: Reader>(
 ) -> Result<(), String> {
     let Loaded {
         model,
+        about,
+        accel,
+    } = loaded;
+    let mut engine = Engine::new(
+        model,
+        tokenizer,
+        about.format,
+        accel,
+        cancel,
+        gate,
+        max_context,
+    );
+    let workspace = workspace_for(args)?;
+    run(
+        args,
+        about,
+        tokenizer,
+        extra,
+        gen_tokens,
+        &mut engine,
+        workspace,
+        cancel,
+        generating,
+    )
+}
+
+/// The interactive chat on the shared loop, over any backend.
+///
+/// # Errors
+/// When the opening, a saved chat or the terminal fails.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub fn run(
+    args: &Args,
+    about_model: About<'_>,
+    tokenizer: &Tokenizer,
+    extra: String,
+    gen_tokens: usize,
+    backend: &mut dyn Backend,
+    workspace: Option<Workspace>,
+    cancel: &AtomicBool,
+    generating: &AtomicBool,
+) -> Result<(), String> {
+    let About {
         description,
         identity,
         engine: engine_name,
         format,
-        accel,
-    } = loaded;
-    if args.resume.is_some() || args.budget != crate::chat::TurnBudget::default() {
-        return Err(
-            "--resume, --turn-minutes and --turn-tokens are not on the shared chat loop yet; \
-             add --legacy-chat"
-                .into(),
-        );
-    }
-    let workspace = workspace_for(args)?;
+    } = about_model;
     let jev = !args.no_checkpoint;
     eprintln!(
         "jev: {}",
@@ -591,37 +753,76 @@ pub fn run<M: Reader>(
         }
     );
     let (input, output) = crate::linear::chat_io(args)?;
+    let rate = Rc::new(Cell::new(None));
     let mut observers: Vec<Box<dyn Observer + '_>> = vec![Box::new(Screen {
         output,
         format,
         tokenizer,
         display: Display::default(),
         call: None,
+        rate: Rc::clone(&rate),
     })];
+    let mut saved_path = None;
     let mut saved = None;
     if !args.no_transcript {
-        if let Some(dir) = crate::transcript::default_dir() {
-            match Transcript::create(&dir, format.name(), &args.model_dir.display().to_string()) {
+        if let Some(dir) = transcripts() {
+            let opened = match &args.resume {
+                Some(which) => Transcript::resume(&dir, which, format.name()).map(|(t, state)| {
+                    saved = Some(state);
+                    t
+                }),
+                None => {
+                    Transcript::create(&dir, format.name(), &args.model_dir.display().to_string())
+                }
+            };
+            match opened {
                 Ok(t) => {
                     eprintln!("transcript: {}", t.path().display());
-                    saved = Some(t.path().display().to_string());
+                    saved_path = Some(t.path().display().to_string());
                     observers.push(Box::new(t));
                 }
+                Err(e) if args.resume.is_some() => return Err(e),
                 Err(e) => eprintln!("transcript: {e}; the chat is not saved"),
             }
         }
     }
     let template = KimiTemplate::new(format, tokenizer, identity, extra);
     let mut chat = Agent::new(template, workspace, jev, Box::new(Tee(observers)));
-    let mut engine = Engine::new(model, tokenizer, format, accel, cancel, gate, max_context);
+    chat.set_budget(args.budget);
     let started = Instant::now();
-    let opening = chat.prepare(&mut engine)?;
-    eprintln!(
-        "read the opening ({opening} tokens) in {:.1?}; each conversation starts from it",
-        started.elapsed()
-    );
+    if let Some(saved) = &saved {
+        chat.restore(saved, backend)?;
+        eprintln!(
+            "resumed: {} exchanges, {} context tokens in {:.1?}{}",
+            chat.history().len(),
+            backend.position(),
+            started.elapsed(),
+            if chat.pending().is_some() {
+                "; a paused turn waits for /continue"
+            } else {
+                ""
+            }
+        );
+    } else {
+        let opening = chat.prepare(backend)?;
+        if opening > 0 {
+            eprintln!(
+                "read the opening ({opening} tokens) in {:.1?}; each conversation starts from it",
+                started.elapsed()
+            );
+        }
+    }
     println!("Local {description} on {engine_name}. {HELP}");
+    let max_context = backend.capacity();
     let mut input = input;
+    let show = |end: &TurnEnd| {
+        if let Some(why) = &end.paused {
+            eprintln!(
+                "[paused: {why}. /continue goes on; a new message answers waiting tool calls as \
+                 not run]"
+            );
+        }
+    };
     loop {
         generating.store(false, Ordering::Relaxed);
         print!("\nYou> ");
@@ -639,27 +840,36 @@ pub fn run<M: Reader>(
         if line.len() > 65_536 {
             return Err("input line exceeds 64 KiB".into());
         }
+        cancel.store(false, Ordering::Relaxed);
         match line.trim() {
             "" => {}
             "/quit" | "/exit" => break,
             "/help" => println!("{HELP}"),
             "/stats" => println!(
-                "{} / {max_context} context tokens; {} exchanges",
-                engine.position(),
-                chat.history().len()
+                "{} / {max_context} context tokens; {} exchanges; paused turn: {}",
+                backend.position(),
+                chat.history().len(),
+                chat.pending().is_some()
             ),
-            "/continue" => println!(
-                "Not on the shared chat loop yet (step 3 of loadngo docs/AGENT_LOOP.md): send \
-                 the message again, or start Kimi with --legacy-chat."
-            ),
+            "/continue" => {
+                generating.store(true, Ordering::Relaxed);
+                match agent::resume(&mut chat, backend, gen_tokens, cancel) {
+                    Ok(Some(end)) => show(&end),
+                    Ok(None) => println!("Nothing to continue."),
+                    Err(e) => eprintln!("[{e}; /undo removes this turn]"),
+                }
+                chat.save(backend);
+            }
             "/reset" => {
                 let keep = chat.reset();
-                engine.truncate(keep)?;
+                backend.truncate(keep)?;
+                chat.save(backend);
                 println!("Conversation cleared.");
             }
             "/undo" => match chat.undo() {
                 Some(at) => {
-                    engine.truncate(at)?;
+                    backend.truncate(at)?;
+                    chat.save(backend);
                     println!("Last exchange removed; file changes stay.");
                 }
                 None => println!("Nothing to undo."),
@@ -670,13 +880,13 @@ pub fn run<M: Reader>(
                     description,
                     engine_name,
                     max_context,
-                    saved.as_deref(),
-                    engine.rate,
+                    saved_path.as_deref(),
+                    rate.get(),
                 ));
-                cancel.store(false, Ordering::Relaxed);
                 generating.store(true, Ordering::Relaxed);
-                if let Err(e) = agent::turn(&mut chat, &mut engine, text, gen_tokens, cancel) {
-                    eprintln!("[{e}; /undo removes this turn]");
+                match agent::turn(&mut chat, backend, text, gen_tokens, cancel) {
+                    Ok(end) => show(&end),
+                    Err(e) => eprintln!("[{e}; /undo removes this turn]"),
                 }
             }
         }
@@ -690,6 +900,16 @@ pub fn run<M: Reader>(
         }
     }
     Ok(())
+}
+
+/// Kimi's turn budget, from `--turn-minutes` (default 30) and `--turn-tokens` (default
+/// 16,384); 0 turns either off.
+#[must_use]
+pub fn default_budget() -> Budget {
+    Budget {
+        time: Some(std::time::Duration::from_secs(30 * 60)),
+        tokens: Some(16_384),
+    }
 }
 
 #[cfg(test)]
@@ -884,5 +1104,61 @@ mod tests {
         let (reply, ended) = e.generate(1, &[END], &cancel, &mut |_| true).unwrap();
         assert_eq!((reply.len(), ended), (1, Ended::Limit));
         assert!(e.feed(&[6; 1_000]).is_err());
+        // A context rebuilt from a handoff starts from the opening's snapshot.
+        let mut rebuilt = vec![1; 100];
+        rebuilt.extend([8; 3]);
+        let before = reads.get();
+        e.load(&rebuilt).unwrap();
+        assert_eq!(reads.get() - before, 3);
+        assert_eq!(e.held(), rebuilt);
+    }
+
+    #[test]
+    fn k3_closes_its_last_reply_and_starts_its_first_message_with_the_opening() {
+        let tok = tokenizer();
+        let format = ChatFormat::K3;
+        let t = KimiTemplate::new(&format, &tok, "Kimi", String::new());
+        assert_eq!(t.opening("rules", None).unwrap(), Vec::<u32>::new());
+        let now = clock::now();
+        let Rendered::Append(first) = t.render(&prompt(&now, "hi", &[])).unwrap() else {
+            panic!()
+        };
+        assert_eq!(first, crate::chat::prompt(&tok, "hi", true));
+        let history = [agent::Exchange {
+            user: "hi".into(),
+            answer: "hello".into(),
+        }];
+        let Rendered::Append(next) = t.render(&prompt(&now, "again", &history)).unwrap() else {
+            panic!()
+        };
+        assert_eq!(next[0], 163_586, "the last reply's end");
+        assert_eq!(&next[1..], &crate::chat::prompt(&tok, "again", false)[..]);
+    }
+
+    #[test]
+    fn a_next_token_model_sees_the_whole_context_and_its_end_token_is_not_fed() {
+        let seen = Rc::new(Cell::new(0));
+        let counter = Rc::clone(&seen);
+        let mut b = NextToken::new(
+            move |ids: &[u32]| {
+                counter.set(ids.len());
+                Ok(if ids.len() >= 5 { 9 } else { 7 })
+            },
+            100,
+        );
+        b.feed(&[1, 2, 3]).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (out, ended) = b.generate(10, &[9], &cancel, &mut |_| true).unwrap();
+        assert_eq!((out.as_slice(), ended), (&[7, 7, 9][..], Ended::Stop));
+        assert_eq!(b.held(), [1, 2, 3, 7, 7]);
+        assert_eq!(seen.get(), 5);
+        b.truncate(3).unwrap();
+        assert_eq!(b.position(), 3);
+        assert!(b.feed(&[0; 100]).is_err());
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            b.generate(10, &[9], &cancel, &mut |_| true).unwrap().1,
+            Ended::Cancelled
+        );
     }
 }

@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use kimi_k3_core::{linear::LinearModel, model::argmax, tokenizer::Tokenizer};
-use loadngo_inference::tools::Toolbox;
 
 use crate::{Args, accel, chat, convert, quality, system_one, thermal};
 
@@ -35,13 +34,6 @@ fn pick(logits: &[f32]) -> Result<u32, String> {
         return Err("non-finite logits; refusing to emit a token".into());
     }
     u32::try_from(argmax(logits)).map_err(|e| e.to_string())
-}
-
-/// The legacy chat's tools (`--legacy-chat`): the same as the shared loop's.
-pub(crate) fn toolbox(args: &Args) -> Result<Toolbox, String> {
-    Ok(crate::agent_chat::workspace_for(args)?
-        .map(|w| w.tools)
-        .unwrap_or_default())
 }
 
 /// The engine, as the chat tells the model.
@@ -178,17 +170,19 @@ pub fn run(
         );
         model.set_expert_transform(args.experts.transform());
     }
-    if args.chat && !args.legacy_chat {
+    if args.chat {
         let format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
         let accel = device.accel();
-        return crate::agent_chat::run(
+        return crate::agent_chat::run_reader(
             args,
             crate::agent_chat::Loaded {
                 model: &mut model,
-                description: "Kimi Linear 48B-A3B (Moonshot AI, open weights)",
-                identity: "Kimi",
-                engine: engine_name(args.accel),
-                format: &format,
+                about: crate::agent_chat::About {
+                    description: "Kimi Linear 48B-A3B (Moonshot AI, open weights)",
+                    identity: "Kimi",
+                    engine: engine_name(args.accel),
+                    format: &format,
+                },
                 accel,
             },
             tokenizer,
@@ -202,106 +196,6 @@ pub fn run(
     }
     let mut session = model.session(max_context);
     let keep = || !cancel.load(Ordering::Relaxed);
-
-    if args.chat {
-        let mut format = chat::ChatFormat::kimi_linear(tokenizer, model.config.eos_token_id)?;
-        if let Some(memory) = memory_store(args) {
-            format = format.with_note(&memory_note(&memory));
-        }
-        format = format.with_note(crate::chat::FRESHNESS_GUIDANCE);
-        if args.voice {
-            format = format.with_note(VOICE_NOTE);
-        }
-        let mut options = crate::chat_options(args, format.name(), max_context)?;
-        let tools = toolbox(args)?;
-        let tools = Some(&tools).filter(|t| !t.is_empty());
-        // Every conversation opens with the same tool declarations (~800 tokens, about a
-        // minute on a cold expert cache). Consume them once now and keep a snapshot, so
-        // the first question and every /reset start from it instead.
-        let preamble = format.preamble(tokenizer, tools);
-        let mut opening: Option<kimi_k3_core::linear::LinearSession> = None;
-        if !preamble.is_empty() {
-            eprintln!(
-                "reading the tool declarations once ({} tokens; Ctrl-C quits)...",
-                preamble.len()
-            );
-            let start = Instant::now();
-            gate.checkpoint(cancel)?;
-            model
-                .feed(&mut session, &preamble, device.accel(), keep)
-                .map_err(|e| e.to_string())?;
-            opening = Some(session.clone());
-            eprintln!("  ready in {:.1?}", start.elapsed());
-        }
-        println!(
-            "Local Kimi Linear 48B-A3B on {}. The first reply is slower while the \
-             expert cache warms.",
-            match args.accel {
-                accel::AccelKind::Ane => "the Apple Neural Engine",
-                accel::AccelKind::Gpu => "the GPU (prompts on the Apple Neural Engine)",
-                accel::AccelKind::Cpu => "the CPU",
-            }
-        );
-        let mut last: Option<Vec<f32>> = None;
-        let (input, output) = chat_io(args)?;
-        // The chat and its checkpoints take turns with the one model; a checkpoint reads
-        // its state in a session of its own, so the chat's session is not disturbed.
-        let model = std::cell::RefCell::new(&mut model);
-        if !args.no_checkpoint {
-            options.checkpoint = Some(Box::new(|request| {
-                let mut model = model.borrow_mut();
-                let mut labels = system_one::KimiLabels::new(
-                    &mut **model,
-                    tokenizer,
-                    &format,
-                    device.accel(),
-                    cancel,
-                );
-                loadngo_inference::system_one::answer(
-                    &mut labels,
-                    request,
-                    loadngo_inference::system_one::Calibration::default(),
-                )
-            }));
-        }
-        return chat::run_with(
-            &format,
-            tools,
-            tokenizer,
-            max_context,
-            gen_tokens,
-            cancel,
-            generating,
-            input,
-            output,
-            |ids| {
-                gate.checkpoint(cancel)?;
-                // Feed only what the session has not consumed; rebuild after /undo,
-                // /reset or a cancelled pass, when the history no longer extends it,
-                // from the opening snapshot when the history still starts with it.
-                if session.is_broken() || !ids.starts_with(session.ids()) {
-                    match &opening {
-                        Some(start) if ids.starts_with(start.ids()) => session = start.clone(),
-                        _ => session.reset(),
-                    }
-                    last = None;
-                }
-                let new = &ids[session.ids().len()..];
-                let logits = if new.is_empty() {
-                    last.clone().ok_or("empty context")?
-                } else {
-                    model
-                        .borrow_mut()
-                        .feed(&mut session, new, device.accel(), keep)
-                        .map_err(|e| e.to_string())?
-                };
-                let token = pick(&logits)?;
-                last = Some(logits);
-                Ok(token)
-            },
-            options,
-        );
-    }
 
     let prompt = prompt.ok_or("one-shot mode needs --prompt")?;
     let mut ids = tokenizer.encode(prompt);
@@ -361,32 +255,6 @@ pub fn run(
         eprintln!("{summary}");
     }
     Ok(())
-}
-
-/// Kimi's memory file, unless tools or memory are off.
-pub(crate) fn memory_store(args: &Args) -> Option<loadngo_inference::memory_tools::MemoryStore> {
-    if args.no_tools || args.no_memory {
-        return None;
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(loadngo_inference::memory_tools::MemoryStore::new(
-        std::path::Path::new(&home).join(".loadngo/kimi/memory.jsonl"),
-    ))
-}
-
-/// What opens each conversation about her memory: the newest notes that fit in 4 KB.
-pub(crate) fn memory_note(memory: &loadngo_inference::memory_tools::MemoryStore) -> String {
-    let intro = "You have a memory that lasts across sessions. Save facts, decisions and \
-the state of ongoing work with memory_save when they will matter later; look things up with \
-memory_search; drop wrong or outdated notes with memory_forget.";
-    match memory.recall(4096) {
-        Ok(notes) if !notes.is_empty() => format!(
-            "{intro} Your most recent notes:\n{}",
-            loadngo_inference::memory_tools::format_notes(&notes)
-        ),
-        Ok(_) => format!("{intro} You have no notes yet."),
-        Err(e) => format!("{intro} (Your notes could not be read: {e}.)"),
-    }
 }
 
 /// How to answer when replies are spoken aloud (`--voice`).

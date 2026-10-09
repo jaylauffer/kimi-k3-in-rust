@@ -2,8 +2,8 @@
 
 ## Since 2026-10-09: the shared chat loop
 
-Kimi Linear and Gemma 4 chat on loadngo's shared loop (`loadngo-inference::agent`,
-loadngo `docs/AGENT_LOOP.md`), the one gpt-oss runs on. `crates/kimi-k3-cli/src/agent_chat.rs`
+Every model here (Kimi Linear, Gemma 4 and K3) chats on loadngo's shared loop
+(`loadngo-inference::agent`, loadngo `docs/AGENT_LOOP.md`), the one gpt-oss runs on. `crates/kimi-k3-cli/src/agent_chat.rs`
 connects them: `KimiTemplate` (both formats), `Engine` (any `Reader`: the context is kept
 as tokens and the session follows it, restarting from a snapshot after the opening when
 `/undo` or `/reset` go back) and the terminal or voice (`Kimi> ` then the reply; status
@@ -24,21 +24,27 @@ What changed for Kimi:
   turns Jev off).
 - **Each turn** a system note gives the local date and time and says which model she is,
   on which engine, her context, where this chat is saved and her last reply's speed.
-- **Commands**: `/help`, `/stats`, `/undo`, `/reset`, `/quit`. Ctrl-C stops a reply.
-- **Saved chats**: still `~/.loadngo/kimi/transcripts/<time>.jsonl`, with the same event
-  names; no `.state.json` beside them yet.
+- **Commands**: `/continue`, `/undo`, `/reset`, `/stats`, `/help`, `/quit`. Ctrl-C pauses a
+  turn; so do a spent budget (`--turn-minutes` 30, `--turn-tokens` 16,384) and a reply
+  reaching `--gen`. `/continue` goes on; a new message answers waiting tool calls as not run.
+- **Context flow**: past three quarters of `--max-context` she writes a handoff and the
+  context is rebuilt from it; a rebuild after work that added nothing new closes her tools
+  so she answers (loadngo `docs/AGENT_LOOP.md`, "Context flow").
+- **Saved chats**: `~/.loadngo/kimi/transcripts/<time>.jsonl` with the same event names,
+  and `<time>.state.json` beside it; `--resume latest` carries a chat on, a paused turn
+  included. Snapshots saved before 2026-10-09 (by the old chat) cannot be resumed.
+- **K3** runs on the loop through a next-token adapter (`NextToken`), with no tools.
 
-Not yet on the loop (step 3): `/continue`, turn budgets (`--turn-minutes`,
-`--turn-tokens`), `--resume`, and compaction through a handoff, so a full context ends a
-turn (`/undo` or `/reset` make room). `--legacy-chat` runs the chat described below, which
-has them, with the same tools.
+The chat before the loop (`chat::run_with`, about 2,600 lines, and its own transcript
+module) was removed on 2026-10-09 once the loop had everything it had.
 
 Checked 2026-10-09 on the GPU: Kimi Linear answered where her chat is saved and which model
 and engine she is, then fixed the seeded `median` bug (12 calls, 77 s, the chat's own check
 passing): her first finished code task. Gemma answered a one-call question. Evidence:
 loadngo `docs/AGENT_LOOP.md`, "Evidence, step 2".
 
-The rest of this file describes the chat before the loop (`--legacy-chat`, and K3).
+The rest of this file describes the chat before the loop, for reading older transcripts
+and the reasons behind behaviours the loop took over.
 
 ## Run
 

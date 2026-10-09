@@ -24,9 +24,6 @@ pub struct GemmaTokens {
     pub turn: u32,
     pub turn_end: u32,
     pub newline: u32,
-    /// The words after `<|turn>`.
-    pub user: u32,
-    pub model: u32,
     pub channel: u32,
     pub channel_end: u32,
     pub call: u32,
@@ -38,7 +35,6 @@ pub struct GemmaTokens {
     pub tool_end: u32,
     /// The config's `eos_token_id`s (`<eos>`, `<turn|>`).
     pub eos: Vec<u32>,
-    pub note: Option<String>,
 }
 
 fn single(tokenizer: &Tokenizer, text: &str) -> Result<u32, String> {
@@ -63,8 +59,6 @@ impl GemmaTokens {
             turn: single(tokenizer, "<|turn>")?,
             turn_end: single(tokenizer, "<turn|>")?,
             newline: single(tokenizer, "\n")?,
-            user: single(tokenizer, "user")?,
-            model: single(tokenizer, "model")?,
             channel: single(tokenizer, "<|channel>")?,
             channel_end: single(tokenizer, "<channel|>")?,
             call: single(tokenizer, "<|tool_call>")?,
@@ -75,7 +69,6 @@ impl GemmaTokens {
             tool: single(tokenizer, "<|tool>")?,
             tool_end: single(tokenizer, "<tool|>")?,
             eos: eos.to_vec(),
-            note: None,
         })
     }
 
@@ -95,43 +88,6 @@ impl GemmaTokens {
         ids.push(self.channel);
         ordinary(ids, tokenizer, "thought\n");
         ids.push(self.channel_end);
-    }
-
-    /// Where the reply begins in `span`: just past its model header.
-    pub fn reply_start(&self, span: &[u32]) -> Option<usize> {
-        let header = (0..span.len().saturating_sub(1))
-            .find(|&i| span[i] == self.turn && span[i + 1] == self.model)?;
-        let after = header + 3;
-        // Past the empty thought channel, when the header has one.
-        match span
-            .get(after..)?
-            .iter()
-            .position(|&id| id == self.channel_end)
-        {
-            Some(end) if span.get(after) == Some(&self.channel) => Some(after + end + 1),
-            _ => Some(after),
-        }
-    }
-
-    /// The text of the last user message in `prompt`.
-    pub fn user_text<'s>(&self, prompt: &'s [u32]) -> Option<&'s [u32]> {
-        let at = (0..prompt.len().saturating_sub(1))
-            .rev()
-            .find(|&i| prompt[i] == self.turn && prompt[i + 1] == self.user)?;
-        let body = prompt.get(at + 3..)?;
-        let end = body
-            .iter()
-            .position(|&id| id == self.turn_end)
-            .unwrap_or(body.len());
-        Some(&body[..end])
-    }
-
-    /// Whether `prompt` holds a user message before any model header.
-    pub fn has_user(&self, prompt: &[u32]) -> bool {
-        prompt
-            .windows(2)
-            .take_while(|w| !(w[0] == self.turn && w[1] == self.model))
-            .any(|w| w[0] == self.turn && w[1] == self.user)
     }
 
     /// The system turn every conversation opens with: the guidance and notes, then each

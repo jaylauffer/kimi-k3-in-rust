@@ -432,8 +432,8 @@ pub fn run(
 /// Chat defaults when `--gen` is not given: replies as long as Kimi Linear's.
 const CHAT_GEN: usize = 1024;
 
-/// Interactive chat with tools, through the same loop as Kimi Linear's.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Interactive chat with tools, on the shared loop as Kimi Linear's.
+#[allow(clippy::too_many_arguments)]
 fn chat(
     args: &Args,
     model: &mut GemmaModel,
@@ -450,118 +450,27 @@ fn chat(
         CHAT_GEN
     };
     let config = &model.config;
-    let mut format =
+    let format =
         crate::chat::ChatFormat::gemma(tokenizer, config.bos_token_id, &config.eos_token_ids)?;
-    if !args.legacy_chat {
-        return crate::agent_chat::run(
-            args,
-            crate::agent_chat::Loaded {
-                model,
+    crate::agent_chat::run_reader(
+        args,
+        crate::agent_chat::Loaded {
+            model,
+            about: crate::agent_chat::About {
                 description: "Gemma 4 31B-it (Google, open weights)",
                 identity: "Gemma",
                 engine: crate::linear::engine_name(args.accel),
                 format: &format,
-                accel: device.accel(),
             },
-            tokenizer,
-            crate::linear::extra_notes(args),
-            max_context,
-            gen_tokens,
-            gate,
-            cancel,
-            generating,
-        );
-    }
-    if let Some(memory) = crate::linear::memory_store(args) {
-        format = format.with_note(&crate::linear::memory_note(&memory));
-    }
-    format = format.with_note(crate::chat::FRESHNESS_GUIDANCE);
-    if args.voice {
-        format = format.with_note(crate::linear::VOICE_NOTE);
-    }
-    let mut options = crate::chat_options(args, format.name(), max_context)?;
-    let tools = crate::linear::toolbox(args)?;
-    let tools = Some(&tools).filter(|t| !t.is_empty());
-    let keep = || !cancel.load(Ordering::Relaxed);
-    // The opening (instructions, notes, tool declarations) is the same for every
-    // conversation: read it once and start the first question and every /reset from it.
-    let preamble = format.preamble(tokenizer, tools);
-    let mut session = model.session(max_context);
-    eprintln!(
-        "reading the opening once ({} tokens; Ctrl-C quits)...",
-        preamble.len()
-    );
-    let start = Instant::now();
-    gate.checkpoint(cancel)?;
-    model
-        .feed(&mut session, &preamble, device.accel(), keep)
-        .map_err(|e| e.to_string())?;
-    let opening = session.clone();
-    eprintln!("  ready in {:.1?}", start.elapsed());
-    println!(
-        "Local Gemma 4 31B on {}.",
-        match args.accel {
-            accel::AccelKind::Ane => "the Apple Neural Engine",
-            accel::AccelKind::Gpu => "the GPU",
-            accel::AccelKind::Cpu => "the CPU",
-        }
-    );
-    let mut last: Option<Vec<f32>> = None;
-    let (input, output) = crate::linear::chat_io(args)?;
-    let model = std::cell::RefCell::new(model);
-    if !args.no_checkpoint {
-        options.checkpoint = Some(Box::new(|request| {
-            let mut model = model.borrow_mut();
-            let mut labels = crate::system_one::KimiLabels::new(
-                &mut **model,
-                tokenizer,
-                &format,
-                device.accel(),
-                cancel,
-            );
-            loadngo_inference::system_one::answer(
-                &mut labels,
-                request,
-                loadngo_inference::system_one::Calibration::default(),
-            )
-        }));
-    }
-    crate::chat::run_with(
-        &format,
-        tools,
+            accel: device.accel(),
+        },
         tokenizer,
+        crate::linear::extra_notes(args),
         max_context,
         gen_tokens,
+        gate,
         cancel,
         generating,
-        input,
-        output,
-        |ids| {
-            gate.checkpoint(cancel)?;
-            // Feed only what the session has not consumed; rebuild after /undo, /reset
-            // or a cancelled pass, from the opening when the history still starts with it.
-            if session.is_broken() || !ids.starts_with(session.ids()) {
-                if ids.starts_with(opening.ids()) {
-                    session = opening.clone();
-                } else {
-                    session.reset();
-                }
-                last = None;
-            }
-            let new = &ids[session.ids().len()..];
-            let logits = if new.is_empty() {
-                last.clone().ok_or("empty context")?
-            } else {
-                model
-                    .borrow()
-                    .feed(&mut session, new, device.accel(), keep)
-                    .map_err(|e| e.to_string())?
-            };
-            let token = pick(&logits)?;
-            last = Some(logits);
-            Ok(token)
-        },
-        options,
     )
 }
 
